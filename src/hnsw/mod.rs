@@ -1,5 +1,6 @@
 //! HNSW (Hierarchical Navigable Small World) index implementation
 
+pub mod search;
 pub mod storage;
 
 use crate::distance::DistanceMetric;
