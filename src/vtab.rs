@@ -361,26 +361,25 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                         meta_table
                     );
 
-                    if let Ok(entry_point_str) = conn.query_row(&entry_point_query, [], |row| row.get::<_, String>(0)) {
-                        if let Ok(entry_point) = entry_point_str.parse::<i64>() {
-                            if entry_point >= 0 {
-                                // Verify the entry point exists in nodes table
-                                let node_check = format!(
-                                    "SELECT COUNT(*) FROM \"{}\" WHERE rowid=?",
-                                    nodes_table
-                                );
-                                let node_exists: i64 = conn
-                                    .query_row(&node_check, [entry_point], |row| row.get(0))
-                                    .unwrap_or(0);
+                    if let Ok(entry_point_str) = conn.query_row(&entry_point_query, [], |row| row.get::<_, String>(0))
+                        && let Ok(entry_point) = entry_point_str.parse::<i64>()
+                        && entry_point >= 0
+                    {
+                        // Verify the entry point exists in nodes table
+                        let node_check = format!(
+                            "SELECT COUNT(*) FROM \"{}\" WHERE rowid=?",
+                            nodes_table
+                        );
+                        let node_exists: i64 = conn
+                            .query_row(&node_check, [entry_point], |row| row.get(0))
+                            .unwrap_or(0);
 
-                                if node_exists == 0 {
-                                    std::mem::forget(conn);
-                                    return Ok(Some(format!(
-                                        "HNSW index for column '{}': entry point rowid {} does not exist",
-                                        col.name, entry_point
-                                    )));
-                                }
-                            }
+                        if node_exists == 0 {
+                            std::mem::forget(conn);
+                            return Ok(Some(format!(
+                                "HNSW index for column '{}': entry point rowid {} does not exist",
+                                col.name, entry_point
+                            )));
                         }
                     }
                 }

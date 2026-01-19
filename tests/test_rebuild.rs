@@ -1,5 +1,4 @@
 use rusqlite::Connection;
-use sqlite_vec_hnsw;
 
 #[test]
 fn test_vec_rebuild_hnsw_basic() {
