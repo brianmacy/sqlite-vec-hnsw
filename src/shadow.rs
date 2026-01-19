@@ -883,6 +883,110 @@ pub unsafe fn insert_vector_ffi(
     Ok(())
 }
 
+/// Read a vector from shadow tables
+///
+/// # Arguments
+/// * `db` - Database connection
+/// * `schema` - Schema name
+/// * `table_name` - Table name
+/// * `column_idx` - Vector column index
+/// * `rowid` - Rowid of the vector to read
+///
+/// # Returns
+/// Vector data as bytes, or None if not found
+pub fn read_vector_from_chunk(
+    db: &Connection,
+    schema: &str,
+    table_name: &str,
+    column_idx: usize,
+    rowid: i64,
+) -> Result<Option<Vec<u8>>> {
+    // Step 1: Get chunk_id and chunk_offset from _rowids table
+    let rowid_query = format!(
+        "SELECT chunk_id, chunk_offset FROM \"{}\".\"{}_rowids\" WHERE rowid = ?",
+        schema, table_name
+    );
+
+    let mapping = db
+        .query_row(&rowid_query, [rowid], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .optional()
+        .map_err(Error::Sqlite)?;
+
+    let (chunk_id, chunk_offset) = match mapping {
+        Some(m) => m,
+        None => return Ok(None), // Rowid not found
+    };
+
+    // Step 2: Check validity bitmap
+    let validity_query = format!(
+        "SELECT validity FROM \"{}\".\"{}_chunks\" WHERE chunk_id = ?",
+        schema, table_name
+    );
+
+    let validity_data: Vec<u8> = db
+        .query_row(&validity_query, [chunk_id], |row| row.get(0))
+        .map_err(Error::Sqlite)?;
+
+    let validity = ValidityBitmap::from_bytes(validity_data);
+    if !validity.is_set(chunk_offset as usize) {
+        return Ok(None); // Vector was deleted
+    }
+
+    // Step 3: Open BLOB and read vector data
+    let table = format!("{}_vector_chunks{:02}", table_name, column_idx);
+
+    let mut blob = db
+        .blob_open(
+            rusqlite::DatabaseName::Main,
+            &table,
+            "vectors",
+            chunk_id,
+            true, // read-only
+        )
+        .map_err(Error::Sqlite)?;
+
+    // Determine vector size from BLOB
+    use std::io::{Read, Seek, SeekFrom};
+    let blob_size = blob
+        .seek(SeekFrom::End(0))
+        .map_err(|e| Error::InvalidParameter(format!("Seek failed: {}", e)))?;
+
+    // Calculate vector size (blob_size / DEFAULT_CHUNK_SIZE)
+    let vector_size = (blob_size as usize) / DEFAULT_CHUNK_SIZE;
+    let byte_offset = (chunk_offset as usize) * vector_size;
+
+    // Seek to the vector position and read
+    blob.seek(SeekFrom::Start(byte_offset as u64))
+        .map_err(|e| Error::InvalidParameter(format!("Seek failed: {}", e)))?;
+
+    let mut vector_data = vec![0u8; vector_size];
+    blob.read_exact(&mut vector_data)
+        .map_err(|e| Error::InvalidParameter(format!("Read failed: {}", e)))?;
+
+    blob.close().map_err(Error::Sqlite)?;
+
+    Ok(Some(vector_data))
+}
+
+/// Get all rowids from the shadow table (for full scan)
+pub fn get_all_rowids(db: &Connection, schema: &str, table_name: &str) -> Result<Vec<i64>> {
+    let query = format!(
+        "SELECT rowid FROM \"{}\".\"{}_rowids\" ORDER BY rowid",
+        schema, table_name
+    );
+
+    let mut stmt = db.prepare(&query).map_err(Error::Sqlite)?;
+    let rowids = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(Error::Sqlite)?
+        .collect::<std::result::Result<Vec<i64>, _>>()
+        .map_err(Error::Sqlite)?;
+
+    Ok(rowids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

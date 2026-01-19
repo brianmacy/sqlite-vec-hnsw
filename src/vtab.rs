@@ -282,8 +282,8 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         // args[2..]: column values
 
         // Determine rowid
+        // TODO: Auto-generate rowid by querying max rowid from _rowids table
         let rowid = if args.len() > 1 {
-            // TODO: Auto-generate rowid by querying max rowid from _rowids table
             args.get::<Option<i64>>(1)?.unwrap_or(1)
         } else {
             1
@@ -352,8 +352,8 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
 pub struct Vec0TabCursor<'vtab> {
     base: sqlite3_vtab_cursor,
     phantom: PhantomData<&'vtab Vec0Tab>,
-    current_row: i64,
-    eof: bool,
+    rowids: Vec<i64>,
+    current_index: usize,
 }
 
 impl<'vtab> Vec0TabCursor<'vtab> {
@@ -361,15 +361,19 @@ impl<'vtab> Vec0TabCursor<'vtab> {
         Vec0TabCursor {
             base: sqlite3_vtab_cursor::default(),
             phantom: PhantomData,
-            current_row: 0,
-            eof: true, // Start at EOF since we have no data yet
+            rowids: Vec::new(),
+            current_index: 0,
         }
     }
 
     /// Accessor to the associated virtual table
-    #[allow(dead_code)]
     fn vtab(&self) -> &Vec0Tab {
         unsafe { &*(self.base.pVtab as *const Vec0Tab) }
+    }
+
+    /// Get the current rowid
+    fn current_rowid(&self) -> Option<i64> {
+        self.rowids.get(self.current_index).copied()
     }
 }
 
@@ -380,32 +384,86 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
         _idx_str: Option<&str>,
         _args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        // TODO: Implement query execution using shadow tables
-        // For now, return empty result set
-        self.current_row = 0;
-        self.eof = true;
+        let vtab = self.vtab();
+
+        // Get all rowids from shadow tables for full scan
+        // SAFETY: vtab.db is valid for the lifetime of the virtual table
+        let rowids = unsafe {
+            let conn = Connection::from_handle(vtab.db)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+            let result = shadow::get_all_rowids(&conn, &vtab.schema_name, &vtab.table_name)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            std::mem::forget(conn);
+            result
+        };
+
+        self.rowids = rowids;
+        self.current_index = 0;
+
         Ok(())
     }
 
     fn next(&mut self) -> rusqlite::Result<()> {
-        self.current_row += 1;
-        // TODO: Check if we have more rows in shadow tables
-        self.eof = true;
+        self.current_index += 1;
         Ok(())
     }
 
     fn eof(&self) -> bool {
-        self.eof
+        self.current_index >= self.rowids.len()
     }
 
-    fn column(&self, ctx: &mut Context, _col: c_int) -> rusqlite::Result<()> {
-        // TODO: Implement column read from shadow tables
+    fn column(&self, ctx: &mut Context, col: c_int) -> rusqlite::Result<()> {
+        let vtab = self.vtab();
+        let col_idx = col as usize;
+
+        // Get current rowid
+        let rowid = match self.current_rowid() {
+            Some(r) => r,
+            None => {
+                ctx.set_result(&rusqlite::types::Null)?;
+                return Ok(());
+            }
+        };
+
+        // Check if this is a vector column
+        if col_idx < vtab.columns.len()
+            && let ColumnType::Vector { .. } = &vtab.columns[col_idx].col_type
+        {
+            // Read vector from shadow tables
+            // SAFETY: vtab.db is valid for the lifetime of the virtual table
+            let vector_data = unsafe {
+                let conn = Connection::from_handle(vtab.db)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                let result = shadow::read_vector_from_chunk(
+                    &conn,
+                    &vtab.schema_name,
+                    &vtab.table_name,
+                    col_idx,
+                    rowid,
+                )
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                std::mem::forget(conn);
+                result
+            };
+
+            match vector_data {
+                Some(data) => ctx.set_result(&data.as_slice())?,
+                None => ctx.set_result(&rusqlite::types::Null)?,
+            }
+            return Ok(());
+        }
+
+        // For non-vector columns, return NULL for now
         ctx.set_result(&rusqlite::types::Null)?;
         Ok(())
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        Ok(self.current_row)
+        Ok(self.current_rowid().unwrap_or(0))
     }
 }
 
@@ -716,5 +774,58 @@ mod tests {
                 assert_eq!(count, 1, "Should have one rowid mapping");
             }
         }
+    }
+
+    #[test]
+    fn test_insert_and_select_vector() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        // Create a vec0 virtual table
+        db.execute(
+            "CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[3])",
+            [],
+        )
+        .unwrap();
+
+        // Insert multiple vectors
+        db.execute(
+            "INSERT INTO vec_items(rowid, embedding) VALUES (1, vec_f32('[1.0, 2.0, 3.0]'))",
+            [],
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO vec_items(rowid, embedding) VALUES (2, vec_f32('[4.0, 5.0, 6.0]'))",
+            [],
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO vec_items(rowid, embedding) VALUES (3, vec_f32('[7.0, 8.0, 9.0]'))",
+            [],
+        )
+        .unwrap();
+
+        // Query the table
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM vec_items", [], |row| row.get(0))
+            .unwrap();
+
+        println!("Total rows: {}", count);
+        assert_eq!(count, 3, "Should have 3 rows");
+
+        // Query specific vectors
+        let mut stmt = db.prepare("SELECT rowid FROM vec_items ORDER BY rowid").unwrap();
+        let rowids: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        println!("Rowids: {:?}", rowids);
+        assert_eq!(rowids, vec![1, 2, 3]);
     }
 }
