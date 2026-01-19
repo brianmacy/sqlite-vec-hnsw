@@ -970,6 +970,38 @@ pub fn read_vector_from_chunk(
     Ok(Some(vector_data))
 }
 
+/// Mark a chunk row as invalid (for DELETE operations)
+///
+/// # Arguments
+/// * `db` - Database connection
+/// * `chunks_table` - Name of the chunks table
+/// * `chunk_id` - Chunk ID
+/// * `chunk_offset` - Offset within the chunk
+pub fn mark_chunk_row_invalid(
+    db: &Connection,
+    chunks_table: &str,
+    chunk_id: i64,
+    chunk_offset: usize,
+) -> Result<()> {
+    // Read current validity bitmap
+    let query = format!("SELECT validity FROM \"{}\" WHERE chunk_id = ?", chunks_table);
+
+    let validity_data: Vec<u8> = db
+        .query_row(&query, [chunk_id], |row| row.get(0))
+        .map_err(Error::Sqlite)?;
+
+    // Clear the bit for this offset
+    let mut validity = ValidityBitmap::from_bytes(validity_data);
+    validity.clear(chunk_offset);
+
+    // Write back to database
+    let update_sql = format!("UPDATE \"{}\" SET validity = ? WHERE chunk_id = ?", chunks_table);
+    db.execute(&update_sql, rusqlite::params![validity.as_bytes(), chunk_id])
+        .map_err(Error::Sqlite)?;
+
+    Ok(())
+}
+
 /// Get all rowids from the shadow table (for full scan)
 pub fn get_all_rowids(db: &Connection, schema: &str, table_name: &str) -> Result<Vec<i64>> {
     let query = format!(

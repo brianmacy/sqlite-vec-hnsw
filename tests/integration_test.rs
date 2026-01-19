@@ -242,10 +242,42 @@ fn test_delete_vector() {
     )
     .unwrap();
 
-    // Try DELETE (not yet implemented)
-    let result = db.execute("DELETE FROM vec_del WHERE rowid = 1", []);
+    db.execute(
+        "INSERT INTO vec_del(rowid, embedding) VALUES (2, vec_f32('[4.0, 5.0, 6.0]'))",
+        [],
+    )
+    .unwrap();
 
-    assert!(result.is_err(), "DELETE should fail (not yet implemented)");
+    // Verify both vectors exist
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vec_del", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "Should have 2 vectors before delete");
+
+    // DELETE should now work
+    let result = db.execute("DELETE FROM vec_del WHERE rowid = 1", []);
+    if let Err(ref e) = result {
+        eprintln!("DELETE error: {:?}", e);
+    }
+    assert!(result.is_ok(), "DELETE should succeed: {:?}", result);
+
+    // Verify only one vector remains
+    let count_after: i64 = db
+        .query_row("SELECT COUNT(*) FROM vec_del", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count_after, 1, "Should have 1 vector after delete");
+
+    // Verify rowid 1 is gone
+    let result = db.query_row("SELECT embedding FROM vec_del WHERE rowid = 1", [], |row| {
+        row.get::<_, Vec<u8>>(0)
+    });
+    assert!(result.is_err(), "Rowid 1 should be deleted");
+
+    // Verify rowid 2 still exists
+    let result = db.query_row("SELECT embedding FROM vec_del WHERE rowid = 2", [], |row| {
+        row.get::<_, Vec<u8>>(0)
+    });
+    assert!(result.is_ok(), "Rowid 2 should still exist");
 }
 
 #[test]
@@ -557,28 +589,6 @@ fn test_vector_data_integrity() {
 }
 
 // Tests for not-yet-implemented features
-
-#[test]
-fn test_delete_vector_not_implemented() {
-    let db = create_test_db().expect("Failed to create database");
-    init_extension(&db).expect("Failed to init extension");
-
-    db.execute(
-        "CREATE VIRTUAL TABLE vec_del USING vec0(embedding float[3])",
-        [],
-    )
-    .unwrap();
-
-    db.execute(
-        "INSERT INTO vec_del(rowid, embedding) VALUES (1, vec_f32('[1.0, 2.0, 3.0]'))",
-        [],
-    )
-    .unwrap();
-
-    // DELETE not yet implemented
-    let result = db.execute("DELETE FROM vec_del WHERE rowid = 1", []);
-    assert!(result.is_err(), "DELETE not yet implemented");
-}
 
 #[test]
 fn test_update_vector_not_implemented() {

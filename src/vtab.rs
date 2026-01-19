@@ -9,7 +9,7 @@ use rusqlite::vtab::{
     Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, Values,
     sqlite3_vtab, sqlite3_vtab_cursor,
 };
-use rusqlite::{Connection, ffi};
+use rusqlite::{Connection, OptionalExtension, ffi};
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 
@@ -329,11 +329,95 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
 }
 
 impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
-    fn delete(&mut self, _arg: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<()> {
-        // TODO: Implement delete using shadow tables
-        Err(rusqlite::Error::UserFunctionError(Box::new(
-            Error::NotImplemented("DELETE not yet implemented".to_string()),
-        )))
+    fn delete(&mut self, arg: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<()> {
+        // arg is the rowid to delete
+        let rowid = match arg {
+            rusqlite::types::ValueRef::Integer(i) => i,
+            _ => {
+                return Err(rusqlite::Error::UserFunctionError(Box::new(
+                    Error::InvalidParameter("DELETE requires integer rowid".to_string()),
+                )))
+            }
+        };
+
+        // SAFETY: db is a valid sqlite3 handle from SQLite
+        let conn = unsafe { Connection::from_handle(self.db)? };
+
+        // Get chunk position for this rowid
+        let rowids_table = format!("{}_rowids", self.table_name);
+        let query = format!(
+            "SELECT chunk_id, chunk_offset FROM \"{}\".\"{}\" WHERE rowid = ?",
+            self.schema_name, rowids_table
+        );
+
+        let chunk_info: Option<(i64, i64)> = conn
+            .query_row(&query, [rowid], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+
+        if let Some((chunk_id, chunk_offset)) = chunk_info {
+            // Mark as invalid in validity bitmap
+            let chunks_table = format!("{}_chunks", self.table_name);
+            shadow::mark_chunk_row_invalid(&conn, &chunks_table, chunk_id, chunk_offset as usize)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            // Delete from HNSW index if column is a vector
+            for col in &self.columns {
+                if matches!(col.col_type, ColumnType::Vector { .. }) {
+                    let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
+                    let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
+                    let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
+
+                    // Delete node (ignore errors if table doesn't exist)
+                    let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table), [rowid]);
+
+                    // Delete edges (ignore errors if table doesn't exist)
+                    let _ = conn.execute(
+                        &format!("DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?", edges_table),
+                        rusqlite::params![rowid, rowid],
+                    );
+
+                    // Delete from levels (ignore errors if table doesn't exist)
+                    let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table), [rowid]);
+
+                    // Update metadata if it exists
+                    if let Ok(Some(mut meta)) = HnswMetadata::load_from_db(&conn, &self.table_name, &col.name) {
+                        meta.num_nodes = meta.num_nodes.saturating_sub(1);
+                        meta.hnsw_version += 1;
+
+                        // If we deleted the entry point, need to find a new one
+                        if meta.entry_point_rowid == rowid {
+                            let new_entry: Option<(i64, i32)> = conn
+                                .query_row(
+                                    &format!("SELECT rowid, level FROM \"{}\" ORDER BY level DESC LIMIT 1", nodes_table),
+                                    [],
+                                    |row| Ok((row.get(0)?, row.get(1)?)),
+                                )
+                                .optional()
+                                .unwrap_or(None);
+
+                            if let Some((new_rowid, new_level)) = new_entry {
+                                meta.entry_point_rowid = new_rowid;
+                                meta.entry_point_level = new_level;
+                            } else {
+                                // No nodes left
+                                meta.entry_point_rowid = -1;
+                                meta.entry_point_level = -1;
+                            }
+                        }
+
+                        let _ = meta.save_to_db(&conn, &self.table_name, &col.name);
+                    }
+                }
+            }
+
+            // Delete from rowids table
+            conn.execute(&format!("DELETE FROM \"{}\".\"{}\" WHERE rowid = ?", self.schema_name, rowids_table), [rowid])?;
+        }
+
+        // Release connection without closing the database
+        std::mem::forget(conn);
+
+        Ok(())
     }
 
     fn insert(&mut self, args: &Values<'_>) -> rusqlite::Result<i64> {
