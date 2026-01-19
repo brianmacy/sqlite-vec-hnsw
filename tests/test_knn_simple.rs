@@ -6,12 +6,28 @@ fn test_knn_query_simple() {
     sqlite_vec_hnsw::init(&db).unwrap();
 
     // Create table
-    db.execute("CREATE VIRTUAL TABLE test USING vec0(embedding float[3])", []).unwrap();
+    db.execute(
+        "CREATE VIRTUAL TABLE test USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
 
     // Insert test vectors
-    db.execute("INSERT INTO test(rowid, embedding) VALUES (1, vec_f32('[1.0, 0.0, 0.0]'))", []).unwrap();
-    db.execute("INSERT INTO test(rowid, embedding) VALUES (2, vec_f32('[0.0, 1.0, 0.0]'))", []).unwrap();
-    db.execute("INSERT INTO test(rowid, embedding) VALUES (3, vec_f32('[0.0, 0.0, 1.0]'))", []).unwrap();
+    db.execute(
+        "INSERT INTO test(rowid, embedding) VALUES (1, vec_f32('[1.0, 0.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO test(rowid, embedding) VALUES (2, vec_f32('[0.0, 1.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO test(rowid, embedding) VALUES (3, vec_f32('[0.0, 0.0, 1.0]'))",
+        [],
+    )
+    .unwrap();
 
     // Try to prepare KNN query
     println!("\nAttempting to prepare KNN query...");

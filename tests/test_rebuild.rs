@@ -117,10 +117,12 @@ fn test_vec_rebuild_hnsw_invalid_params() {
         |row| row.get::<_, String>(0),
     );
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("M must be between 2 and 100"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("M must be between 2 and 100")
+    );
 
     // Test invalid ef_construction value (too high)
     let result = db.query_row(
@@ -129,10 +131,12 @@ fn test_vec_rebuild_hnsw_invalid_params() {
         |row| row.get::<_, String>(0),
     );
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("ef_construction must be between 10 and 2000"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("ef_construction must be between 10 and 2000")
+    );
 }
 
 #[test]
@@ -151,10 +155,12 @@ fn test_vec_rebuild_hnsw_wrong_arg_count() {
         row.get::<_, String>(0)
     });
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("requires 2 or 4 arguments"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("requires 2 or 4 arguments")
+    );
 
     // Test with wrong number of arguments (3 args)
     let result = db.query_row(
@@ -163,8 +169,10 @@ fn test_vec_rebuild_hnsw_wrong_arg_count() {
         |row| row.get::<_, String>(0),
     );
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("requires 2 or 4 arguments"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("requires 2 or 4 arguments")
+    );
 }

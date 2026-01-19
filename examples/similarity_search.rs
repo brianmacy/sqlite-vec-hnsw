@@ -8,7 +8,7 @@
 
 use rusqlite::Connection;
 use sqlite_vec_hnsw::distance::DistanceMetric;
-use sqlite_vec_hnsw::hnsw::{search, HnswMetadata};
+use sqlite_vec_hnsw::hnsw::{HnswMetadata, search};
 use sqlite_vec_hnsw::vector::{Vector, VectorType};
 use std::time::Instant;
 
@@ -93,8 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  M: {}", metadata.params.m);
     println!("  ef_construction: {}", metadata.params.ef_construction);
     println!("  ef_search: {}", metadata.params.ef_search);
-    println!("  Entry point: rowid {} at level {}",
-             metadata.entry_point_rowid, metadata.entry_point_level);
+    println!(
+        "  Entry point: rowid {} at level {}",
+        metadata.entry_point_rowid, metadata.entry_point_level
+    );
 
     // Perform HNSW search for k=10 nearest neighbors
     let k = 10;
@@ -112,7 +114,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let search_duration = search_start.elapsed();
 
-    println!("✓ Search completed in {:.2}ms", search_duration.as_secs_f64() * 1000.0);
+    println!(
+        "✓ Search completed in {:.2}ms",
+        search_duration.as_secs_f64() * 1000.0
+    );
 
     // Display results
     println!("\n📈 Top {} Results:", results.len());
@@ -154,11 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (rowid, vector_bytes) = row?;
         let vector = Vector::from_blob(&vector_bytes, VectorType::Float32, 128)?;
         let query_vec = Vector::from_blob(&query_bytes, VectorType::Float32, 128)?;
-        let distance = sqlite_vec_hnsw::distance::distance(
-            &query_vec,
-            &vector,
-            DistanceMetric::L2,
-        )?;
+        let distance =
+            sqlite_vec_hnsw::distance::distance(&query_vec, &vector, DistanceMetric::L2)?;
         brute_results.push((rowid, distance));
     }
 
@@ -166,7 +168,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     brute_results.truncate(k);
     let brute_duration = brute_start.elapsed();
 
-    println!("✓ Brute force completed in {:.2}ms", brute_duration.as_secs_f64() * 1000.0);
+    println!(
+        "✓ Brute force completed in {:.2}ms",
+        brute_duration.as_secs_f64() * 1000.0
+    );
 
     // Calculate recall (what percentage of true nearest neighbors were found)
     let brute_rowids: std::collections::HashSet<_> =
@@ -177,10 +182,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recall = (intersection as f64 / k as f64) * 100.0;
 
     println!("\n📊 Search Performance:");
-    println!("  HNSW search: {:.2}ms", search_duration.as_secs_f64() * 1000.0);
-    println!("  Brute force: {:.2}ms", brute_duration.as_secs_f64() * 1000.0);
-    println!("  Speedup: {:.1}x faster",
-             brute_duration.as_secs_f64() / search_duration.as_secs_f64());
+    println!(
+        "  HNSW search: {:.2}ms",
+        search_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Brute force: {:.2}ms",
+        brute_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Speedup: {:.1}x faster",
+        brute_duration.as_secs_f64() / search_duration.as_secs_f64()
+    );
     println!("  Recall@{}: {:.1}%", k, recall);
 
     if recall >= 80.0 {

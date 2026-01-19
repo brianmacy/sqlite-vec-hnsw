@@ -6,9 +6,8 @@ use crate::hnsw::{self, HnswMetadata};
 use crate::shadow;
 use crate::vector::VectorType;
 use rusqlite::vtab::{
-    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor,
-    Inserts, Updates, Filters,
-    sqlite3_vtab, sqlite3_vtab_cursor,
+    Context, CreateVTab, Filters, IndexInfo, Inserts, UpdateVTab, Updates, VTab, VTabConnection,
+    VTabCursor, sqlite3_vtab, sqlite3_vtab_cursor,
 };
 use rusqlite::{Connection, OptionalExtension, ffi};
 use std::marker::PhantomData;
@@ -344,7 +343,12 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         Ok(())
     }
 
-    fn integrity(&self, _schema: &str, _table_name: &str, _flags: c_int) -> rusqlite::Result<Option<String>> {
+    fn integrity(
+        &self,
+        _schema: &str,
+        _table_name: &str,
+        _flags: c_int,
+    ) -> rusqlite::Result<Option<String>> {
         // Validate HNSW index consistency for each vector column
         // SAFETY: db is a valid sqlite3 handle from SQLite
         let conn = unsafe { Connection::from_handle(self.db)? };
@@ -371,15 +375,14 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                         meta_table
                     );
 
-                    if let Ok(entry_point_str) = conn.query_row(&entry_point_query, [], |row| row.get::<_, String>(0))
+                    if let Ok(entry_point_str) =
+                        conn.query_row(&entry_point_query, [], |row| row.get::<_, String>(0))
                         && let Ok(entry_point) = entry_point_str.parse::<i64>()
                         && entry_point >= 0
                     {
                         // Verify the entry point exists in nodes table
-                        let node_check = format!(
-                            "SELECT COUNT(*) FROM \"{}\" WHERE rowid=?",
-                            nodes_table
-                        );
+                        let node_check =
+                            format!("SELECT COUNT(*) FROM \"{}\" WHERE rowid=?", nodes_table);
                         let node_exists: i64 = conn
                             .query_row(&node_check, [entry_point], |row| row.get(0))
                             .unwrap_or(0);

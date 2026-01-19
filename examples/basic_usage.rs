@@ -45,7 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    println!("✓ Inserted {} vectors with automatic HNSW indexing", vectors.len());
+    println!(
+        "✓ Inserted {} vectors with automatic HNSW indexing",
+        vectors.len()
+    );
 
     // Query the count
     let count: i64 = db.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
@@ -79,11 +82,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n📏 Distance between vectors: {:.3}", distance);
 
     // Get vector length
-    let length: i64 = db.query_row(
-        "SELECT vec_length(vec_f32('[1.0, 2.0, 3.0]'))",
-        [],
-        |row| row.get(0),
-    )?;
+    let length: i64 = db.query_row("SELECT vec_length(vec_f32('[1.0, 2.0, 3.0]'))", [], |row| {
+        row.get(0)
+    })?;
     println!("📐 Vector dimensions: {}", length);
 
     // Get version
