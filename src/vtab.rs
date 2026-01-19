@@ -15,8 +15,8 @@ use std::os::raw::c_int;
 
 /// Register the vec0 virtual table module
 pub fn register_vec0_module(db: &Connection) -> Result<()> {
-    // Use update_module to support CREATE/INSERT/UPDATE/DELETE on virtual tables
-    let module = rusqlite::vtab::update_module::<Vec0Tab>();
+    // Use update_module_with_tx to support CREATE/INSERT/UPDATE/DELETE + transactions
+    let module = rusqlite::vtab::update_module_with_tx::<Vec0Tab>();
     db.create_module("vec0", module, None)
         .map_err(Error::Sqlite)?;
     Ok(())
@@ -790,6 +790,30 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl<'vtab> rusqlite::vtab::TransactionVTab<'vtab> for Vec0Tab {
+    fn begin(&mut self) -> rusqlite::Result<()> {
+        // No-op: page-cache based design persists immediately
+        // All changes are committed to shadow tables as they happen
+        Ok(())
+    }
+
+    fn sync(&mut self) -> rusqlite::Result<()> {
+        // No-op: no prepared statement caching yet
+        // Future: finalize temporary prepared statements and clear caches
+        Ok(())
+    }
+
+    fn commit(&mut self) -> rusqlite::Result<()> {
+        // No-op: page-cache based design persists immediately
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> rusqlite::Result<()> {
+        // No-op: SQLite handles rollback via shadow tables automatically
         Ok(())
     }
 }
