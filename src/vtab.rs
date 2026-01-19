@@ -318,6 +318,12 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                 }
             }
+
+            // Register MATCH operator for KNN queries
+            // This enables syntax like: WHERE embedding MATCH '[1,2,3]'
+            let conn = Connection::from_handle(db_handle)?;
+            conn.overload_function("match", 2)?;
+            std::mem::forget(conn); // Don't close the connection
         }
 
         Ok((sql, vtab))
@@ -326,6 +332,63 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
     fn destroy(&self) -> rusqlite::Result<()> {
         // Shadow tables are dropped automatically by SQLite when the virtual table is dropped
         Ok(())
+    }
+
+    fn integrity(&self, _schema: &str, _table_name: &str, _flags: c_int) -> rusqlite::Result<Option<String>> {
+        // Validate HNSW index consistency for each vector column
+        // SAFETY: db is a valid sqlite3 handle from SQLite
+        let conn = unsafe { Connection::from_handle(self.db)? };
+
+        for col in self.columns.iter() {
+            if let ColumnType::Vector { .. } = col.col_type {
+                // Check if HNSW shadow tables exist
+                let nodes_table = format!("{}__{}_hnsw_nodes", self.table_name, col.name);
+                let count_query = format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{}'",
+                    nodes_table
+                );
+
+                let table_exists: bool = conn
+                    .query_row(&count_query, [], |row| row.get::<_, i64>(0))
+                    .map(|count| count > 0)
+                    .unwrap_or(false);
+
+                if table_exists {
+                    // Basic validation: check that entry_point_rowid is valid
+                    let meta_table = format!("{}__{}_hnsw_meta", self.table_name, col.name);
+                    let entry_point_query = format!(
+                        "SELECT value FROM \"{}\" WHERE key='entry_point_rowid'",
+                        meta_table
+                    );
+
+                    if let Ok(entry_point_str) = conn.query_row(&entry_point_query, [], |row| row.get::<_, String>(0)) {
+                        if let Ok(entry_point) = entry_point_str.parse::<i64>() {
+                            if entry_point >= 0 {
+                                // Verify the entry point exists in nodes table
+                                let node_check = format!(
+                                    "SELECT COUNT(*) FROM \"{}\" WHERE rowid=?",
+                                    nodes_table
+                                );
+                                let node_exists: i64 = conn
+                                    .query_row(&node_check, [entry_point], |row| row.get(0))
+                                    .unwrap_or(0);
+
+                                if node_exists == 0 {
+                                    std::mem::forget(conn);
+                                    return Ok(Some(format!(
+                                        "HNSW index for column '{}': entry point rowid {} does not exist",
+                                        col.name, entry_point
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        std::mem::forget(conn);
+        Ok(None) // No errors found
     }
 }
 
