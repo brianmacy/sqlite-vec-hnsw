@@ -62,7 +62,10 @@ fn test_create_vec0_table_with_metadata() {
         [],
     );
 
-    assert!(result.is_ok(), "CREATE VIRTUAL TABLE with metadata should succeed");
+    assert!(
+        result.is_ok(),
+        "CREATE VIRTUAL TABLE with metadata should succeed"
+    );
 }
 
 #[test]
@@ -79,7 +82,10 @@ fn test_create_vec0_table_with_partition_keys() {
         [],
     );
 
-    assert!(result.is_ok(), "CREATE VIRTUAL TABLE with partition keys should succeed");
+    assert!(
+        result.is_ok(),
+        "CREATE VIRTUAL TABLE with partition keys should succeed"
+    );
 }
 
 #[test]
@@ -141,7 +147,9 @@ fn test_insert_and_query_vectors() {
     assert_eq!(count, 2, "Should have 2 rows");
 
     // Query rowids
-    let mut stmt = db.prepare("SELECT rowid FROM vec_test ORDER BY rowid").unwrap();
+    let mut stmt = db
+        .prepare("SELECT rowid FROM vec_test ORDER BY rowid")
+        .unwrap();
     let rowids: Vec<i64> = stmt
         .query_map([], |row| row.get(0))
         .unwrap()
@@ -165,7 +173,10 @@ fn test_multiple_vector_columns() {
         [],
     );
 
-    assert!(result.is_ok(), "CREATE TABLE with multiple vector columns should succeed");
+    assert!(
+        result.is_ok(),
+        "CREATE TABLE with multiple vector columns should succeed"
+    );
 
     // Verify shadow tables for both columns exist
     let shadow_count: i64 = db
@@ -190,7 +201,10 @@ fn test_int8_vector_type() {
         [],
     );
 
-    assert!(result.is_ok(), "CREATE TABLE with int8 vectors should succeed");
+    assert!(
+        result.is_ok(),
+        "CREATE TABLE with int8 vectors should succeed"
+    );
 }
 
 #[test]
@@ -204,7 +218,10 @@ fn test_binary_vector_type() {
         [],
     );
 
-    assert!(result.is_ok(), "CREATE TABLE with binary vectors should succeed");
+    assert!(
+        result.is_ok(),
+        "CREATE TABLE with binary vectors should succeed"
+    );
 }
 
 #[test]
@@ -228,10 +245,7 @@ fn test_delete_vector() {
     // Try DELETE (not yet implemented)
     let result = db.execute("DELETE FROM vec_del WHERE rowid = 1", []);
 
-    assert!(
-        result.is_err(),
-        "DELETE should fail (not yet implemented)"
-    );
+    assert!(result.is_err(), "DELETE should fail (not yet implemented)");
 }
 
 #[test]
@@ -258,10 +272,7 @@ fn test_update_vector() {
         [],
     );
 
-    assert!(
-        result.is_err(),
-        "UPDATE should fail (not yet implemented)"
-    );
+    assert!(result.is_err(), "UPDATE should fail (not yet implemented)");
 }
 
 #[test]
@@ -283,11 +294,10 @@ fn test_point_query_by_rowid() {
     .unwrap();
 
     // Point query by rowid - should work with full scan
-    let result: SqliteResult<i64> = db.query_row(
-        "SELECT rowid FROM vec_point WHERE rowid = 1",
-        [],
-        |row| row.get(0),
-    );
+    let result: SqliteResult<i64> =
+        db.query_row("SELECT rowid FROM vec_point WHERE rowid = 1", [], |row| {
+            row.get(0)
+        });
 
     // This might work with full scan even if point query optimization isn't implemented
     if let Ok(rowid) = result {
@@ -344,11 +354,8 @@ fn test_vec_f32_scalar_function() {
     init_extension(&db).expect("Failed to init extension");
 
     // Test vec_f32 function
-    let result: SqliteResult<Vec<u8>> = db.query_row(
-        "SELECT vec_f32('[1.0, 2.0, 3.0]')",
-        [],
-        |row| row.get(0),
-    );
+    let result: SqliteResult<Vec<u8>> =
+        db.query_row("SELECT vec_f32('[1.0, 2.0, 3.0]')", [], |row| row.get(0));
 
     assert!(result.is_ok(), "vec_f32 should work");
     let data = result.unwrap();
@@ -371,7 +378,10 @@ fn test_vec_distance_l2() {
 
     println!("L2 distance: {}", distance);
     // Distance should be sqrt(2) ≈ 1.414
-    assert!((distance - 1.414).abs() < 0.01, "L2 distance should be approximately sqrt(2)");
+    assert!(
+        (distance - 1.414).abs() < 0.01,
+        "L2 distance should be approximately sqrt(2)"
+    );
 }
 
 #[test]
@@ -493,7 +503,9 @@ fn test_chunk_allocation() {
 
     // Verify chunks table has entries
     let chunk_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM vec_chunks_chunks", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM vec_chunks_chunks", [], |row| {
+            row.get(0)
+        })
         .unwrap();
 
     assert!(chunk_count >= 1, "Should have at least one chunk");
@@ -526,7 +538,11 @@ fn test_vector_data_integrity() {
         )
         .unwrap();
 
-    assert_eq!(vector_data.len(), 12, "Should be 12 bytes for 3 float32 values");
+    assert_eq!(
+        vector_data.len(),
+        12,
+        "Should be 12 bytes for 3 float32 values"
+    );
 
     // Decode and verify values
     let floats: Vec<f32> = vector_data
@@ -605,7 +621,10 @@ fn test_knn_query_not_implemented() {
         db.execute(
             &format!(
                 "INSERT INTO vec_knn(rowid, embedding) VALUES ({}, vec_f32('[{}.0, {}.0, {}.0]'))",
-                i, i, i + 1, i + 2
+                i,
+                i,
+                i + 1,
+                i + 2
             ),
             [],
         )
@@ -625,7 +644,10 @@ fn test_knn_query_not_implemented() {
     if let Ok((rowid, distance)) = result {
         assert_eq!(rowid, 1); // Vector [1.0, 2.0, 3.0] is closest to itself
         assert!(distance < 0.01, "Distance to itself should be near zero");
-        println!("KNN query successful: rowid={}, distance={}", rowid, distance);
+        println!(
+            "KNN query successful: rowid={}, distance={}",
+            rowid, distance
+        );
     }
 }
 
@@ -694,7 +716,10 @@ fn test_knn_end_to_end() {
     // Expected to fail with current rusqlite limitations
     match result {
         Err(e) => {
-            println!("MATCH operator not supported (expected limitation): {:?}", e);
+            println!(
+                "MATCH operator not supported (expected limitation): {:?}",
+                e
+            );
             // This is acceptable - the HNSW infrastructure is complete,
             // just needs MATCH operator registration at C level
 
@@ -713,19 +738,17 @@ fn test_knn_end_to_end() {
         Ok(mut stmt) => {
             // If it works, verify results
             match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
-                Ok(rows) => {
-                    match rows.collect::<SqliteResult<Vec<(i64, f32)>>>() {
-                        Ok(results) => {
-                            println!("KNN results: {:?}", results);
-                            assert_eq!(results.len(), 3, "Should return k=3 results");
-                            assert_eq!(results[0].0, 1);
-                            assert!(results[0].1 < 0.01);
-                        }
-                        Err(e) => {
-                            println!("Result collection failed (MATCH limitation): {:?}", e);
-                        }
+                Ok(rows) => match rows.collect::<SqliteResult<Vec<(i64, f32)>>>() {
+                    Ok(results) => {
+                        println!("KNN results: {:?}", results);
+                        assert_eq!(results.len(), 3, "Should return k=3 results");
+                        assert_eq!(results[0].0, 1);
+                        assert!(results[0].1 < 0.01);
                     }
-                }
+                    Err(e) => {
+                        println!("Result collection failed (MATCH limitation): {:?}", e);
+                    }
+                },
                 Err(e) => {
                     println!("Query execution failed (MATCH limitation): {:?}", e);
                 }

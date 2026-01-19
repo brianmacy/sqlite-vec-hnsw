@@ -92,7 +92,7 @@ pub struct HnswMetadata {
     pub params: HnswParams,
 
     /// Entry point node
-    pub entry_point_rowid: i64,  // -1 if empty
+    pub entry_point_rowid: i64, // -1 if empty
     pub entry_point_level: i32,
 
     /// Statistics (approximate, not authoritative)
@@ -144,9 +144,14 @@ impl HnswMetadata {
         // Try to read metadata values
         let get_meta = |key: &str| -> Result<Option<String>> {
             let query = format!("SELECT value FROM \"{}\" WHERE key = ?", meta_table);
-            match db.query_row(&query, [key], |row| row.get::<_, String>(0)).optional() {
+            match db
+                .query_row(&query, [key], |row| row.get::<_, String>(0))
+                .optional()
+            {
                 Ok(opt) => Ok(opt),
-                Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::Unknown => {
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::Unknown =>
+                {
                     // Table doesn't exist
                     Ok(None)
                 }
@@ -162,43 +167,62 @@ impl HnswMetadata {
 
         let params = HnswParams {
             m: get_meta("M")?.and_then(|s| s.parse().ok()).unwrap_or(32),
-            max_m0: get_meta("max_M0")?.and_then(|s| s.parse().ok()).unwrap_or(64),
-            ef_construction: get_meta("ef_construction")?.and_then(|s| s.parse().ok()).unwrap_or(400),
-            ef_search: get_meta("ef_search")?.and_then(|s| s.parse().ok()).unwrap_or(200),
-            max_level: get_meta("max_level")?.and_then(|s| s.parse().ok()).unwrap_or(16),
-            level_factor: get_meta("level_factor")?.and_then(|s| s.parse().ok()).unwrap_or(1.0 / 32.0_f64.ln()),
+            max_m0: get_meta("max_M0")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64),
+            ef_construction: get_meta("ef_construction")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(400),
+            ef_search: get_meta("ef_search")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200),
+            max_level: get_meta("max_level")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16),
+            level_factor: get_meta("level_factor")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0 / 32.0_f64.ln()),
         };
 
         Ok(Some(HnswMetadata {
             params,
             entry_point_rowid,
-            entry_point_level: get_meta("entry_point_level")?.and_then(|s| s.parse().ok()).unwrap_or(-1),
-            num_nodes: get_meta("num_nodes")?.and_then(|s| s.parse().ok()).unwrap_or(0),
-            dimensions: get_meta("dimensions")?.and_then(|s| s.parse().ok()).unwrap_or(0),
-            element_type: get_meta("element_type")?.and_then(|s| match s.as_str() {
-                "float32" => Some(VectorType::Float32),
-                "int8" => Some(VectorType::Int8),
-                "bit" => Some(VectorType::Bit),
-                _ => None,
-            }).unwrap_or(VectorType::Float32),
-            distance_metric: get_meta("distance_metric")?.and_then(|s| match s.as_str() {
-                "l2" => Some(DistanceMetric::L2),
-                "cosine" => Some(DistanceMetric::Cosine),
-                "l1" => Some(DistanceMetric::L1),
-                _ => None,
-            }).unwrap_or(DistanceMetric::L2),
-            rng_seed: get_meta("rng_seed")?.and_then(|s| s.parse().ok()).unwrap_or(12345),
-            hnsw_version: get_meta("hnsw_version")?.and_then(|s| s.parse().ok()).unwrap_or(1),
+            entry_point_level: get_meta("entry_point_level")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1),
+            num_nodes: get_meta("num_nodes")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            dimensions: get_meta("dimensions")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            element_type: get_meta("element_type")?
+                .and_then(|s| match s.as_str() {
+                    "float32" => Some(VectorType::Float32),
+                    "int8" => Some(VectorType::Int8),
+                    "bit" => Some(VectorType::Bit),
+                    _ => None,
+                })
+                .unwrap_or(VectorType::Float32),
+            distance_metric: get_meta("distance_metric")?
+                .and_then(|s| match s.as_str() {
+                    "l2" => Some(DistanceMetric::L2),
+                    "cosine" => Some(DistanceMetric::Cosine),
+                    "l1" => Some(DistanceMetric::L1),
+                    _ => None,
+                })
+                .unwrap_or(DistanceMetric::L2),
+            rng_seed: get_meta("rng_seed")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(12345),
+            hnsw_version: get_meta("hnsw_version")?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
         }))
     }
 
     /// Save metadata to shadow table
-    pub fn save_to_db(
-        &self,
-        db: &Connection,
-        table_name: &str,
-        column_name: &str,
-    ) -> Result<()> {
+    pub fn save_to_db(&self, db: &Connection, table_name: &str, column_name: &str) -> Result<()> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
         let update_sql = format!(
             "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
@@ -207,18 +231,42 @@ impl HnswMetadata {
 
         db.execute(&update_sql, ["M", &self.params.m.to_string()])?;
         db.execute(&update_sql, ["max_M0", &self.params.max_m0.to_string()])?;
-        db.execute(&update_sql, ["ef_construction", &self.params.ef_construction.to_string()])?;
-        db.execute(&update_sql, ["ef_search", &self.params.ef_search.to_string()])?;
-        db.execute(&update_sql, ["max_level", &self.params.max_level.to_string()])?;
-        db.execute(&update_sql, ["level_factor", &self.params.level_factor.to_string()])?;
-        db.execute(&update_sql, ["entry_point_rowid", &self.entry_point_rowid.to_string()])?;
-        db.execute(&update_sql, ["entry_point_level", &self.entry_point_level.to_string()])?;
+        db.execute(
+            &update_sql,
+            ["ef_construction", &self.params.ef_construction.to_string()],
+        )?;
+        db.execute(
+            &update_sql,
+            ["ef_search", &self.params.ef_search.to_string()],
+        )?;
+        db.execute(
+            &update_sql,
+            ["max_level", &self.params.max_level.to_string()],
+        )?;
+        db.execute(
+            &update_sql,
+            ["level_factor", &self.params.level_factor.to_string()],
+        )?;
+        db.execute(
+            &update_sql,
+            ["entry_point_rowid", &self.entry_point_rowid.to_string()],
+        )?;
+        db.execute(
+            &update_sql,
+            ["entry_point_level", &self.entry_point_level.to_string()],
+        )?;
         db.execute(&update_sql, ["num_nodes", &self.num_nodes.to_string()])?;
         db.execute(&update_sql, ["dimensions", &self.dimensions.to_string()])?;
         db.execute(&update_sql, ["element_type", self.element_type.as_str()])?;
-        db.execute(&update_sql, ["distance_metric", self.distance_metric.as_str()])?;
+        db.execute(
+            &update_sql,
+            ["distance_metric", self.distance_metric.as_str()],
+        )?;
         db.execute(&update_sql, ["rng_seed", &self.rng_seed.to_string()])?;
-        db.execute(&update_sql, ["hnsw_version", &self.hnsw_version.to_string()])?;
+        db.execute(
+            &update_sql,
+            ["hnsw_version", &self.hnsw_version.to_string()],
+        )?;
 
         Ok(())
     }
@@ -361,9 +409,7 @@ mod tests {
 
         // Create and save metadata
         let metadata = HnswMetadata::new(384, VectorType::Float32, DistanceMetric::L2);
-        metadata
-            .save_to_db(&db, "test_table", "embedding")
-            .unwrap();
+        metadata.save_to_db(&db, "test_table", "embedding").unwrap();
 
         // Load it back
         let loaded = HnswMetadata::load_from_db(&db, "test_table", "embedding")

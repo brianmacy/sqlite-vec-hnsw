@@ -5,7 +5,7 @@
 
 use crate::distance;
 use crate::error::{Error, Result};
-use crate::hnsw::{search, storage, HnswMetadata};
+use crate::hnsw::{HnswMetadata, search, storage};
 use crate::vector::Vector;
 use rusqlite::Connection;
 
@@ -21,10 +21,12 @@ fn generate_level(metadata: &HnswMetadata) -> i32 {
     let mut hasher = random_state.build_hasher();
     hasher.write_u32(metadata.rng_seed);
     hasher.write_i32(metadata.num_nodes);
-    hasher.write_u64(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64);
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    );
 
     let random_val = (hasher.finish() % 1_000_000) as f64 / 1_000_000.0; // [0, 1)
 
@@ -38,10 +40,7 @@ fn generate_level(metadata: &HnswMetadata) -> i32 {
 /// Prune edges to maintain maximum M connections
 ///
 /// Keeps the M closest neighbors based on distance
-fn prune_edges(
-    candidates: &[(i64, f32)],
-    max_connections: usize,
-) -> Vec<(i64, f32)> {
+fn prune_edges(candidates: &[(i64, f32)], max_connections: usize) -> Vec<(i64, f32)> {
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     sorted.truncate(max_connections);
@@ -122,7 +121,12 @@ pub fn insert_hnsw(
     // Insert at each level from insertion level down to 0
     for lv in (0..=level).rev() {
         // Find M nearest neighbors at this level
-        let neighbors = search::search_layer(&ctx, current_nearest, metadata.params.ef_construction as usize, lv)?;
+        let neighbors = search::search_layer(
+            &ctx,
+            current_nearest,
+            metadata.params.ef_construction as usize,
+            lv,
+        )?;
 
         // Determine max connections for this level
         let max_connections = if lv == 0 {
@@ -159,7 +163,8 @@ pub fn insert_hnsw(
             )?;
 
             // Check if neighbor now has too many connections, prune if needed
-            let neighbor_edges = storage::fetch_neighbors(db, table_name, column_name, *neighbor_rowid, lv)?;
+            let neighbor_edges =
+                storage::fetch_neighbors(db, table_name, column_name, *neighbor_rowid, lv)?;
             if neighbor_edges.len() > max_connections {
                 // Need to prune neighbor's edges
                 // Fetch all neighbor's neighbors with distances
@@ -243,7 +248,8 @@ fn find_closest_at_level(
         let neighbors = storage::fetch_neighbors(db, table_name, column_name, current, level)?;
 
         for neighbor_rowid in neighbors {
-            let neighbor_node = storage::fetch_node_data(db, table_name, column_name, neighbor_rowid)?;
+            let neighbor_node =
+                storage::fetch_node_data(db, table_name, column_name, neighbor_rowid)?;
             let neighbor_node = match neighbor_node {
                 Some(n) => n,
                 None => continue,
@@ -254,7 +260,8 @@ fn find_closest_at_level(
                 metadata.element_type,
                 metadata.dimensions as usize,
             )?;
-            let neighbor_dist = distance::distance(query_vec, &neighbor_vec, metadata.distance_metric)?;
+            let neighbor_dist =
+                distance::distance(query_vec, &neighbor_vec, metadata.distance_metric)?;
 
             if neighbor_dist < current_dist {
                 current = neighbor_rowid;
@@ -299,13 +306,7 @@ mod tests {
 
     #[test]
     fn test_prune_edges_keeps_closest() {
-        let candidates = vec![
-            (1, 0.5),
-            (2, 0.3),
-            (3, 0.7),
-            (4, 0.2),
-            (5, 0.9),
-        ];
+        let candidates = vec![(1, 0.5), (2, 0.3), (3, 0.7), (4, 0.2), (5, 0.9)];
 
         let pruned = prune_edges(&candidates, 3);
 
@@ -351,9 +352,18 @@ mod tests {
         // Insert multiple vectors
         for i in 1..=5 {
             let vector = vec![
-                i as u8, 0, 0, 0,
-                (i + 1) as u8, 0, 0, 0,
-                (i + 2) as u8, 0, 0, 0,
+                i as u8,
+                0,
+                0,
+                0,
+                (i + 1) as u8,
+                0,
+                0,
+                0,
+                (i + 2) as u8,
+                0,
+                0,
+                0,
             ];
             insert_hnsw(&db, &mut metadata, "test_table", "embedding", i, &vector).unwrap();
         }
@@ -377,11 +387,7 @@ mod tests {
 
         // Insert a few vectors
         for i in 1..=3 {
-            let vector = vec![
-                i as u8, 0, 0, 0,
-                i as u8, 0, 0, 0,
-                i as u8, 0, 0, 0,
-            ];
+            let vector = vec![i as u8, 0, 0, 0, i as u8, 0, 0, 0, i as u8, 0, 0, 0];
             insert_hnsw(&db, &mut metadata, "test_table", "embedding", i, &vector).unwrap();
         }
 

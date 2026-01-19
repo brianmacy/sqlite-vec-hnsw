@@ -13,7 +13,7 @@
 //! - {table}_{column}_hnsw_levels: HNSW level index
 
 use crate::error::{Error, Result};
-use rusqlite::{ffi, Connection, OptionalExtension, Statement};
+use rusqlite::{Connection, OptionalExtension, Statement, ffi};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -720,10 +720,7 @@ pub fn write_vector_to_chunk(
     // Open or create the BLOB
     // First try to open, if it doesn't exist, insert a row
     let vectors_size = DEFAULT_CHUNK_SIZE * vector_data.len();
-    let check_sql = format!(
-        "SELECT 1 FROM \"{}\" WHERE rowid = ?",
-        table
-    );
+    let check_sql = format!("SELECT 1 FROM \"{}\" WHERE rowid = ?", table);
 
     let exists = db
         .query_row(&check_sql, [chunk_id], |_| Ok(()))
@@ -737,8 +734,11 @@ pub fn write_vector_to_chunk(
             "INSERT INTO \"{}\" (rowid, vectors) VALUES (?, zeroblob(?))",
             table
         );
-        db.execute(&insert_sql, rusqlite::params![chunk_id, vectors_size as i64])
-            .map_err(Error::Sqlite)?;
+        db.execute(
+            &insert_sql,
+            rusqlite::params![chunk_id, vectors_size as i64],
+        )
+        .map_err(Error::Sqlite)?;
     }
 
     // Now open the BLOB for writing
@@ -1201,11 +1201,9 @@ mod tests {
 
         // Verify chunk was created
         let count: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM test_table_chunks",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM test_table_chunks", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
     }

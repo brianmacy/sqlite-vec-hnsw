@@ -5,11 +5,11 @@ use crate::error::{Error, Result};
 use crate::hnsw::{self, HnswMetadata};
 use crate::shadow;
 use crate::vector::VectorType;
-use rusqlite::{ffi, Connection};
 use rusqlite::vtab::{
     Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, Values,
     sqlite3_vtab, sqlite3_vtab_cursor,
 };
+use rusqlite::{Connection, ffi};
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 
@@ -198,8 +198,12 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
             // Check for MATCH operator on a vector column
             if constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_MATCH {
                 let col_idx = constraint.column();
-                if col_idx >= 0 && (col_idx as usize) < self.columns.len()
-                    && matches!(self.columns[col_idx as usize].col_type, ColumnType::Vector { .. })
+                if col_idx >= 0
+                    && (col_idx as usize) < self.columns.len()
+                    && matches!(
+                        self.columns[col_idx as usize].col_type,
+                        ColumnType::Vector { .. }
+                    )
                 {
                     match_constraint = Some(i);
                 }
@@ -345,17 +349,18 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     // Auto-generate rowid by querying max rowid from _rowids table
                     // SAFETY: self.db is valid for the lifetime of the virtual table
                     unsafe {
-                        let conn = Connection::from_handle(self.db)
-                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+                        let conn = Connection::from_handle(self.db).map_err(|e| {
+                            rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                        })?;
 
                         let table_name = format!("{}_rowids", self.table_name);
                         let query = format!(
                             "SELECT COALESCE(MAX(rowid), 0) + 1 FROM \"{}\".\"{}\"",
-                            self.schema_name,
-                            table_name
+                            self.schema_name, table_name
                         );
 
-                        let auto_rowid = conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                        let auto_rowid = conn
+                            .query_row(&query, [], |row| row.get::<_, i64>(0))
                             .unwrap_or(1);
 
                         std::mem::forget(conn);
@@ -369,7 +374,11 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
 
         // Process vector columns
         for (col_idx, col) in self.columns.iter().enumerate() {
-            if let ColumnType::Vector { vec_type, dimensions } = &col.col_type {
+            if let ColumnType::Vector {
+                vec_type,
+                dimensions,
+            } = &col.col_type
+            {
                 let value_idx = col_idx + 2; // Skip NULL and rowid args
                 if value_idx >= args.len() {
                     continue;
@@ -392,7 +401,9 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     return Err(rusqlite::Error::UserFunctionError(Box::new(
                         Error::InvalidParameter(format!(
                             "Vector byte size mismatch: expected {} bytes for {} dimensions, got {} bytes",
-                            expected_bytes, dimensions, vector_data.len()
+                            expected_bytes,
+                            dimensions,
+                            vector_data.len()
                         )),
                     )));
                 }
@@ -415,20 +426,22 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 // Also insert into HNSW index
                 // SAFETY: self.db is valid for the lifetime of the virtual table
                 unsafe {
-                    let conn = Connection::from_handle(self.db)
-                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+                    let conn = Connection::from_handle(self.db).map_err(|e| {
+                        rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                    })?;
 
                     // Load or initialize HNSW metadata
-                    let mut metadata = HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
-                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
-                        .unwrap_or_else(|| {
-                            // Initialize new HNSW index
-                            HnswMetadata::new(
-                                *dimensions as i32,
-                                *vec_type,
-                                DistanceMetric::L2, // TODO: Make configurable
-                            )
-                        });
+                    let mut metadata =
+                        HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
+                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                            .unwrap_or_else(|| {
+                                // Initialize new HNSW index
+                                HnswMetadata::new(
+                                    *dimensions as i32,
+                                    *vec_type,
+                                    DistanceMetric::L2, // TODO: Make configurable
+                                )
+                            });
 
                     // Insert into HNSW graph
                     hnsw::insert::insert_hnsw(
@@ -505,8 +518,8 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
 
         // Parse idxStr to determine query plan
         let idx_str = idx_str.unwrap_or("1");
-        let (plan, _blocks) = parse_idxstr(idx_str)
-            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        let (plan, _blocks) =
+            parse_idxstr(idx_str).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
         match plan {
             QueryPlan::Knn => {
@@ -529,8 +542,9 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 // Execute HNSW search
                 // SAFETY: vtab.db is valid for the lifetime of the virtual table
                 let results = unsafe {
-                    let conn = Connection::from_handle(vtab.db)
-                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+                    let conn = Connection::from_handle(vtab.db).map_err(|e| {
+                        rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                    })?;
 
                     // Load HNSW metadata
                     let metadata = HnswMetadata::load_from_db(&conn, &vtab.table_name, &col.name)
@@ -568,8 +582,9 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 // Get all rowids from shadow tables
                 // SAFETY: vtab.db is valid for the lifetime of the virtual table
                 let rowids = unsafe {
-                    let conn = Connection::from_handle(vtab.db)
-                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+                    let conn = Connection::from_handle(vtab.db).map_err(|e| {
+                        rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                    })?;
 
                     let result = shadow::get_all_rowids(&conn, &vtab.schema_name, &vtab.table_name)
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
@@ -954,11 +969,9 @@ mod tests {
         }
 
         // Verify rowid mapping was created
-        let mapping_count = db.query_row(
-            "SELECT COUNT(*) FROM vec_test3_rowids",
-            [],
-            |row| row.get::<_, i64>(0),
-        );
+        let mapping_count = db.query_row("SELECT COUNT(*) FROM vec_test3_rowids", [], |row| {
+            row.get::<_, i64>(0)
+        });
 
         if let Ok(count) = mapping_count {
             println!("Rowid mappings: {}", count);
@@ -1010,7 +1023,9 @@ mod tests {
         assert_eq!(count, 3, "Should have 3 rows");
 
         // Query specific vectors
-        let mut stmt = db.prepare("SELECT rowid FROM vec_items ORDER BY rowid").unwrap();
+        let mut stmt = db
+            .prepare("SELECT rowid FROM vec_items ORDER BY rowid")
+            .unwrap();
         let rowids: Vec<i64> = stmt
             .query_map([], |row| row.get(0))
             .unwrap()

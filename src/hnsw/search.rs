@@ -5,8 +5,8 @@
 
 use crate::distance;
 use crate::error::{Error, Result};
-use crate::hnsw::storage;
 use crate::hnsw::HnswMetadata;
+use crate::hnsw::storage;
 use crate::vector::Vector;
 use rusqlite::Connection;
 use std::collections::{BinaryHeap, HashSet};
@@ -81,7 +81,11 @@ pub fn search_hnsw(
     let ef = ef_search.unwrap_or(metadata.params.ef_search).max(k as i32);
 
     // Parse query vector
-    let query_vec = Vector::from_blob(query_vector, metadata.element_type, metadata.dimensions as usize)?;
+    let query_vec = Vector::from_blob(
+        query_vector,
+        metadata.element_type,
+        metadata.dimensions as usize,
+    )?;
 
     // Create search context
     let ctx = SearchContext {
@@ -124,10 +128,17 @@ pub fn search_layer(
     let mut results = BinaryHeap::new();
 
     // Get entry point node
-    let entry_node = storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, entry_rowid)?
-        .ok_or_else(|| Error::InvalidParameter(format!("Entry point node {} not found", entry_rowid)))?;
+    let entry_node =
+        storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, entry_rowid)?
+            .ok_or_else(|| {
+                Error::InvalidParameter(format!("Entry point node {} not found", entry_rowid))
+            })?;
 
-    let entry_vec = Vector::from_blob(&entry_node.vector, ctx.metadata.element_type, ctx.metadata.dimensions as usize)?;
+    let entry_vec = Vector::from_blob(
+        &entry_node.vector,
+        ctx.metadata.element_type,
+        ctx.metadata.dimensions as usize,
+    )?;
     let entry_dist = distance::distance(ctx.query_vec, &entry_vec, ctx.metadata.distance_metric)?;
 
     candidates.push(SearchCandidate {
@@ -154,7 +165,13 @@ pub fn search_layer(
         }
 
         // Get neighbors of this candidate at the current level
-        let neighbors = storage::fetch_neighbors(ctx.db, ctx.table_name, ctx.column_name, candidate.rowid, level)?;
+        let neighbors = storage::fetch_neighbors(
+            ctx.db,
+            ctx.table_name,
+            ctx.column_name,
+            candidate.rowid,
+            level,
+        )?;
 
         for neighbor_rowid in neighbors {
             if visited.contains(&neighbor_rowid) {
@@ -163,7 +180,8 @@ pub fn search_layer(
             visited.insert(neighbor_rowid);
 
             // Fetch neighbor vector and calculate distance
-            let neighbor_node = storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, neighbor_rowid)?;
+            let neighbor_node =
+                storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, neighbor_rowid)?;
             let neighbor_node = match neighbor_node {
                 Some(n) => n,
                 None => continue, // Node deleted
@@ -174,7 +192,8 @@ pub fn search_layer(
                 ctx.metadata.element_type,
                 ctx.metadata.dimensions as usize,
             )?;
-            let neighbor_dist = distance::distance(ctx.query_vec, &neighbor_vec, ctx.metadata.distance_metric)?;
+            let neighbor_dist =
+                distance::distance(ctx.query_vec, &neighbor_vec, ctx.metadata.distance_metric)?;
 
             // Check if this neighbor is better than our worst result
             if results.len() < ef || neighbor_dist < results.peek().unwrap().distance {
@@ -223,7 +242,8 @@ mod tests {
         let metadata = HnswMetadata::new(3, VectorType::Float32, DistanceMetric::L2);
 
         let query = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // [1.0, 2.0, 3.0]
-        let results = search_hnsw(&db, &metadata, "test_table", "embedding", &query, 5, None).unwrap();
+        let results =
+            search_hnsw(&db, &metadata, "test_table", "embedding", &query, 5, None).unwrap();
 
         assert_eq!(results.len(), 0, "Empty index should return no results");
     }
@@ -245,11 +265,15 @@ mod tests {
 
         // Search for it
         let query = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // Same vector
-        let results = search_hnsw(&db, &metadata, "test_table", "embedding", &query, 1, None).unwrap();
+        let results =
+            search_hnsw(&db, &metadata, "test_table", "embedding", &query, 1, None).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
-        assert!(results[0].1 < 0.001, "Distance to itself should be near zero");
+        assert!(
+            results[0].1 < 0.001,
+            "Distance to itself should be near zero"
+        );
     }
 
     #[test]
