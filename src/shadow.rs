@@ -705,7 +705,7 @@ pub fn find_or_create_chunk(
 /// Write a vector to a vector_chunks table using BLOB operations
 pub fn write_vector_to_chunk(
     db: &Connection,
-    schema: &str,
+    _schema: &str,
     table_name: &str,
     column_idx: usize,
     chunk_id: i64,
@@ -721,8 +721,8 @@ pub fn write_vector_to_chunk(
     // First try to open, if it doesn't exist, insert a row
     let vectors_size = DEFAULT_CHUNK_SIZE * vector_data.len();
     let check_sql = format!(
-        "SELECT 1 FROM \"{}\".\"{}\".\"{}\" WHERE rowid = ?",
-        schema, schema, table
+        "SELECT 1 FROM \"{}\" WHERE rowid = ?",
+        table
     );
 
     let exists = db
@@ -734,8 +734,8 @@ pub fn write_vector_to_chunk(
     if !exists {
         // Create the blob row
         let insert_sql = format!(
-            "INSERT INTO \"{}\".\"{}\".\"{}\" (rowid, vectors) VALUES (?, zeroblob(?))",
-            schema, schema, table
+            "INSERT INTO \"{}\" (rowid, vectors) VALUES (?, zeroblob(?))",
+            table
         );
         db.execute(&insert_sql, rusqlite::params![chunk_id, vectors_size as i64])
             .map_err(Error::Sqlite)?;
@@ -820,6 +820,65 @@ pub fn insert_rowid_mapping(
         rusqlite::params![rowid, rusqlite::types::Null, chunk_id, chunk_offset],
     )
     .map_err(Error::Sqlite)?;
+
+    Ok(())
+}
+
+/// Perform a complete vector insert operation using raw FFI
+///
+/// # Safety
+/// Must be called with a valid sqlite3 database handle
+pub unsafe fn insert_vector_ffi(
+    db: *mut ffi::sqlite3,
+    schema: &str,
+    table_name: &str,
+    chunk_size: usize,
+    rowid: i64,
+    column_idx: usize,
+    vector_data: &[u8],
+) -> Result<()> {
+    // Wrap the raw handle in a Connection for our helper functions
+    // SAFETY: We're creating a non-owning Connection from the handle
+    // This is safe because we don't drop the Connection (we forget it)
+    let conn = unsafe { Connection::from_handle(db).map_err(Error::Sqlite)? };
+
+    // Step 1: Find or create a chunk with space
+    let allocation = find_or_create_chunk(&conn, schema, table_name, chunk_size)?;
+
+    // Step 2: Write the vector data to the chunk
+    write_vector_to_chunk(
+        &conn,
+        schema,
+        table_name,
+        column_idx,
+        allocation.chunk_id,
+        allocation.chunk_offset,
+        vector_data,
+    )?;
+
+    // Step 3: Update the chunk metadata
+    update_chunk_after_insert(
+        &conn,
+        schema,
+        table_name,
+        allocation.chunk_id,
+        allocation.chunk_offset,
+        allocation.chunk_size as usize,
+    )?;
+
+    // Step 4: Insert rowid mapping
+    insert_rowid_mapping(
+        &conn,
+        schema,
+        table_name,
+        rowid,
+        allocation.chunk_id,
+        allocation.chunk_offset,
+    )?;
+
+    // Forget the Connection to avoid double-free
+    // SAFETY: The Connection doesn't own the handle
+    std::mem::forget(conn);
 
     Ok(())
 }
