@@ -1,0 +1,29 @@
+[package]
+name = "sqlite-vec-hnsw"
+version = "0.1.0"
+edition = "2024"
+authors = ["Senzing"]
+license = "Apache-2.0"
+description = "SQLite extension for vector search with HNSW indexing"
+repository = "https://github.com/senzing/sqlite-vec-hnsw"
+
+[lib]
+name = "sqlite_vec_hnsw"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled", "vtab", "blob", "functions"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+simsimd = "6.3"
+
+[dev-dependencies]
+tempfile = "3.8"
+rand = "0.8"
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
