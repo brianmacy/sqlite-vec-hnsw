@@ -342,7 +342,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         for col in self.columns.iter() {
             if let ColumnType::Vector { .. } = col.col_type {
                 // Check if HNSW shadow tables exist
-                let nodes_table = format!("{}__{}_hnsw_nodes", self.table_name, col.name);
+                let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
                 let count_query = format!(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{}'",
                     nodes_table
@@ -355,7 +355,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
 
                 if table_exists {
                     // Basic validation: check that entry_point_rowid is valid
-                    let meta_table = format!("{}__{}_hnsw_meta", self.table_name, col.name);
+                    let meta_table = format!("{}_{}_hnsw_meta", self.table_name, col.name);
                     let entry_point_query = format!(
                         "SELECT value FROM \"{}\" WHERE key='entry_point_rowid'",
                         meta_table

@@ -324,31 +324,96 @@ fn register_vec_rebuild_hnsw(db: &Connection) -> Result<()> {
                 ));
             }
 
-            let _table_name = ctx.get::<String>(0)?;
-            let _column_name = ctx.get::<String>(1)?;
+            let table_name = ctx.get::<String>(0)?;
+            let column_name = ctx.get::<String>(1)?;
 
-            if argc == 4 {
-                let new_m = ctx.get::<i32>(2)?;
-                let new_ef_construction = ctx.get::<i32>(3)?;
+            let (new_m, new_ef_construction) = if argc == 4 {
+                let m = ctx.get::<i32>(2)?;
+                let ef = ctx.get::<i32>(3)?;
 
-                if !(2..=100).contains(&new_m) {
+                if !(2..=100).contains(&m) {
                     return Err(rusqlite::Error::UserFunctionError(
                         "M must be between 2 and 100".into(),
                     ));
                 }
-                if !(10..=2000).contains(&new_ef_construction) {
+                if !(10..=2000).contains(&ef) {
                     return Err(rusqlite::Error::UserFunctionError(
                         "ef_construction must be between 10 and 2000".into(),
                     ));
                 }
+                (Some(m), Some(ef))
+            } else {
+                (None, None)
+            };
+
+            // Get database connection using Context::get_connection()
+            let conn = unsafe { ctx.get_connection()? };
+
+            // Step 1: Count non-NULL vectors
+            let count_query = format!(
+                "SELECT COUNT(*) FROM \"{}\" WHERE \"{}\" IS NOT NULL",
+                table_name, column_name
+            );
+            let vector_count: i64 = conn.query_row(&count_query, [], |row| row.get(0))?;
+
+            // Step 2: Clear HNSW shadow tables
+            let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
+            let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+            let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
+
+            conn.execute(&format!("DELETE FROM \"{}\"", nodes_table), [])?;
+            conn.execute(&format!("DELETE FROM \"{}\"", edges_table), [])?;
+
+            // Step 3: Reset/update metadata
+            conn.execute(
+                &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('entry_point_rowid', '-1')", meta_table),
+                []
+            )?;
+            conn.execute(
+                &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('num_nodes', '0')", meta_table),
+                []
+            )?;
+            conn.execute(
+                &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('hnsw_version', '1')", meta_table),
+                []
+            )?;
+
+            if let Some(m) = new_m {
+                conn.execute(
+                    &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('M', '{}')", meta_table, m),
+                    []
+                )?;
+            }
+            if let Some(ef) = new_ef_construction {
+                conn.execute(
+                    &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('ef_construction', '{}')", meta_table, ef),
+                    []
+                )?;
             }
 
-            // rusqlite scalar functions don't have database access
-            // This would need to be implemented as a virtual table method or
-            // require C FFI to access sqlite3_context_db_handle()
-            Err(rusqlite::Error::UserFunctionError(
-                "vec_rebuild_hnsw() not yet supported (requires database handle access)".into(),
-            ))
+            // Step 4: Trigger rebuild by copying to temp, delete, and re-insert
+            // This causes all vectors to be re-inserted through the HNSW insert path
+            conn.execute(
+                &format!("CREATE TEMP TABLE _rebuild_temp AS SELECT rowid, \"{}\" FROM \"{}\" WHERE \"{}\" IS NOT NULL",
+                    column_name, table_name, column_name),
+                []
+            )?;
+
+            conn.execute(
+                &format!("UPDATE \"{}\" SET \"{}\" = NULL WHERE \"{}\" IS NOT NULL",
+                    table_name, column_name, column_name),
+                []
+            )?;
+
+            conn.execute(
+                &format!("UPDATE \"{}\" SET \"{}\" = (SELECT \"{}\" FROM _rebuild_temp WHERE _rebuild_temp.rowid = \"{}\".rowid) WHERE rowid IN (SELECT rowid FROM _rebuild_temp)",
+                    table_name, column_name, column_name, table_name),
+                []
+            )?;
+
+            conn.execute("DROP TABLE _rebuild_temp", [])?;
+
+            Ok(format!("Rebuilt HNSW index for {}.{}: {} vectors", table_name, column_name, vector_count))
         },
     )
     .map_err(Error::Sqlite)?;
