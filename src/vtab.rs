@@ -282,9 +282,31 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         // args[2..]: column values
 
         // Determine rowid
-        // TODO: Auto-generate rowid by querying max rowid from _rowids table
         let rowid = if args.len() > 1 {
-            args.get::<Option<i64>>(1)?.unwrap_or(1)
+            match args.get::<Option<i64>>(1)? {
+                Some(r) => r,
+                None => {
+                    // Auto-generate rowid by querying max rowid from _rowids table
+                    // SAFETY: self.db is valid for the lifetime of the virtual table
+                    unsafe {
+                        let conn = Connection::from_handle(self.db)
+                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                        let table_name = format!("{}_rowids", self.table_name);
+                        let query = format!(
+                            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM \"{}\".\"{}\"",
+                            self.schema_name,
+                            table_name
+                        );
+
+                        let auto_rowid = conn.query_row(&query, [], |row| row.get::<_, i64>(0))
+                            .unwrap_or(1);
+
+                        std::mem::forget(conn);
+                        auto_rowid
+                    }
+                }
+            }
         } else {
             1
         };
