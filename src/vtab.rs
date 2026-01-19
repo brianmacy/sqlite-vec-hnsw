@@ -163,6 +163,8 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
                 ColumnType::Metadata => sql.push_str(" TEXT"),
             }
         }
+        // Add hidden columns for KNN queries
+        sql.push_str(", distance REAL HIDDEN, k INTEGER HIDDEN");
         sql.push(')');
 
         // SAFETY: Store the database handle for later operations
@@ -182,11 +184,63 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        // For now, just do a full scan
-        // TODO: Implement proper query planning for KNN queries
+        use rusqlite::vtab::IndexConstraintOp;
+
+        let mut match_constraint = None;
+        let mut k_constraint = None;
+
+        // Scan constraints looking for MATCH and k operators
+        for (i, constraint) in info.constraints().enumerate() {
+            if !constraint.is_usable() {
+                continue;
+            }
+
+            // Check for MATCH operator on a vector column
+            if constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_MATCH {
+                let col_idx = constraint.column();
+                if col_idx >= 0 && (col_idx as usize) < self.columns.len()
+                    && matches!(self.columns[col_idx as usize].col_type, ColumnType::Vector { .. })
+                {
+                    match_constraint = Some(i);
+                }
+            }
+
+            // Check for k = ? constraint (hidden k column)
+            // The k column is added after all user columns
+            if constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
+                // k column is typically at index equal to number of columns
+                if constraint.column() as usize == self.columns.len() {
+                    k_constraint = Some(i);
+                }
+            }
+        }
+
+        // Determine query plan
+        if let Some(match_idx) = match_constraint
+            && k_constraint.is_some()
+        {
+            // KNN query with MATCH and k
+            info.set_idx_str("3{___}___"); // KNN plan: match + k
+            info.set_estimated_cost(10.0); // Low cost for indexed query
+            info.set_estimated_rows(10);
+
+            // Mark MATCH constraint as used (argv index 1)
+            info.constraint_usage(match_idx).set_argv_index(1);
+            info.constraint_usage(match_idx).set_omit(true);
+
+            // Mark k constraint as used (argv index 2)
+            if let Some(k_idx) = k_constraint {
+                info.constraint_usage(k_idx).set_argv_index(2);
+                info.constraint_usage(k_idx).set_omit(true);
+            }
+
+            return Ok(());
+        }
+
+        // Default: full scan
+        info.set_idx_str("1"); // FullScan query plan
         info.set_estimated_cost(1000000.0);
         info.set_estimated_rows(1000000);
-        info.set_idx_str("1"); // FullScan query plan
         Ok(())
     }
 
@@ -409,6 +463,7 @@ pub struct Vec0TabCursor<'vtab> {
     base: sqlite3_vtab_cursor,
     phantom: PhantomData<&'vtab Vec0Tab>,
     rowids: Vec<i64>,
+    distances: Vec<f32>, // For KNN queries
     current_index: usize,
 }
 
@@ -418,6 +473,7 @@ impl<'vtab> Vec0TabCursor<'vtab> {
             base: sqlite3_vtab_cursor::default(),
             phantom: PhantomData,
             rowids: Vec::new(),
+            distances: Vec::new(),
             current_index: 0,
         }
     }
@@ -431,32 +487,102 @@ impl<'vtab> Vec0TabCursor<'vtab> {
     fn current_rowid(&self) -> Option<i64> {
         self.rowids.get(self.current_index).copied()
     }
+
+    /// Get the current distance (for KNN queries)
+    fn current_distance(&self) -> Option<f32> {
+        self.distances.get(self.current_index).copied()
+    }
 }
 
 unsafe impl VTabCursor for Vec0TabCursor<'_> {
     fn filter(
         &mut self,
         _idx_num: c_int,
-        _idx_str: Option<&str>,
-        _args: &Values<'_>,
+        idx_str: Option<&str>,
+        args: &Values<'_>,
     ) -> rusqlite::Result<()> {
         let vtab = self.vtab();
 
-        // Get all rowids from shadow tables for full scan
-        // SAFETY: vtab.db is valid for the lifetime of the virtual table
-        let rowids = unsafe {
-            let conn = Connection::from_handle(vtab.db)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+        // Parse idxStr to determine query plan
+        let idx_str = idx_str.unwrap_or("1");
+        let (plan, _blocks) = parse_idxstr(idx_str)
+            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-            let result = shadow::get_all_rowids(&conn, &vtab.schema_name, &vtab.table_name)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+        match plan {
+            QueryPlan::Knn => {
+                // KNN query - extract query vector and k from args
+                let query_vector: Vec<u8> = args.get(0)?;
+                let k: i64 = args.get(1)?;
 
-            std::mem::forget(conn);
-            result
-        };
+                // Find the vector column (first vector column for now)
+                let (_col_idx, col) = vtab
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| matches!(c.col_type, ColumnType::Vector { .. }))
+                    .ok_or_else(|| {
+                        rusqlite::Error::UserFunctionError(Box::new(Error::InvalidParameter(
+                            "No vector column found for KNN query".to_string(),
+                        )))
+                    })?;
 
-        self.rowids = rowids;
-        self.current_index = 0;
+                // Execute HNSW search
+                // SAFETY: vtab.db is valid for the lifetime of the virtual table
+                let results = unsafe {
+                    let conn = Connection::from_handle(vtab.db)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                    // Load HNSW metadata
+                    let metadata = HnswMetadata::load_from_db(&conn, &vtab.table_name, &col.name)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                    let result = if let Some(meta) = metadata {
+                        // Use HNSW search
+                        hnsw::search::search_hnsw(
+                            &conn,
+                            &meta,
+                            &vtab.table_name,
+                            &col.name,
+                            &query_vector,
+                            k as usize,
+                            None,
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                    } else {
+                        // No HNSW index - fall back to brute force
+                        // TODO: Implement brute force search
+                        Vec::new()
+                    };
+
+                    std::mem::forget(conn);
+                    result
+                };
+
+                // Store results in cursor
+                self.rowids = results.iter().map(|(rowid, _)| *rowid).collect();
+                self.distances = results.iter().map(|(_, dist)| *dist).collect();
+                self.current_index = 0;
+            }
+            _ => {
+                // Full scan or other query types
+                // Get all rowids from shadow tables
+                // SAFETY: vtab.db is valid for the lifetime of the virtual table
+                let rowids = unsafe {
+                    let conn = Connection::from_handle(vtab.db)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                    let result = shadow::get_all_rowids(&conn, &vtab.schema_name, &vtab.table_name)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                    std::mem::forget(conn);
+                    result
+                };
+
+                self.rowids = rowids;
+                self.distances.clear();
+                self.current_index = 0;
+            }
+        }
 
         Ok(())
     }
@@ -482,6 +608,16 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 return Ok(());
             }
         };
+
+        // Check if this is the distance column (typically last column)
+        // Distance column is a hidden column that comes after all user columns
+        if col_idx == vtab.columns.len() {
+            // Return distance if we have it (from KNN query)
+            if let Some(dist) = self.current_distance() {
+                ctx.set_result(&dist)?;
+                return Ok(());
+            }
+        }
 
         // Check if this is a vector column
         if col_idx < vtab.columns.len()

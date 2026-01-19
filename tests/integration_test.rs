@@ -612,13 +612,87 @@ fn test_knn_query_not_implemented() {
         .unwrap();
     }
 
-    // KNN query (MATCH operator not yet implemented in best_index)
+    // KNN query using MATCH operator
     let result = db.query_row(
-        "SELECT rowid FROM vec_knn WHERE embedding MATCH '[1.0, 2.0, 3.0]' AND k = 3",
+        "SELECT rowid, distance FROM vec_knn WHERE embedding MATCH vec_f32('[1.0, 2.0, 3.0]') AND k = 3 ORDER BY distance",
         [],
-        |row| row.get::<_, i64>(0),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?)),
     );
 
-    // This will likely fail or return unexpected results until KNN is implemented
     println!("KNN query result: {:?}", result);
+
+    // Should work and return the closest vector
+    if let Ok((rowid, distance)) = result {
+        assert_eq!(rowid, 1); // Vector [1.0, 2.0, 3.0] is closest to itself
+        assert!(distance < 0.01, "Distance to itself should be near zero");
+        println!("KNN query successful: rowid={}, distance={}", rowid, distance);
+    }
+}
+
+#[test]
+fn test_knn_end_to_end() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_knn_test USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert test vectors
+    db.execute(
+        "INSERT INTO vec_knn_test(rowid, embedding) VALUES (1, vec_f32('[1.0, 0.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO vec_knn_test(rowid, embedding) VALUES (2, vec_f32('[0.0, 1.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO vec_knn_test(rowid, embedding) VALUES (3, vec_f32('[0.0, 0.0, 1.0]'))",
+        [],
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO vec_knn_test(rowid, embedding) VALUES (4, vec_f32('[1.0, 1.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO vec_knn_test(rowid, embedding) VALUES (5, vec_f32('[0.5, 0.5, 0.5]'))",
+        [],
+    )
+    .unwrap();
+
+    // Query for vectors nearest to [1.0, 0.0, 0.0]
+    let mut stmt = db
+        .prepare("SELECT rowid, distance FROM vec_knn_test WHERE embedding MATCH vec_f32('[1.0, 0.0, 0.0]') AND k = 3 ORDER BY distance")
+        .unwrap();
+
+    let results: Vec<(i64, f32)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<SqliteResult<Vec<_>>>()
+        .unwrap();
+
+    println!("KNN results: {:?}", results);
+
+    // Should return 3 nearest vectors
+    assert_eq!(results.len(), 3, "Should return k=3 results");
+
+    // First result should be rowid 1 (exact match)
+    assert_eq!(results[0].0, 1);
+    assert!(results[0].1 < 0.01, "Distance to itself should be near zero");
+
+    // Results should be sorted by distance
+    for i in 1..results.len() {
+        assert!(results[i].1 >= results[i - 1].1, "Results should be sorted by distance");
+    }
 }
