@@ -20,12 +20,7 @@ fn test_extension_loading() {
     let db = create_test_db().expect("Failed to create database");
     let result = init_extension(&db);
 
-    // Extension init should fail because not all functions are implemented yet
-    // (virtual table is still stubbed)
-    assert!(
-        result.is_err(),
-        "Extension initialization should fail (virtual table not yet implemented)"
-    );
+    assert!(result.is_ok(), "Extension initialization should succeed");
 }
 
 #[test]

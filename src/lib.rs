@@ -59,11 +59,7 @@ mod tests {
     #[test]
     fn test_extension_init() {
         let db = Connection::open_in_memory().unwrap();
-        // This will fail until we implement it
         let result = init(&db);
-        assert!(
-            result.is_err(),
-            "Extension init should fail (not yet implemented)"
-        );
+        assert!(result.is_ok(), "Extension init should succeed");
     }
 }
