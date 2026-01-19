@@ -1,6 +1,7 @@
 //! HNSW (Hierarchical Navigable Small World) index implementation
 
 pub mod insert;
+pub mod rebuild;
 pub mod search;
 pub mod storage;
 

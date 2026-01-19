@@ -41,6 +41,9 @@ pub fn register_all(db: &Connection) -> Result<()> {
     register_vec_version(db)?;
     let _ = register_vec_debug(db);
 
+    // Management functions
+    register_vec_rebuild_hnsw(db)?;
+
     Ok(())
 }
 
@@ -306,6 +309,50 @@ fn register_vec_debug(_db: &Connection) -> Result<()> {
     Err(Error::NotImplemented(
         "vec_debug() not yet implemented".to_string(),
     ))
+}
+
+fn register_vec_rebuild_hnsw(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_rebuild_hnsw",
+        -1, // Variable number of arguments (2 or 4)
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| -> rusqlite::Result<String> {
+            let argc = ctx.len();
+            if argc != 2 && argc != 4 {
+                return Err(rusqlite::Error::UserFunctionError(
+                    "vec_rebuild_hnsw() requires 2 or 4 arguments: table_name, column_name [, new_M, new_ef_construction]".into(),
+                ));
+            }
+
+            let _table_name = ctx.get::<String>(0)?;
+            let _column_name = ctx.get::<String>(1)?;
+
+            if argc == 4 {
+                let new_m = ctx.get::<i32>(2)?;
+                let new_ef_construction = ctx.get::<i32>(3)?;
+
+                if !(2..=100).contains(&new_m) {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        "M must be between 2 and 100".into(),
+                    ));
+                }
+                if !(10..=2000).contains(&new_ef_construction) {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        "ef_construction must be between 10 and 2000".into(),
+                    ));
+                }
+            }
+
+            // rusqlite scalar functions don't have database access
+            // This would need to be implemented as a virtual table method or
+            // require C FFI to access sqlite3_context_db_handle()
+            Err(rusqlite::Error::UserFunctionError(
+                "vec_rebuild_hnsw() not yet supported (requires database handle access)".into(),
+            ))
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
 #[cfg(test)]
