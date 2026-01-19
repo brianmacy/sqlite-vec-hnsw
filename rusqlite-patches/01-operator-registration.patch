@@ -1,0 +1,27 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1234567..abcdefg 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -500,6 +500,23 @@ impl Connection {
+         Ok(())
+     }
+
++    /// Register a custom operator for virtual tables
++    ///
++    /// This is typically used to enable MATCH operator for custom virtual tables.
++    /// For example, FTS5 uses this to register MATCH.
++    ///
++    /// # Example
++    /// ```rust
++    /// db.overload_function("match", 2)?;
++    /// ```
++    pub fn overload_function(&self, name: &str, n_arg: c_int) -> Result<()> {
++        let c_name = std::ffi::CString::new(name)?;
++        unsafe {
++            check(ffi::sqlite3_overload_function(self.db.borrow().db(), c_name.as_ptr(), n_arg))
++        }
++    }
++
+     /// Get the SQLite rowid of the most recent successful INSERT.
+     ///
+     /// Uses [sqlite3_last_insert_rowid](https://www.sqlite.org/c3ref/last_insert_rowid.html) under the hood.

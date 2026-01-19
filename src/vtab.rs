@@ -6,7 +6,8 @@ use crate::hnsw::{self, HnswMetadata};
 use crate::shadow;
 use crate::vector::VectorType;
 use rusqlite::vtab::{
-    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, Values,
+    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor,
+    Inserts, Updates, Filters,
     sqlite3_vtab, sqlite3_vtab_cursor,
 };
 use rusqlite::{Connection, OptionalExtension, ffi};
@@ -437,7 +438,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         Ok(())
     }
 
-    fn insert(&mut self, args: &Values<'_>) -> rusqlite::Result<i64> {
+    fn insert(&mut self, args: &Inserts<'_>) -> rusqlite::Result<i64> {
         // args[0]: NULL for auto-rowid
         // args[1]: new rowid (or NULL for auto)
         // args[2..]: column values
@@ -563,7 +564,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         Ok(rowid)
     }
 
-    fn update(&mut self, args: &Values<'_>) -> rusqlite::Result<()> {
+    fn update(&mut self, args: &Updates<'_>) -> rusqlite::Result<()> {
         // args[0]: old rowid
         // args[1]: new rowid (we don't support rowid changes)
         // args[2..]: new column values
@@ -760,7 +761,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
         &mut self,
         _idx_num: c_int,
         idx_str: Option<&str>,
-        args: &Values<'_>,
+        args: &Filters<'_>,
     ) -> rusqlite::Result<()> {
         let vtab = self.vtab();
 

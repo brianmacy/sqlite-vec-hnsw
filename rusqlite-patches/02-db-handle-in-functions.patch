@@ -1,0 +1,32 @@
+diff --git a/src/functions.rs b/src/functions.rs
+index 1234567..abcdefg 100644
+--- a/src/functions.rs
++++ b/src/functions.rs
+@@ -200,6 +200,26 @@ impl<'a> Context<'a> {
+         }
+     }
+
++    /// Get the database connection handle
++    ///
++    /// This allows scalar functions to execute queries or modify the database.
++    /// Use with caution as this breaks the typical stateless nature of SQL functions.
++    ///
++    /// # Safety
++    /// The returned connection borrows from this Context and must not outlive it.
++    /// The caller must ensure no conflicting database operations occur.
++    ///
++    /// # Example
++    /// ```rust
++    /// db.create_scalar_function("my_func", 1, FunctionFlags::default(), |ctx| {
++    ///     let conn = unsafe { ctx.get_connection()? };
++    ///     // Can now execute queries
++    ///     Ok(())
++    /// })?;
++    /// ```
++    pub unsafe fn get_connection(&self) -> Result<Connection> {
++        Connection::from_handle(ffi::sqlite3_context_db_handle(self.ctx))
++    }
++
+     /// Sets the auxilliary data associated with a particular parameter. See
+     /// <https://www.sqlite.org/c3ref/get_auxdata.html> for a discussion of
+     /// this capability.

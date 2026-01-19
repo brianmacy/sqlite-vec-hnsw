@@ -744,8 +744,8 @@ pub fn write_vector_to_chunk(
     // Now open the BLOB for writing
     let mut blob = db
         .blob_open(
-            rusqlite::DatabaseName::Main,
-            &table,
+            "main",
+            table.as_str(),
             "vectors",
             chunk_id,
             false, // read-write
@@ -939,8 +939,8 @@ pub fn read_vector_from_chunk(
 
     let mut blob = db
         .blob_open(
-            rusqlite::DatabaseName::Main,
-            &table,
+            "main",
+            table.as_str(),
             "vectors",
             chunk_id,
             true, // read-only

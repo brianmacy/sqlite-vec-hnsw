@@ -1,0 +1,73 @@
+diff --git a/src/vtab.rs b/src/vtab.rs
+index 1234567..abcdefg 100644
+--- a/src/vtab.rs
++++ b/src/vtab.rs
+@@ -150,6 +150,17 @@ pub trait VTab: Sized {
+     fn destroy(&self) -> Result<()> {
+         Ok(())
+     }
++
++    /// Called during PRAGMA integrity_check to validate virtual table
++    ///
++    /// Return Ok(None) if the table is valid, or Ok(Some(error_message)) if corrupted.
++    /// Available only with SQLite 3.44.0+
++    ///
++    /// Default implementation returns Ok(None) (no validation performed).
++    fn integrity(&self, _schema: &str, _table_name: &str, _flags: c_int) -> Result<Option<String>> {
++        // Default: no validation
++        Ok(None)
++    }
+ }
+
+ /// Virtual table cursors can set an error message by assigning a string to
+@@ -500,6 +511,39 @@ where
+     }
+ }
+
++#[cfg(feature = "vtab")]
++unsafe extern "C" fn rust_integrity<T: CreateVTab>(
++    vtab: *mut ffi::sqlite3_vtab,
++    schema: *const c_char,
++    tab_name: *const c_char,
++    flags: c_int,
++    pz_err: *mut *mut c_char,
++) -> c_int {
++    let vtab = vtab as *mut T::VTab;
++    let schema_str = match CStr::from_ptr(schema).to_str() {
++        Ok(s) => s,
++        Err(_) => return ffi::SQLITE_ERROR,
++    };
++    let table_str = match CStr::from_ptr(tab_name).to_str() {
++        Ok(s) => s,
++        Err(_) => return ffi::SQLITE_ERROR,
++    };
++
++    match (*vtab).integrity(schema_str, table_str, flags) {
++        Ok(None) => ffi::SQLITE_OK,
++        Ok(Some(err_msg)) => {
++            // Allocate error message for SQLite to free
++            let c_err = match CString::new(err_msg) {
++                Ok(s) => s,
++                Err(_) => return ffi::SQLITE_ERROR,
++            };
++            *pz_err = ffi::sqlite3_mprintf(c_str!("%s"), c_err.as_ptr());
++            ffi::SQLITE_ERROR
++        }
++        Err(_) => ffi::SQLITE_ERROR,
++    }
++}
++
+ #[cfg(feature = "vtab")]
+ unsafe extern "C" fn rust_update<T: CreateVTab>(
+     vtab: *mut ffi::sqlite3_vtab,
+@@ -600,6 +644,11 @@ where
+         xRename: None,
+         xSavepoint: None,
+         xRelease: None,
+         xRollbackTo: None,
++        #[cfg(all(feature = "vtab", sqlite_version_check(3, 44, 0)))]
++        xIntegrity: Some(rust_integrity::<T>),
++        #[cfg(not(all(feature = "vtab", sqlite_version_check(3, 44, 0))))]
++        xIntegrity: None,
+     }
+ }
