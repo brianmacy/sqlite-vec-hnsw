@@ -1,6 +1,7 @@
 //! Virtual table implementation for vec0
 
 use crate::error::{Error, Result};
+use crate::shadow;
 use crate::vector::VectorType;
 use rusqlite::Connection;
 use rusqlite::vtab::{
@@ -12,7 +13,8 @@ use std::os::raw::c_int;
 
 /// Register the vec0 virtual table module
 pub fn register_vec0_module(db: &Connection) -> Result<()> {
-    let module = rusqlite::vtab::eponymous_only_module::<Vec0Tab>();
+    // Use update_module to support CREATE/INSERT/UPDATE/DELETE on virtual tables
+    let module = rusqlite::vtab::update_module::<Vec0Tab>();
     db.create_module("vec0", module, None)
         .map_err(Error::Sqlite)?;
     Ok(())
@@ -26,13 +28,16 @@ struct ColumnDef {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum ColumnType {
     Vector {
+        #[allow(dead_code)]
         vec_type: VectorType,
+        #[allow(dead_code)]
         dimensions: usize,
     },
+    #[allow(dead_code)]
     PartitionKey,
+    #[allow(dead_code)]
     Auxiliary,
     Metadata,
 }
@@ -41,22 +46,26 @@ enum ColumnType {
 #[repr(C)]
 pub struct Vec0Tab {
     base: sqlite3_vtab,
+    schema_name: String,
+    table_name: String,
     columns: Vec<ColumnDef>,
-    rows: Vec<Row>,
-}
-
-#[derive(Debug, Clone)]
-struct Row {
-    rowid: i64,
-    data: Vec<Option<Vec<u8>>>,
+    chunk_size: usize,
 }
 
 impl Vec0Tab {
-    fn parse_create_args(args: &[&str]) -> Result<Vec<ColumnDef>> {
+    fn parse_create_args(args: &[&str]) -> Result<(String, String, Vec<ColumnDef>)> {
         let mut columns = Vec::new();
 
-        // Skip module name and table name (first two args)
-        for arg in args.iter().skip(2) {
+        // args[0] = module name ("vec0")
+        // args[1] = schema name (e.g., "main")
+        // args[2] = table name
+        // args[3..] = column definitions
+
+        let schema_name = args.get(1).unwrap_or(&"main").to_string();
+        let table_name = args.get(2).unwrap_or(&"vec_table").to_string();
+
+        // Skip module name, schema, and table name
+        for arg in args.iter().skip(3) {
             let arg = arg.trim();
             if arg.is_empty() {
                 continue;
@@ -90,8 +99,18 @@ impl Vec0Tab {
                             dimensions,
                         },
                     });
+                } else if type_spec.to_uppercase().contains("PARTITION") {
+                    columns.push(ColumnDef {
+                        name,
+                        col_type: ColumnType::PartitionKey,
+                    });
+                } else if parts.iter().any(|p| p.to_uppercase().starts_with('+')) {
+                    columns.push(ColumnDef {
+                        name: name.trim_start_matches('+').to_string(),
+                        col_type: ColumnType::Auxiliary,
+                    });
                 } else {
-                    // For now, treat other types as metadata
+                    // Default to metadata column
                     columns.push(ColumnDef {
                         name,
                         col_type: ColumnType::Metadata,
@@ -106,7 +125,7 @@ impl Vec0Tab {
             }
         }
 
-        Ok(columns)
+        Ok((schema_name, table_name, columns))
     }
 }
 
@@ -124,7 +143,7 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
             .map(|arg| std::str::from_utf8(arg).unwrap_or(""))
             .collect();
 
-        let columns = Self::parse_create_args(&args_str)
+        let (schema_name, table_name, columns) = Self::parse_create_args(&args_str)
             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
         // Build CREATE TABLE statement for SQLite
@@ -136,8 +155,9 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
             sql.push_str(&col.name);
             match &col.col_type {
                 ColumnType::Vector { .. } => sql.push_str(" BLOB"),
+                ColumnType::PartitionKey => sql.push_str(" INTEGER"),
+                ColumnType::Auxiliary => sql.push_str(" TEXT"),
                 ColumnType::Metadata => sql.push_str(" TEXT"),
-                _ => sql.push_str(" TEXT"),
             }
         }
         sql.push(')');
@@ -146,8 +166,10 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
             sql,
             Vec0Tab {
                 base: sqlite3_vtab::default(),
+                schema_name,
+                table_name,
                 columns,
-                rows: Vec::new(),
+                chunk_size: shadow::DEFAULT_CHUNK_SIZE,
             },
         ))
     }
@@ -174,81 +196,93 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         aux: Option<&Self::Aux>,
         args: &[&[u8]],
     ) -> rusqlite::Result<(String, Self)> {
-        // For vec0, create and connect are the same
-        Self::connect(db, aux, args)
+        // First, parse arguments and create the base virtual table
+        let (sql, vtab) = Self::connect(db, aux, args)?;
+
+        // Count column types
+        let num_vector_columns = vtab
+            .columns
+            .iter()
+            .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
+            .count();
+        let num_auxiliary_columns = vtab
+            .columns
+            .iter()
+            .filter(|c| matches!(c.col_type, ColumnType::Auxiliary))
+            .count();
+        let num_metadata_columns = vtab
+            .columns
+            .iter()
+            .filter(|c| matches!(c.col_type, ColumnType::Metadata))
+            .count();
+        let num_partition_columns = vtab
+            .columns
+            .iter()
+            .filter(|c| matches!(c.col_type, ColumnType::PartitionKey))
+            .count();
+
+        // Create shadow tables using raw FFI
+        // SAFETY: We're using the raw sqlite3 handle to execute DDL statements
+        // This is necessary because rusqlite's VTab trait doesn't provide
+        // a way to execute arbitrary SQL during table creation
+        unsafe {
+            let db_handle = db.handle();
+
+            // Create base shadow tables
+            let config = shadow::ShadowTablesConfig {
+                num_vector_columns,
+                num_auxiliary_columns,
+                num_metadata_columns,
+                has_text_pk: false, // TODO: detect from args
+                num_partition_columns,
+            };
+            shadow::create_shadow_tables_ffi(
+                db_handle,
+                &vtab.schema_name,
+                &vtab.table_name,
+                &config,
+            )
+            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            // Create HNSW shadow tables for vector columns
+            // TODO: Only create if use_hnsw=1 option is set
+            for col in vtab.columns.iter() {
+                if let ColumnType::Vector { .. } = col.col_type {
+                    shadow::create_hnsw_shadow_tables_ffi(db_handle, &vtab.table_name, &col.name)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                }
+            }
+        }
+
+        Ok((sql, vtab))
     }
 
     fn destroy(&self) -> rusqlite::Result<()> {
-        // No cleanup needed for in-memory table
+        // Shadow tables are dropped automatically by SQLite when the virtual table is dropped
         Ok(())
     }
 }
 
 impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
-    fn delete(&mut self, arg: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<()> {
-        let rowid = arg.as_i64()?;
-        self.rows.retain(|row| row.rowid != rowid);
-        Ok(())
+    fn delete(&mut self, _arg: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<()> {
+        // TODO: Implement delete using shadow tables
+        Err(rusqlite::Error::UserFunctionError(Box::new(
+            Error::NotImplemented("DELETE not yet implemented".to_string()),
+        )))
     }
 
-    fn insert(&mut self, args: &Values<'_>) -> rusqlite::Result<i64> {
-        // args[0]: NULL for auto-rowid
-        // args[1]: new rowid (or NULL for auto)
-        // args[2..]: column values
-
-        let new_rowid = if args.len() > 1 {
-            // Try to get rowid, or auto-generate
-            args.get::<Option<i64>>(1)?
-                .unwrap_or_else(|| self.rows.iter().map(|r| r.rowid).max().unwrap_or(0) + 1)
-        } else {
-            1
-        };
-
-        let mut data = Vec::new();
-        for i in 2..args.len() {
-            // Try to get as blob first (vectors), then as string
-            if let Ok(blob) = args.get::<Vec<u8>>(i) {
-                data.push(Some(blob));
-            } else if let Ok(text) = args.get::<String>(i) {
-                data.push(Some(text.into_bytes()));
-            } else {
-                data.push(None);
-            }
-        }
-
-        self.rows.push(Row {
-            rowid: new_rowid,
-            data,
-        });
-
-        Ok(new_rowid)
+    fn insert(&mut self, _args: &Values<'_>) -> rusqlite::Result<i64> {
+        // TODO: Implement insert using shadow tables
+        Err(rusqlite::Error::UserFunctionError(Box::new(
+            Error::NotImplemented("INSERT not yet implemented".to_string()),
+        )))
     }
 
-    fn update(&mut self, args: &Values<'_>) -> rusqlite::Result<()> {
-        // args[0]: old rowid
-        // args[1]: new rowid
-        // args[2..]: new column values
-
-        let old_rowid = args.get::<i64>(0)?;
-        let new_rowid = args.get::<i64>(1)?;
-
-        if let Some(row) = self.rows.iter_mut().find(|r| r.rowid == old_rowid) {
-            row.rowid = new_rowid;
-            row.data.clear();
-
-            for i in 2..args.len() {
-                // Try to get as blob first (vectors), then as string
-                if let Ok(blob) = args.get::<Vec<u8>>(i) {
-                    row.data.push(Some(blob));
-                } else if let Ok(text) = args.get::<String>(i) {
-                    row.data.push(Some(text.into_bytes()));
-                } else {
-                    row.data.push(None);
-                }
-            }
-        }
-
-        Ok(())
+    fn update(&mut self, _args: &Values<'_>) -> rusqlite::Result<()> {
+        // TODO: Implement update using shadow tables
+        Err(rusqlite::Error::UserFunctionError(Box::new(
+            Error::NotImplemented("UPDATE not yet implemented".to_string()),
+        )))
     }
 }
 
@@ -257,21 +291,22 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
 pub struct Vec0TabCursor<'vtab> {
     base: sqlite3_vtab_cursor,
     phantom: PhantomData<&'vtab Vec0Tab>,
-    current_row: usize,
-    row_count: usize,
+    current_row: i64,
+    eof: bool,
 }
 
 impl<'vtab> Vec0TabCursor<'vtab> {
-    fn new(table: &Vec0Tab) -> Self {
+    fn new(_table: &Vec0Tab) -> Self {
         Vec0TabCursor {
             base: sqlite3_vtab_cursor::default(),
             phantom: PhantomData,
             current_row: 0,
-            row_count: table.rows.len(),
+            eof: true, // Start at EOF since we have no data yet
         }
     }
 
     /// Accessor to the associated virtual table
+    #[allow(dead_code)]
     fn vtab(&self) -> &Vec0Tab {
         unsafe { &*(self.base.pVtab as *const Vec0Tab) }
     }
@@ -284,51 +319,32 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
         _idx_str: Option<&str>,
         _args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        // Reset to beginning
+        // TODO: Implement query execution using shadow tables
+        // For now, return empty result set
         self.current_row = 0;
+        self.eof = true;
         Ok(())
     }
 
     fn next(&mut self) -> rusqlite::Result<()> {
         self.current_row += 1;
+        // TODO: Check if we have more rows in shadow tables
+        self.eof = true;
         Ok(())
     }
 
     fn eof(&self) -> bool {
-        self.current_row >= self.row_count
+        self.eof
     }
 
-    fn column(&self, ctx: &mut Context, col: c_int) -> rusqlite::Result<()> {
-        let table = self.vtab();
-
-        if self.current_row >= table.rows.len() {
-            ctx.set_result(&rusqlite::types::Null)?;
-            return Ok(());
-        }
-
-        let row = &table.rows[self.current_row];
-        let col_idx = col as usize;
-
-        if col_idx < row.data.len() {
-            match &row.data[col_idx] {
-                Some(data) => ctx.set_result(&data.as_slice())?,
-                None => ctx.set_result(&rusqlite::types::Null)?,
-            }
-        } else {
-            ctx.set_result(&rusqlite::types::Null)?;
-        }
-
+    fn column(&self, ctx: &mut Context, _col: c_int) -> rusqlite::Result<()> {
+        // TODO: Implement column read from shadow tables
+        ctx.set_result(&rusqlite::types::Null)?;
         Ok(())
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        let table = self.vtab();
-
-        if self.current_row < table.rows.len() {
-            Ok(table.rows[self.current_row].rowid)
-        } else {
-            Ok(0)
-        }
+        Ok(self.current_row)
     }
 }
 
@@ -514,5 +530,85 @@ mod tests {
     fn test_parse_idxstr_invalid_header() {
         let result = parse_idxstr("X");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_virtual_table_creation_with_shadow_tables() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        // Create a vec0 virtual table with one vector column
+        db.execute(
+            "CREATE VIRTUAL TABLE vec_test USING vec0(embedding float[384])",
+            [],
+        )
+        .unwrap();
+
+        // Verify shadow tables were created
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_test%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        println!("Created tables: {:?}", tables);
+
+        // Check that expected shadow tables exist
+        assert!(
+            tables.contains(&"vec_test_chunks".to_string()),
+            "Missing _chunks table"
+        );
+        assert!(
+            tables.contains(&"vec_test_rowids".to_string()),
+            "Missing _rowids table"
+        );
+        assert!(
+            tables.contains(&"vec_test_vector_chunks00".to_string()),
+            "Missing _vector_chunks00 table"
+        );
+
+        // Check HNSW tables
+        assert!(
+            tables.contains(&"vec_test_embedding_hnsw_meta".to_string()),
+            "Missing HNSW meta table"
+        );
+        assert!(
+            tables.contains(&"vec_test_embedding_hnsw_nodes".to_string()),
+            "Missing HNSW nodes table"
+        );
+        assert!(
+            tables.contains(&"vec_test_embedding_hnsw_edges".to_string()),
+            "Missing HNSW edges table"
+        );
+        assert!(
+            tables.contains(&"vec_test_embedding_hnsw_levels".to_string()),
+            "Missing HNSW levels table"
+        );
+    }
+
+    #[test]
+    fn test_virtual_table_schema() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        // Create a vec0 virtual table
+        db.execute(
+            "CREATE VIRTUAL TABLE vec_test2 USING vec0(id INTEGER PRIMARY KEY, embedding float[768], category TEXT)",
+            [],
+        )
+        .unwrap();
+
+        // Verify we can query the table (even though it's empty)
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM vec_test2", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(count, 0, "New table should be empty");
     }
 }

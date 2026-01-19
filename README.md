@@ -2,7 +2,7 @@
 
 A Rust-based SQLite extension for vector similarity search with HNSW (Hierarchical Navigable Small World) indexing.
 
-> **Note:** This is a Rust port of [sqlite-vec](https://github.com/asg017/sqlite-vec) with modifications from Senzing. This project is pre-v1 and may have breaking changes.
+> **Note:** This is a Rust port of [sqlite-vec](https://github.com/asg017/sqlite-vec) that adds HNSW indexing support for fast approximate nearest neighbor search. This project is pre-v1 and may have breaking changes.
 
 ## Features
 
@@ -321,7 +321,6 @@ CREATE VIRTUAL TABLE vec_example USING vec0(
 
 For implementation details, see:
 - Original C project: https://github.com/asg017/sqlite-vec
-- Senzing modifications: `~/dev/G2/dev/libs/external/sqlite-vec`
 - Architecture documentation: See `CLAUDE.md`
 
 ## License

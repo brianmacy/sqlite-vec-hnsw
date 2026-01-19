@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust port of sqlite-vec, a SQLite extension providing vector search with HNSW indexing. Original C implementation at `~/dev/G2/dev/libs/external/sqlite-vec` (from https://github.com/asg017/sqlite-vec, modified by Senzing).
+Rust port of sqlite-vec with enhanced HNSW (Hierarchical Navigable Small World) indexing for fast approximate nearest neighbor search. Based on https://github.com/asg017/sqlite-vec with HNSW persistence and page-cache based implementation.
 
 ## Build Commands
 
@@ -86,8 +86,6 @@ The `idxStr` encodes query plans as a header character + 4-char blocks:
 - HNSW must be truly optimized (not acting as flat index)
 - Multi-process access must work correctly (transactional safety)
 - Benchmarks must use actual data, not estimates
-
-**Test against:** Original C implementation at `~/dev/G2/dev/libs/external/sqlite-vec`
 
 ## Reference Implementation
 

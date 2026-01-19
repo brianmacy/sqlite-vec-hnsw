@@ -6,6 +6,7 @@
 pub mod distance;
 pub mod error;
 pub mod hnsw;
+pub mod shadow;
 pub mod sql_functions;
 pub mod vector;
 pub mod vtab;
