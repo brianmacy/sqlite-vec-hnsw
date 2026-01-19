@@ -1,5 +1,7 @@
 //! HNSW (Hierarchical Navigable Small World) index implementation
 
+pub mod storage;
+
 use crate::distance::DistanceMetric;
 use crate::error::{Error, Result};
 use crate::vector::VectorType;
