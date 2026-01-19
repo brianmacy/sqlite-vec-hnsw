@@ -546,11 +546,149 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         Ok(rowid)
     }
 
-    fn update(&mut self, _args: &Values<'_>) -> rusqlite::Result<()> {
-        // TODO: Implement update using shadow tables
-        Err(rusqlite::Error::UserFunctionError(Box::new(
-            Error::NotImplemented("UPDATE not yet implemented".to_string()),
-        )))
+    fn update(&mut self, args: &Values<'_>) -> rusqlite::Result<()> {
+        // args[0]: old rowid
+        // args[1]: new rowid (we don't support rowid changes)
+        // args[2..]: new column values
+
+        if args.len() < 2 {
+            return Err(rusqlite::Error::UserFunctionError(Box::new(
+                Error::InvalidParameter("UPDATE requires at least 2 arguments".to_string()),
+            )));
+        }
+
+        // Get old and new rowids
+        let old_rowid = args.get::<i64>(0)?;
+        let new_rowid = args.get::<i64>(1)?;
+
+        // Check if rowid is being changed (not supported)
+        if old_rowid != new_rowid {
+            return Err(rusqlite::Error::UserFunctionError(Box::new(
+                Error::NotImplemented("Changing rowid in UPDATE is not supported".to_string()),
+            )));
+        }
+
+        // Process vector columns
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if let ColumnType::Vector {
+                vec_type,
+                dimensions,
+            } = &col.col_type
+            {
+                let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
+                if value_idx >= args.len() {
+                    continue;
+                }
+
+                // Get the new vector data
+                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx)? {
+                    Some(data) => data,
+                    None => continue, // NULL vector, skip (could implement DELETE here)
+                };
+
+                // Validate byte size
+                let expected_bytes = match vec_type {
+                    VectorType::Float32 => dimensions * 4,
+                    VectorType::Int8 => *dimensions,
+                    VectorType::Bit => dimensions.div_ceil(8),
+                };
+
+                if vector_data.len() != expected_bytes {
+                    return Err(rusqlite::Error::UserFunctionError(Box::new(
+                        Error::InvalidParameter(format!(
+                            "Vector byte size mismatch: expected {} bytes, got {}",
+                            expected_bytes,
+                            vector_data.len()
+                        )),
+                    )));
+                }
+
+                // SAFETY: self.db is valid for the lifetime of the virtual table
+                let conn = unsafe { Connection::from_handle(self.db)? };
+
+                // Get chunk position for this rowid
+                let rowids_table = format!("{}_rowids", self.table_name);
+                let query = format!(
+                    "SELECT chunk_id, chunk_offset FROM \"{}\".\"{}\" WHERE rowid = ?",
+                    self.schema_name, rowids_table
+                );
+
+                let chunk_info: Option<(i64, i64)> = conn
+                    .query_row(&query, [old_rowid], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?;
+
+                if let Some((chunk_id, chunk_offset)) = chunk_info {
+                    // Write new vector to shadow table (overwrite existing)
+                    shadow::write_vector_to_chunk(
+                        &conn,
+                        &self.schema_name,
+                        &self.table_name,
+                        col_idx,
+                        chunk_id,
+                        chunk_offset,
+                        &vector_data,
+                    )
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                    // Update HNSW index if column is a vector
+                    if matches!(col.col_type, ColumnType::Vector { .. }) {
+                        // Delete old HNSW node
+                        let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
+                        let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
+                        let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
+
+                        // Get old level before deletion
+                        let old_level: Option<i32> = conn
+                            .query_row(
+                                &format!("SELECT level FROM \"{}\" WHERE rowid = ?", nodes_table),
+                                [old_rowid],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+
+                        // Delete old node and edges
+                        let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table), [old_rowid]);
+                        let _ = conn.execute(
+                            &format!("DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?", edges_table),
+                            rusqlite::params![old_rowid, old_rowid],
+                        );
+                        let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table), [old_rowid]);
+
+                        // Insert new node into HNSW
+                        let mut metadata =
+                            HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                                .unwrap_or_else(|| {
+                                    HnswMetadata::new(
+                                        *dimensions as i32,
+                                        *vec_type,
+                                        DistanceMetric::L2,
+                                    )
+                                });
+
+                        // Decrement node count since we're replacing
+                        if old_level.is_some() {
+                            metadata.num_nodes = metadata.num_nodes.saturating_sub(1);
+                        }
+
+                        // Re-insert with new vector
+                        hnsw::insert::insert_hnsw(
+                            &conn,
+                            &mut metadata,
+                            &self.table_name,
+                            &col.name,
+                            old_rowid,
+                            &vector_data,
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    }
+                }
+
+                std::mem::forget(conn);
+            }
+        }
+
+        Ok(())
     }
 }
 

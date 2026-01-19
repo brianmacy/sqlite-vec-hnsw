@@ -298,13 +298,40 @@ fn test_update_vector() {
     )
     .unwrap();
 
-    // Try UPDATE (not yet implemented)
+    // Read original vector
+    let orig_vector: Vec<u8> = db
+        .query_row("SELECT embedding FROM vec_upd WHERE rowid = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    // UPDATE should now work
     let result = db.execute(
         "UPDATE vec_upd SET embedding = vec_f32('[4.0, 5.0, 6.0]') WHERE rowid = 1",
         [],
     );
+    assert!(result.is_ok(), "UPDATE should succeed");
 
-    assert!(result.is_err(), "UPDATE should fail (not yet implemented)");
+    // Read updated vector
+    let updated_vector: Vec<u8> = db
+        .query_row("SELECT embedding FROM vec_upd WHERE rowid = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    // Verify vector changed
+    assert_ne!(orig_vector, updated_vector, "Vector should have been updated");
+
+    // Decode and verify new values
+    let floats: Vec<f32> = updated_vector
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    assert_eq!(floats.len(), 3);
+    assert!((floats[0] - 4.0).abs() < 0.001);
+    assert!((floats[1] - 5.0).abs() < 0.001);
+    assert!((floats[2] - 6.0).abs() < 0.001);
 }
 
 #[test]
@@ -589,31 +616,6 @@ fn test_vector_data_integrity() {
 }
 
 // Tests for not-yet-implemented features
-
-#[test]
-fn test_update_vector_not_implemented() {
-    let db = create_test_db().expect("Failed to create database");
-    init_extension(&db).expect("Failed to init extension");
-
-    db.execute(
-        "CREATE VIRTUAL TABLE vec_upd USING vec0(embedding float[3])",
-        [],
-    )
-    .unwrap();
-
-    db.execute(
-        "INSERT INTO vec_upd(rowid, embedding) VALUES (1, vec_f32('[1.0, 2.0, 3.0]'))",
-        [],
-    )
-    .unwrap();
-
-    // UPDATE not yet implemented
-    let result = db.execute(
-        "UPDATE vec_upd SET embedding = vec_f32('[4.0, 5.0, 6.0]') WHERE rowid = 1",
-        [],
-    );
-    assert!(result.is_err(), "UPDATE not yet implemented");
-}
 
 #[test]
 fn test_knn_query_not_implemented() {
