@@ -12,12 +12,12 @@ use rusqlite::Connection;
 use std::collections::{BinaryHeap, HashSet};
 
 /// Search context to reduce parameter count
-struct SearchContext<'a> {
-    db: &'a Connection,
-    metadata: &'a HnswMetadata,
-    table_name: &'a str,
-    column_name: &'a str,
-    query_vec: &'a Vector,
+pub struct SearchContext<'a> {
+    pub db: &'a Connection,
+    pub metadata: &'a HnswMetadata,
+    pub table_name: &'a str,
+    pub column_name: &'a str,
+    pub query_vec: &'a Vector,
 }
 
 /// Search candidate with priority ordering
@@ -113,7 +113,7 @@ pub fn search_hnsw(
 /// Search a single layer for nearest neighbors
 ///
 /// This is the core HNSW search algorithm at one layer
-fn search_layer(
+pub fn search_layer(
     ctx: &SearchContext,
     entry_rowid: i64,
     ef: usize,
