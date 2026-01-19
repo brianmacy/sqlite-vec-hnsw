@@ -1,6 +1,8 @@
 //! Virtual table implementation for vec0
 
+use crate::distance::DistanceMetric;
 use crate::error::{Error, Result};
+use crate::hnsw::{self, HnswMetadata};
 use crate::shadow;
 use crate::vector::VectorType;
 use rusqlite::{ffi, Connection};
@@ -354,6 +356,38 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                         &vector_data,
                     )
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                }
+
+                // Also insert into HNSW index
+                // SAFETY: self.db is valid for the lifetime of the virtual table
+                unsafe {
+                    let conn = Connection::from_handle(self.db)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                    // Load or initialize HNSW metadata
+                    let mut metadata = HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                        .unwrap_or_else(|| {
+                            // Initialize new HNSW index
+                            HnswMetadata::new(
+                                *dimensions as i32,
+                                *vec_type,
+                                DistanceMetric::L2, // TODO: Make configurable
+                            )
+                        });
+
+                    // Insert into HNSW graph
+                    hnsw::insert::insert_hnsw(
+                        &conn,
+                        &mut metadata,
+                        &self.table_name,
+                        &col.name,
+                        rowid,
+                        &vector_data,
+                    )
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                    std::mem::forget(conn);
                 }
             }
         }
