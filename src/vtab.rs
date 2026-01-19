@@ -171,6 +171,15 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
         // SAFETY: Store the database handle for later operations
         let db_handle = unsafe { db.handle() };
 
+        // Register MATCH operator for KNN queries
+        // This needs to be done in connect() as well as create()
+        // because connect() is called when opening existing tables
+        unsafe {
+            let conn = Connection::from_handle(db_handle)?;
+            conn.overload_function("match", 2)?;
+            std::mem::forget(conn); // Don't close the connection
+        }
+
         Ok((
             sql,
             Vec0Tab {
@@ -211,10 +220,11 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
             }
 
             // Check for k = ? constraint (hidden k column)
-            // The k column is added after all user columns
+            // The k column is the last column: columns + distance + k
             if constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
-                // k column is typically at index equal to number of columns
-                if constraint.column() as usize == self.columns.len() {
+                // k column is at index: num_user_columns + 1 (distance is at num_user_columns)
+                let k_column_idx = self.columns.len() + 1;
+                if constraint.column() as usize == k_column_idx {
                     k_constraint = Some(i);
                 }
             }
