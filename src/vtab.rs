@@ -876,7 +876,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 let k: i64 = args.get(1)?;
 
                 // Find the vector column (first vector column for now)
-                let (_col_idx, col) = vtab
+                let (col_idx, col) = vtab
                     .columns
                     .iter()
                     .enumerate()
@@ -911,9 +911,16 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                     } else {
-                        // No HNSW index - fall back to brute force
-                        // TODO: Implement brute force search
-                        Vec::new()
+                        // No HNSW index - fall back to brute force search
+                        brute_force_search(
+                            &conn,
+                            &vtab.schema_name,
+                            &vtab.table_name,
+                            col_idx,
+                            &query_vector,
+                            k as usize,
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                     };
 
                     std::mem::forget(conn);
@@ -1102,6 +1109,74 @@ impl IdxStrKind {
             ))),
         }
     }
+}
+
+/// Brute force k-NN search when HNSW index is not available
+fn brute_force_search(
+    conn: &Connection,
+    schema: &str,
+    table_name: &str,
+    column_idx: usize,
+    query_vector: &[u8],
+    k: usize,
+) -> Result<Vec<(i64, f32)>> {
+    use crate::distance;
+    use crate::vector::Vector;
+
+    // Get all rowids
+    let rowids_table = format!("{}_rowids", table_name);
+    let mut stmt = conn
+        .prepare(&format!("SELECT rowid FROM \"{}\".\"{}\"", schema, rowids_table))
+        .map_err(Error::Sqlite)?;
+
+    let rowids: Vec<i64> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(Error::Sqlite)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::Sqlite)?;
+
+    drop(stmt);
+
+    // Parse query vector to get its properties
+    let query_vec = Vector::from_blob(query_vector, VectorType::Float32, query_vector.len() / 4)
+        .map_err(|_| Error::InvalidParameter("Invalid query vector format".to_string()))?;
+
+    // Calculate distances for all vectors
+    let mut distances = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        // Read vector from shadow table
+        let vector_bytes = match shadow::read_vector_from_chunk(
+            conn,
+            schema,
+            table_name,
+            column_idx,
+            rowid,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue, // NULL vector, skip
+            Err(_) => continue,   // Error reading vector, skip
+        };
+
+        // Parse vector and calculate distance
+        let vec = match Vector::from_blob(&vector_bytes, VectorType::Float32, vector_bytes.len() / 4)
+        {
+            Ok(v) => v,
+            Err(_) => continue, // Invalid vector, skip
+        };
+
+        let dist = match distance::distance(&query_vec, &vec, DistanceMetric::L2) {
+            Ok(d) => d,
+            Err(_) => continue, // Error calculating distance, skip
+        };
+
+        distances.push((rowid, dist));
+    }
+
+    // Sort by distance and take top k
+    distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    distances.truncate(k);
+
+    Ok(distances)
 }
 
 /// Parse idxStr into components
