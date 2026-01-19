@@ -20,10 +20,11 @@ fn test_extension_loading() {
     let db = create_test_db().expect("Failed to create database");
     let result = init_extension(&db);
 
-    // Extension init should fail (not yet implemented)
+    // Extension init should fail because not all functions are implemented yet
+    // (virtual table is still stubbed)
     assert!(
         result.is_err(),
-        "Extension initialization should fail (not yet implemented)"
+        "Extension initialization should fail (virtual table not yet implemented)"
     );
 }
 
@@ -191,25 +192,26 @@ fn test_knn_query_with_partition_key() {
 #[test]
 fn test_vec_distance_l2_function() {
     let db = create_test_db().expect("Failed to create database");
-    let _ = init_extension(&db);
+    // Register SQL functions directly (virtual table not needed for this test)
+    sqlite_vec_hnsw::sql_functions::register_all(&db).expect("Failed to register functions");
 
-    // Try to use vec_distance_l2 function
+    // Test vec_distance_l2 function
     let result: SqliteResult<f64> = db.query_row(
         "SELECT vec_distance_l2('[1.0, 2.0, 3.0]', '[4.0, 5.0, 6.0]')",
         [],
         |row| row.get(0),
     );
 
-    assert!(
-        result.is_err(),
-        "vec_distance_l2 function should fail (not registered)"
-    );
+    assert!(result.is_ok(), "vec_distance_l2 should work");
+    let distance = result.unwrap();
+    // sqrt((3^2 + 3^2 + 3^2)) = sqrt(27) ≈ 5.196
+    assert!((distance - 5.196).abs() < 0.01);
 }
 
 #[test]
 fn test_vec_distance_cosine_function() {
     let db = create_test_db().expect("Failed to create database");
-    let _ = init_extension(&db);
+    sqlite_vec_hnsw::sql_functions::register_all(&db).expect("Failed to register functions");
 
     let result: SqliteResult<f64> = db.query_row(
         "SELECT vec_distance_cosine('[1.0, 0.0, 0.0]', '[0.0, 1.0, 0.0]')",
@@ -217,32 +219,30 @@ fn test_vec_distance_cosine_function() {
         |row| row.get(0),
     );
 
-    assert!(
-        result.is_err(),
-        "vec_distance_cosine function should fail (not registered)"
-    );
+    assert!(result.is_ok(), "vec_distance_cosine should work");
+    let distance = result.unwrap();
+    // Orthogonal vectors have cosine distance of 1
+    assert!((distance - 1.0).abs() < 0.01);
 }
 
 #[test]
 fn test_vec_length_function() {
     let db = create_test_db().expect("Failed to create database");
-    let _ = init_extension(&db);
+    sqlite_vec_hnsw::sql_functions::register_all(&db).expect("Failed to register functions");
 
     let result: SqliteResult<i64> =
         db.query_row("SELECT vec_length('[1.0, 2.0, 3.0, 4.0]')", [], |row| {
             row.get(0)
         });
 
-    assert!(
-        result.is_err(),
-        "vec_length function should fail (not registered)"
-    );
+    assert!(result.is_ok(), "vec_length should work");
+    assert_eq!(result.unwrap(), 4);
 }
 
 #[test]
 fn test_vec_to_json_function() {
     let db = create_test_db().expect("Failed to create database");
-    let _ = init_extension(&db);
+    sqlite_vec_hnsw::sql_functions::register_all(&db).expect("Failed to register functions");
 
     let result: SqliteResult<String> = db.query_row(
         "SELECT vec_to_json(vec_f32('[1.0, 2.0, 3.0]'))",
@@ -250,10 +250,9 @@ fn test_vec_to_json_function() {
         |row| row.get(0),
     );
 
-    assert!(
-        result.is_err(),
-        "vec_to_json function should fail (not registered)"
-    );
+    assert!(result.is_ok(), "vec_to_json should work");
+    let json = result.unwrap();
+    assert_eq!(json, "[1.0,2.0,3.0]");
 }
 
 #[test]
@@ -305,14 +304,13 @@ fn test_vec_quantize_int8_function() {
 #[test]
 fn test_vec_version_function() {
     let db = create_test_db().expect("Failed to create database");
-    let _ = init_extension(&db);
+    sqlite_vec_hnsw::sql_functions::register_all(&db).expect("Failed to register functions");
 
     let result: SqliteResult<String> = db.query_row("SELECT vec_version()", [], |row| row.get(0));
 
-    assert!(
-        result.is_err(),
-        "vec_version function should fail (not registered)"
-    );
+    assert!(result.is_ok(), "vec_version should work");
+    let version = result.unwrap();
+    assert!(version.contains("sqlite-vec-hnsw"));
 }
 
 #[test]
