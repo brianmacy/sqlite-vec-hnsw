@@ -1,7 +1,7 @@
 //! HNSW index rebuild functionality
 
 use crate::error::{Error, Result};
-use crate::hnsw::{insert, HnswMetadata, HnswParams};
+use crate::hnsw::{HnswMetadata, HnswParams, insert};
 use rusqlite::Connection;
 
 /// Rebuild HNSW index from scratch
@@ -66,10 +66,8 @@ pub fn rebuild_hnsw_index(
     for rowid in rowids {
         // Read vector from shadow table
         let vector_data = crate::shadow::read_vector_from_chunk(
-            db,
-            "main", // TODO: Get actual schema name
-            table_name,
-            0, // TODO: Handle multiple vector columns
+            db, "main", // TODO: Get actual schema name
+            table_name, 0, // TODO: Handle multiple vector columns
             rowid,
         )?;
 
@@ -106,7 +104,7 @@ fn clear_hnsw_tables(db: &Connection, table_name: &str, column_name: &str) -> Re
 mod tests {
     use super::*;
     use crate::distance::DistanceMetric;
-    use crate::hnsw::{storage, HnswMetadata};
+    use crate::hnsw::{HnswMetadata, storage};
     use crate::shadow;
     use crate::vector::VectorType;
 

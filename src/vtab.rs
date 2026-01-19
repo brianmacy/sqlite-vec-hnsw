@@ -336,7 +336,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             _ => {
                 return Err(rusqlite::Error::UserFunctionError(Box::new(
                     Error::InvalidParameter("DELETE requires integer rowid".to_string()),
-                )))
+                )));
             }
         };
 
@@ -368,19 +368,30 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
 
                     // Delete node (ignore errors if table doesn't exist)
-                    let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table), [rowid]);
+                    let _ = conn.execute(
+                        &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
+                        [rowid],
+                    );
 
                     // Delete edges (ignore errors if table doesn't exist)
                     let _ = conn.execute(
-                        &format!("DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?", edges_table),
+                        &format!(
+                            "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
+                            edges_table
+                        ),
                         rusqlite::params![rowid, rowid],
                     );
 
                     // Delete from levels (ignore errors if table doesn't exist)
-                    let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table), [rowid]);
+                    let _ = conn.execute(
+                        &format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table),
+                        [rowid],
+                    );
 
                     // Update metadata if it exists
-                    if let Ok(Some(mut meta)) = HnswMetadata::load_from_db(&conn, &self.table_name, &col.name) {
+                    if let Ok(Some(mut meta)) =
+                        HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
+                    {
                         meta.num_nodes = meta.num_nodes.saturating_sub(1);
                         meta.hnsw_version += 1;
 
@@ -411,7 +422,13 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             }
 
             // Delete from rowids table
-            conn.execute(&format!("DELETE FROM \"{}\".\"{}\" WHERE rowid = ?", self.schema_name, rowids_table), [rowid])?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM \"{}\".\"{}\" WHERE rowid = ?",
+                    self.schema_name, rowids_table
+                ),
+                [rowid],
+            )?;
         }
 
         // Release connection without closing the database
@@ -647,12 +664,21 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             .optional()?;
 
                         // Delete old node and edges
-                        let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table), [old_rowid]);
                         let _ = conn.execute(
-                            &format!("DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?", edges_table),
+                            &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
+                            [old_rowid],
+                        );
+                        let _ = conn.execute(
+                            &format!(
+                                "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
+                                edges_table
+                            ),
                             rusqlite::params![old_rowid, old_rowid],
                         );
-                        let _ = conn.execute(&format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table), [old_rowid]);
+                        let _ = conn.execute(
+                            &format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table),
+                            [old_rowid],
+                        );
 
                         // Insert new node into HNSW
                         let mut metadata =

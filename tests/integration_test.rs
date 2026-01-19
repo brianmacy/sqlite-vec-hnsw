@@ -320,7 +320,10 @@ fn test_update_vector() {
         .unwrap();
 
     // Verify vector changed
-    assert_ne!(orig_vector, updated_vector, "Vector should have been updated");
+    assert_ne!(
+        orig_vector, updated_vector,
+        "Vector should have been updated"
+    );
 
     // Decode and verify new values
     let floats: Vec<f32> = updated_vector

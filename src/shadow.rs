@@ -984,7 +984,10 @@ pub fn mark_chunk_row_invalid(
     chunk_offset: usize,
 ) -> Result<()> {
     // Read current validity bitmap
-    let query = format!("SELECT validity FROM \"{}\" WHERE chunk_id = ?", chunks_table);
+    let query = format!(
+        "SELECT validity FROM \"{}\" WHERE chunk_id = ?",
+        chunks_table
+    );
 
     let validity_data: Vec<u8> = db
         .query_row(&query, [chunk_id], |row| row.get(0))
@@ -995,9 +998,15 @@ pub fn mark_chunk_row_invalid(
     validity.clear(chunk_offset);
 
     // Write back to database
-    let update_sql = format!("UPDATE \"{}\" SET validity = ? WHERE chunk_id = ?", chunks_table);
-    db.execute(&update_sql, rusqlite::params![validity.as_bytes(), chunk_id])
-        .map_err(Error::Sqlite)?;
+    let update_sql = format!(
+        "UPDATE \"{}\" SET validity = ? WHERE chunk_id = ?",
+        chunks_table
+    );
+    db.execute(
+        &update_sql,
+        rusqlite::params![validity.as_bytes(), chunk_id],
+    )
+    .map_err(Error::Sqlite)?;
 
     Ok(())
 }
