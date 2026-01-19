@@ -13,13 +13,79 @@
 //! - {table}_{column}_hnsw_levels: HNSW level index
 
 use crate::error::{Error, Result};
-use rusqlite::{Connection, Statement, ffi};
+use rusqlite::{ffi, Connection, OptionalExtension, Statement};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 
 /// Default chunk size (number of vectors per chunk)
 pub const DEFAULT_CHUNK_SIZE: usize = 256;
+
+/// Chunk information returned when allocating space for a new vector
+#[derive(Debug, Clone)]
+pub struct ChunkAllocation {
+    pub chunk_id: i64,
+    pub chunk_offset: i64,
+    pub chunk_size: i64,
+}
+
+/// Validity bitmap operations for tracking which vectors are valid in a chunk
+pub struct ValidityBitmap {
+    data: Vec<u8>,
+}
+
+impl ValidityBitmap {
+    /// Create a new validity bitmap for the given chunk size
+    pub fn new(chunk_size: usize) -> Self {
+        let byte_size = chunk_size.div_ceil(8);
+        ValidityBitmap {
+            data: vec![0u8; byte_size],
+        }
+    }
+
+    /// Create from existing data
+    pub fn from_bytes(data: Vec<u8>) -> Self {
+        ValidityBitmap { data }
+    }
+
+    /// Check if a bit is set
+    pub fn is_set(&self, offset: usize) -> bool {
+        let byte_idx = offset / 8;
+        let bit_idx = offset % 8;
+        if byte_idx >= self.data.len() {
+            return false;
+        }
+        (self.data[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    /// Set a bit
+    pub fn set(&mut self, offset: usize) {
+        let byte_idx = offset / 8;
+        let bit_idx = offset % 8;
+        if byte_idx < self.data.len() {
+            self.data[byte_idx] |= 1 << bit_idx;
+        }
+    }
+
+    /// Clear a bit
+    pub fn clear(&mut self, offset: usize) {
+        let byte_idx = offset / 8;
+        let bit_idx = offset % 8;
+        if byte_idx < self.data.len() {
+            self.data[byte_idx] &= !(1 << bit_idx);
+        }
+    }
+
+    /// Get the raw bytes
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Find the first unset bit (returns None if all bits are set)
+    pub fn find_first_unset(&self, max_offset: usize) -> Option<usize> {
+        (0..max_offset).find(|&offset| !self.is_set(offset))
+    }
+}
 
 /// Configuration for shadow table creation
 pub struct ShadowTablesConfig {
@@ -579,6 +645,185 @@ impl<'conn> Default for StatementCache<'conn> {
     }
 }
 
+/// Find or create a chunk with available space for inserting a vector
+///
+/// This implements the chunk allocation strategy from the C version
+pub fn find_or_create_chunk(
+    db: &Connection,
+    schema: &str,
+    table_name: &str,
+    chunk_size: usize,
+) -> Result<ChunkAllocation> {
+    // Try to find an existing chunk with space
+    let query = format!(
+        "SELECT chunk_id, size FROM \"{}\".\"{}_chunks\" \
+         WHERE size < ? ORDER BY chunk_id DESC LIMIT 1",
+        schema, table_name
+    );
+
+    let mut stmt = db.prepare(&query).map_err(Error::Sqlite)?;
+    let result = stmt
+        .query_row([chunk_size as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .optional()
+        .map_err(Error::Sqlite)?;
+
+    if let Some((chunk_id, size)) = result {
+        // Found a chunk with space
+        return Ok(ChunkAllocation {
+            chunk_id,
+            chunk_offset: size,
+            chunk_size: size,
+        });
+    }
+
+    // No chunk with space, create a new one
+    let validity = ValidityBitmap::new(chunk_size);
+    let rowids_blob = vec![0u8; chunk_size * 8]; // 8 bytes per rowid
+
+    let insert_sql = format!(
+        "INSERT INTO \"{}\".\"{}_chunks\" (size, validity, rowids) VALUES (?, ?, ?)",
+        schema, table_name
+    );
+
+    db.execute(
+        &insert_sql,
+        rusqlite::params![0i64, validity.as_bytes(), rowids_blob],
+    )
+    .map_err(Error::Sqlite)?;
+
+    let chunk_id = db.last_insert_rowid();
+
+    Ok(ChunkAllocation {
+        chunk_id,
+        chunk_offset: 0,
+        chunk_size: 0,
+    })
+}
+
+/// Write a vector to a vector_chunks table using BLOB operations
+pub fn write_vector_to_chunk(
+    db: &Connection,
+    schema: &str,
+    table_name: &str,
+    column_idx: usize,
+    chunk_id: i64,
+    chunk_offset: i64,
+    vector_data: &[u8],
+) -> Result<()> {
+    let table = format!("{}_vector_chunks{:02}", table_name, column_idx);
+
+    // Calculate byte offset within the chunk
+    let byte_offset = (chunk_offset * vector_data.len() as i64) as usize;
+
+    // Open or create the BLOB
+    // First try to open, if it doesn't exist, insert a row
+    let vectors_size = DEFAULT_CHUNK_SIZE * vector_data.len();
+    let check_sql = format!(
+        "SELECT 1 FROM \"{}\".\"{}\".\"{}\" WHERE rowid = ?",
+        schema, schema, table
+    );
+
+    let exists = db
+        .query_row(&check_sql, [chunk_id], |_| Ok(()))
+        .optional()
+        .map_err(Error::Sqlite)?
+        .is_some();
+
+    if !exists {
+        // Create the blob row
+        let insert_sql = format!(
+            "INSERT INTO \"{}\".\"{}\".\"{}\" (rowid, vectors) VALUES (?, zeroblob(?))",
+            schema, schema, table
+        );
+        db.execute(&insert_sql, rusqlite::params![chunk_id, vectors_size as i64])
+            .map_err(Error::Sqlite)?;
+    }
+
+    // Now open the BLOB for writing
+    let mut blob = db
+        .blob_open(
+            rusqlite::DatabaseName::Main,
+            &table,
+            "vectors",
+            chunk_id,
+            false, // read-write
+        )
+        .map_err(Error::Sqlite)?;
+
+    // Write the vector data at the correct offset
+    use std::io::{Seek, SeekFrom, Write};
+    blob.seek(SeekFrom::Start(byte_offset as u64))
+        .map_err(|e| Error::InvalidParameter(format!("Seek failed: {}", e)))?;
+    blob.write_all(vector_data)
+        .map_err(|e| Error::InvalidParameter(format!("Write failed: {}", e)))?;
+    blob.close().map_err(Error::Sqlite)?;
+
+    Ok(())
+}
+
+/// Update the validity bitmap and chunk size after inserting a vector
+pub fn update_chunk_after_insert(
+    db: &Connection,
+    schema: &str,
+    table_name: &str,
+    chunk_id: i64,
+    chunk_offset: i64,
+    chunk_size: usize,
+) -> Result<()> {
+    // Read current validity bitmap
+    let query = format!(
+        "SELECT validity FROM \"{}\".\"{}_chunks\" WHERE chunk_id = ?",
+        schema, table_name
+    );
+    let validity_data: Vec<u8> = db
+        .query_row(&query, [chunk_id], |row| row.get(0))
+        .map_err(Error::Sqlite)?;
+
+    let mut validity = ValidityBitmap::from_bytes(validity_data);
+    validity.set(chunk_offset as usize);
+
+    // Update the chunk
+    let new_size = (chunk_offset + 1).max(chunk_size as i64);
+    let update_sql = format!(
+        "UPDATE \"{}\".\"{}_chunks\" SET size = ?, validity = ? WHERE chunk_id = ?",
+        schema, table_name
+    );
+
+    db.execute(
+        &update_sql,
+        rusqlite::params![new_size, validity.as_bytes(), chunk_id],
+    )
+    .map_err(Error::Sqlite)?;
+
+    Ok(())
+}
+
+/// Insert or update rowid mapping
+pub fn insert_rowid_mapping(
+    db: &Connection,
+    schema: &str,
+    table_name: &str,
+    rowid: i64,
+    chunk_id: i64,
+    chunk_offset: i64,
+) -> Result<()> {
+    let insert_sql = format!(
+        "INSERT OR REPLACE INTO \"{}\".\"{}_rowids\" (rowid, id, chunk_id, chunk_offset) \
+         VALUES (?, ?, ?, ?)",
+        schema, table_name
+    );
+
+    db.execute(
+        &insert_sql,
+        rusqlite::params![rowid, rusqlite::types::Null, chunk_id, chunk_offset],
+    )
+    .map_err(Error::Sqlite)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +967,164 @@ mod tests {
         // Cache starts empty, so clear should work without errors
         cache.clear();
         assert!(cache.get_chunk_position.is_none());
+    }
+
+    #[test]
+    fn test_validity_bitmap_basic() {
+        let mut bitmap = ValidityBitmap::new(256);
+
+        // Initially all bits should be unset
+        assert!(!bitmap.is_set(0));
+        assert!(!bitmap.is_set(100));
+        assert!(!bitmap.is_set(255));
+
+        // Set some bits
+        bitmap.set(0);
+        bitmap.set(100);
+        bitmap.set(255);
+
+        assert!(bitmap.is_set(0));
+        assert!(bitmap.is_set(100));
+        assert!(bitmap.is_set(255));
+        assert!(!bitmap.is_set(50));
+
+        // Clear a bit
+        bitmap.clear(100);
+        assert!(!bitmap.is_set(100));
+    }
+
+    #[test]
+    fn test_validity_bitmap_find_first_unset() {
+        let mut bitmap = ValidityBitmap::new(256);
+
+        // First unset should be 0
+        assert_eq!(bitmap.find_first_unset(256), Some(0));
+
+        // Set first 5 bits
+        for i in 0..5 {
+            bitmap.set(i);
+        }
+
+        // First unset should now be 5
+        assert_eq!(bitmap.find_first_unset(256), Some(5));
+
+        // Set all bits
+        for i in 0..256 {
+            bitmap.set(i);
+        }
+
+        // No unset bits
+        assert_eq!(bitmap.find_first_unset(256), None);
+    }
+
+    #[test]
+    fn test_find_or_create_chunk() {
+        let db = Connection::open_in_memory().unwrap();
+
+        // Create shadow tables
+        let config = ShadowTablesConfig {
+            num_vector_columns: 1,
+            num_auxiliary_columns: 0,
+            num_metadata_columns: 0,
+            has_text_pk: false,
+            num_partition_columns: 0,
+        };
+        create_shadow_tables(&db, "main", "test_table", &config).unwrap();
+
+        // First allocation should create a new chunk
+        let allocation = find_or_create_chunk(&db, "main", "test_table", 256).unwrap();
+        assert_eq!(allocation.chunk_offset, 0);
+        assert_eq!(allocation.chunk_size, 0);
+
+        // Verify chunk was created
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM test_table_chunks",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_insert_rowid_mapping() {
+        let db = Connection::open_in_memory().unwrap();
+
+        let config = ShadowTablesConfig {
+            num_vector_columns: 1,
+            num_auxiliary_columns: 0,
+            num_metadata_columns: 0,
+            has_text_pk: false,
+            num_partition_columns: 0,
+        };
+        create_shadow_tables(&db, "main", "test_table", &config).unwrap();
+
+        // Insert a rowid mapping
+        insert_rowid_mapping(&db, "main", "test_table", 1, 100, 5).unwrap();
+
+        // Verify it was inserted
+        let (chunk_id, chunk_offset): (i64, i64) = db
+            .query_row(
+                "SELECT chunk_id, chunk_offset FROM test_table_rowids WHERE rowid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(chunk_id, 100);
+        assert_eq!(chunk_offset, 5);
+    }
+
+    #[test]
+    fn test_update_chunk_after_insert() {
+        let db = Connection::open_in_memory().unwrap();
+
+        let config = ShadowTablesConfig {
+            num_vector_columns: 1,
+            num_auxiliary_columns: 0,
+            num_metadata_columns: 0,
+            has_text_pk: false,
+            num_partition_columns: 0,
+        };
+        create_shadow_tables(&db, "main", "test_table", &config).unwrap();
+
+        // Create a chunk
+        let allocation = find_or_create_chunk(&db, "main", "test_table", 256).unwrap();
+
+        // Update it after inserting at offset 5
+        update_chunk_after_insert(
+            &db,
+            "main",
+            "test_table",
+            allocation.chunk_id,
+            5,
+            allocation.chunk_size as usize,
+        )
+        .unwrap();
+
+        // Verify the size was updated
+        let size: i64 = db
+            .query_row(
+                "SELECT size FROM test_table_chunks WHERE chunk_id = ?",
+                [allocation.chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(size, 6); // offset 5 means 6 vectors (0-5)
+
+        // Verify validity bitmap was updated
+        let validity: Vec<u8> = db
+            .query_row(
+                "SELECT validity FROM test_table_chunks WHERE chunk_id = ?",
+                [allocation.chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let bitmap = ValidityBitmap::from_bytes(validity);
+        assert!(bitmap.is_set(5));
+        assert!(!bitmap.is_set(6));
     }
 }
