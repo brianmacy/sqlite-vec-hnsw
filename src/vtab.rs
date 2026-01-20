@@ -53,6 +53,63 @@ pub enum IndexType {
     Enn,
 }
 
+/// Prepared statement cache for HNSW operations
+/// Stores raw sqlite3_stmt pointers to avoid re-preparing statements
+struct HnswStmtCache {
+    get_node_data: *mut ffi::sqlite3_stmt,
+    get_node_level: *mut ffi::sqlite3_stmt,
+    get_edges: *mut ffi::sqlite3_stmt,
+    get_edges_with_dist: *mut ffi::sqlite3_stmt,
+    insert_node: *mut ffi::sqlite3_stmt,
+    insert_edge: *mut ffi::sqlite3_stmt,
+    delete_edges_from: *mut ffi::sqlite3_stmt,
+}
+
+impl HnswStmtCache {
+    fn new() -> Self {
+        HnswStmtCache {
+            get_node_data: std::ptr::null_mut(),
+            get_node_level: std::ptr::null_mut(),
+            get_edges: std::ptr::null_mut(),
+            get_edges_with_dist: std::ptr::null_mut(),
+            insert_node: std::ptr::null_mut(),
+            insert_edge: std::ptr::null_mut(),
+            delete_edges_from: std::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn finalize(&mut self) {
+        if !self.get_node_data.is_null() {
+            ffi::sqlite3_finalize(self.get_node_data);
+            self.get_node_data = std::ptr::null_mut();
+        }
+        if !self.get_node_level.is_null() {
+            ffi::sqlite3_finalize(self.get_node_level);
+            self.get_node_level = std::ptr::null_mut();
+        }
+        if !self.get_edges.is_null() {
+            ffi::sqlite3_finalize(self.get_edges);
+            self.get_edges = std::ptr::null_mut();
+        }
+        if !self.get_edges_with_dist.is_null() {
+            ffi::sqlite3_finalize(self.get_edges_with_dist);
+            self.get_edges_with_dist = std::ptr::null_mut();
+        }
+        if !self.insert_node.is_null() {
+            ffi::sqlite3_finalize(self.insert_node);
+            self.insert_node = std::ptr::null_mut();
+        }
+        if !self.insert_edge.is_null() {
+            ffi::sqlite3_finalize(self.insert_edge);
+            self.insert_edge = std::ptr::null_mut();
+        }
+        if !self.delete_edges_from.is_null() {
+            ffi::sqlite3_finalize(self.delete_edges_from);
+            self.delete_edges_from = std::ptr::null_mut();
+        }
+    }
+}
+
 /// vec0 virtual table structure
 #[repr(C)]
 pub struct Vec0Tab {
@@ -63,6 +120,7 @@ pub struct Vec0Tab {
     chunk_size: usize,
     index_type: IndexType,
     db: *mut ffi::sqlite3, // Raw database handle for operations
+    hnsw_stmt_cache: Vec<HnswStmtCache>, // One cache per vector column
 }
 
 impl Vec0Tab {
@@ -213,6 +271,15 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
             std::mem::forget(conn); // Don't close the connection
         }
 
+        // Initialize statement cache (one per vector column)
+        let num_vector_columns = columns
+            .iter()
+            .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
+            .count();
+        let hnsw_stmt_cache = (0..num_vector_columns)
+            .map(|_| HnswStmtCache::new())
+            .collect();
+
         Ok((
             sql,
             Vec0Tab {
@@ -223,6 +290,7 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
                 chunk_size: shadow::DEFAULT_CHUNK_SIZE,
                 index_type,
                 db: db_handle,
+                hnsw_stmt_cache,
             },
         ))
     }
@@ -379,6 +447,17 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
     }
 
     fn destroy(&self) -> rusqlite::Result<()> {
+        // Finalize all prepared statements
+        // SAFETY: We're finalizing statements that we own
+        unsafe {
+            // Need mutable access, but we have &self
+            // Cast away const for cleanup (safe because this is called during drop)
+            let self_mut = self as *const _ as *mut Vec0Tab;
+            for cache in (*self_mut).hnsw_stmt_cache.iter_mut() {
+                cache.finalize();
+            }
+        }
+
         // Shadow tables are dropped automatically by SQLite when the virtual table is dropped
         Ok(())
     }
