@@ -4,7 +4,8 @@ use crate::error::{Error, Result};
 use crate::vector::{Vector, VectorType};
 
 pub mod scalar;
-pub mod simd;
+// Note: SIMD optimization is provided by the simsimd crate (used in scalar.rs)
+// which automatically detects CPU features (AVX512/AVX2/SSE/NEON) at runtime
 
 /// Distance metric types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,39 +75,38 @@ pub fn distance(a: &Vector, b: &Vector, metric: DistanceMetric) -> Result<f32> {
 }
 
 /// L2 distance for Float32 vectors
+/// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
 pub fn distance_l2_f32(a: &Vector, b: &Vector) -> Result<f32> {
-    // TODO: Implement SIMD-optimized L2 distance
-    // For now, use scalar implementation
     scalar::distance_l2_f32_scalar(a, b)
 }
 
 /// L1 distance for Float32 vectors
+/// Pure Rust implementation (simsimd doesn't provide L1)
 pub fn distance_l1_f32(a: &Vector, b: &Vector) -> Result<f32> {
-    // TODO: Implement SIMD-optimized L1 distance
     scalar::distance_l1_f32_scalar(a, b)
 }
 
 /// Cosine distance for Float32 vectors
+/// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
 pub fn distance_cosine_f32(a: &Vector, b: &Vector) -> Result<f32> {
-    // TODO: Implement SIMD-optimized cosine distance
     scalar::distance_cosine_f32_scalar(a, b)
 }
 
 /// L2 distance for Int8 vectors
+/// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
 pub fn distance_l2_i8(a: &Vector, b: &Vector) -> Result<f32> {
-    // TODO: Implement SIMD-optimized L2 distance for Int8
     scalar::distance_l2_i8_scalar(a, b)
 }
 
 /// L1 distance for Int8 vectors
+/// Pure Rust implementation (simsimd doesn't provide L1 for int8)
 pub fn distance_l1_i8(a: &Vector, b: &Vector) -> Result<f32> {
-    // TODO: Implement SIMD-optimized L1 distance for Int8
     scalar::distance_l1_i8_scalar(a, b)
 }
 
 /// Hamming distance for binary vectors
+/// Uses simsimd with automatic SIMD detection
 pub fn distance_hamming(a: &Vector, b: &Vector) -> Result<f32> {
-    // TODO: Implement SIMD-optimized Hamming distance
     scalar::distance_hamming_scalar(a, b)
 }
 

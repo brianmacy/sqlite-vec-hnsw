@@ -1126,7 +1126,10 @@ fn brute_force_search(
     // Get all rowids
     let rowids_table = format!("{}_rowids", table_name);
     let mut stmt = conn
-        .prepare(&format!("SELECT rowid FROM \"{}\".\"{}\"", schema, rowids_table))
+        .prepare(&format!(
+            "SELECT rowid FROM \"{}\".\"{}\"",
+            schema, rowids_table
+        ))
         .map_err(Error::Sqlite)?;
 
     let rowids: Vec<i64> = stmt
@@ -1145,24 +1148,19 @@ fn brute_force_search(
     let mut distances = Vec::with_capacity(rowids.len());
     for rowid in rowids {
         // Read vector from shadow table
-        let vector_bytes = match shadow::read_vector_from_chunk(
-            conn,
-            schema,
-            table_name,
-            column_idx,
-            rowid,
-        ) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => continue, // NULL vector, skip
-            Err(_) => continue,   // Error reading vector, skip
-        };
+        let vector_bytes =
+            match shadow::read_vector_from_chunk(conn, schema, table_name, column_idx, rowid) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue, // NULL vector, skip
+                Err(_) => continue,   // Error reading vector, skip
+            };
 
         // Parse vector and calculate distance
-        let vec = match Vector::from_blob(&vector_bytes, VectorType::Float32, vector_bytes.len() / 4)
-        {
-            Ok(v) => v,
-            Err(_) => continue, // Invalid vector, skip
-        };
+        let vec =
+            match Vector::from_blob(&vector_bytes, VectorType::Float32, vector_bytes.len() / 4) {
+                Ok(v) => v,
+                Err(_) => continue, // Invalid vector, skip
+            };
 
         let dist = match distance::distance(&query_vec, &vec, DistanceMetric::L2) {
             Ok(d) => d,

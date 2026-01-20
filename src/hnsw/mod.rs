@@ -315,46 +315,11 @@ impl<'conn> Default for HnswStatementCache<'conn> {
     }
 }
 
-/// HNSW index (page-cache based)
-pub struct HnswIndex {
-    #[allow(dead_code)]
-    metadata: HnswMetadata,
-    // TODO: Add shadow table statement caches
-}
-
-impl HnswIndex {
-    /// Create a new HNSW index
-    pub fn new(_params: HnswParams, _dimensions: i32) -> Result<Self> {
-        // TODO: Implement HNSW index creation
-        Err(Error::NotImplemented(
-            "HNSW index creation not yet implemented".to_string(),
-        ))
-    }
-
-    /// Insert a vector into the index
-    pub fn insert(&mut self, _rowid: i64, _vector: &[u8]) -> Result<()> {
-        // TODO: Implement HNSW insertion
-        Err(Error::NotImplemented(
-            "HNSW insert not yet implemented".to_string(),
-        ))
-    }
-
-    /// Search for k nearest neighbors
-    pub fn search(&self, _query: &[u8], _k: usize) -> Result<Vec<(i64, f32)>> {
-        // TODO: Implement HNSW search
-        Err(Error::NotImplemented(
-            "HNSW search not yet implemented".to_string(),
-        ))
-    }
-
-    /// Rebuild the entire index
-    pub fn rebuild(&mut self) -> Result<()> {
-        // TODO: Implement index rebuild
-        Err(Error::NotImplemented(
-            "HNSW rebuild not yet implemented".to_string(),
-        ))
-    }
-}
+// NOTE: HNSW operations use page-cache based design (no in-memory index struct)
+// - insert::insert_hnsw() for vector insertion with HNSW indexing
+// - search::search_hnsw() for k-NN queries using HNSW graph
+// - rebuild::rebuild_hnsw_index() for rebuilding indexes
+// All functions query shadow tables directly rather than maintaining in-memory state
 
 #[cfg(test)]
 mod tests {
@@ -389,14 +354,6 @@ mod tests {
         let cold = HnswParams::cold_tier();
         assert_eq!(cold.m, 96);
         assert_eq!(cold.ef_construction, 1000);
-    }
-
-    #[test]
-    fn test_hnsw_index_new_not_implemented() {
-        let params = HnswParams::default();
-        let result = HnswIndex::new(params, 768);
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::NotImplemented(_))));
     }
 
     #[test]

@@ -125,7 +125,10 @@ fn test_read_c_created_database() {
                 from_rowid, to_rowid, level, dist
             );
         } else {
-            println!("     {} -> {} (level={}, dist=NULL)", from_rowid, to_rowid, level);
+            println!(
+                "     {} -> {} (level={}, dist=NULL)",
+                from_rowid, to_rowid, level
+            );
         }
     }
 
