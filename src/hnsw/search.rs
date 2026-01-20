@@ -129,7 +129,7 @@ pub fn search_layer(
 
     // Get entry point node
     let entry_node =
-        storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, entry_rowid)?
+        storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, entry_rowid, None)?
             .ok_or_else(|| {
                 Error::InvalidParameter(format!("Entry point node {} not found", entry_rowid))
             })?;
@@ -181,7 +181,7 @@ pub fn search_layer(
 
             // Fetch neighbor vector and calculate distance
             let neighbor_node =
-                storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, neighbor_rowid)?;
+                storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, neighbor_rowid, None)?;
             let neighbor_node = match neighbor_node {
                 Some(n) => n,
                 None => continue, // Node deleted
@@ -261,7 +261,7 @@ mod tests {
 
         // Insert the node
         let vector = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // [1.0, 2.0, 3.0]
-        storage::insert_node(&db, "test_table", "embedding", 1, 0, &vector).unwrap();
+        storage::insert_node(&db, "test_table", "embedding", 1, 0, &vector, None).unwrap();
 
         // Search for it
         let query = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // Same vector

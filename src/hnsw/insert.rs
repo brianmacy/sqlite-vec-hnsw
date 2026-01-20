@@ -150,7 +150,7 @@ pub fn insert_hnsw(
     let level = generate_level(metadata);
 
     // Insert node into shadow table
-    storage::insert_node(db, table_name, column_name, rowid, level, vector)?;
+    storage::insert_node(db, table_name, column_name, rowid, level, vector, None)?;
 
     // Handle first node case
     if metadata.entry_point_rowid == -1 {
@@ -211,7 +211,7 @@ pub fn insert_hnsw(
         // Fetch candidate vectors for RNG heuristic pruning
         let mut candidate_vectors = std::collections::HashMap::new();
         for (candidate_rowid, _) in neighbors.iter() {
-            if let Some(node) = storage::fetch_node_data(db, table_name, column_name, *candidate_rowid)? {
+            if let Some(node) = storage::fetch_node_data(db, table_name, column_name, *candidate_rowid, None)? {
                 if let Ok(vec) = Vector::from_blob(&node.vector, metadata.element_type, metadata.dimensions as usize) {
                     candidate_vectors.insert(*candidate_rowid, vec);
                 }
@@ -238,6 +238,7 @@ pub fn insert_hnsw(
                 *neighbor_rowid,
                 lv,
                 *dist,
+                None,
             )?;
 
             // Edge from neighbor to new node
@@ -249,6 +250,7 @@ pub fn insert_hnsw(
                 rowid,
                 lv,
                 *dist,
+                None,
             )?;
 
             // Check if neighbor now has too many connections, prune if needed
@@ -259,12 +261,13 @@ pub fn insert_hnsw(
                 column_name,
                 *neighbor_rowid,
                 lv,
+                None,
             )?;
 
             if neighbor_edges_with_dist.len() >= max_connections {
                 // Need to prune neighbor's edges using RNG heuristic
                 // Fetch neighbor's vector (the center for pruning)
-                if let Some(neighbor_node) = storage::fetch_node_data(db, table_name, column_name, *neighbor_rowid)? {
+                if let Some(neighbor_node) = storage::fetch_node_data(db, table_name, column_name, *neighbor_rowid, None)? {
                     if let Ok(neighbor_vec) = Vector::from_blob(&neighbor_node.vector, metadata.element_type, metadata.dimensions as usize) {
                         // Add the new edge if not already present
                         if !neighbor_edges_with_dist.iter().any(|(r, _)| *r == rowid) {
@@ -277,7 +280,7 @@ pub fn insert_hnsw(
 
                         for (cand_rowid, _) in neighbor_edges_with_dist.iter() {
                             if *cand_rowid != rowid {
-                                if let Some(cand_node) = storage::fetch_node_data(db, table_name, column_name, *cand_rowid)? {
+                                if let Some(cand_node) = storage::fetch_node_data(db, table_name, column_name, *cand_rowid, None)? {
                                     if let Ok(cand_vec) = Vector::from_blob(&cand_node.vector, metadata.element_type, metadata.dimensions as usize) {
                                         neighbor_candidate_vectors.insert(*cand_rowid, cand_vec);
                                     }
@@ -295,7 +298,7 @@ pub fn insert_hnsw(
                         );
 
                         // Rebuild neighbor's edges
-                        storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv)?;
+                        storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv, None)?;
                         for (ne_rowid, ne_dist) in pruned_neighbor {
                             storage::insert_edge(
                                 db,
@@ -305,6 +308,7 @@ pub fn insert_hnsw(
                                 ne_rowid,
                                 lv,
                                 ne_dist,
+                                None,
                             )?;
                         }
                     }
@@ -349,7 +353,7 @@ fn find_closest_at_level(
         changed = false;
 
         // Get current node's distance
-        let current_node = storage::fetch_node_data(db, table_name, column_name, current)?
+        let current_node = storage::fetch_node_data(db, table_name, column_name, current, None)?
             .ok_or_else(|| Error::InvalidParameter(format!("Node {} not found", current)))?;
 
         let current_vec = Vector::from_blob(
@@ -364,7 +368,7 @@ fn find_closest_at_level(
 
         for neighbor_rowid in neighbors {
             let neighbor_node =
-                storage::fetch_node_data(db, table_name, column_name, neighbor_rowid)?;
+                storage::fetch_node_data(db, table_name, column_name, neighbor_rowid, None)?;
             let neighbor_node = match neighbor_node {
                 Some(n) => n,
                 None => continue,
@@ -450,7 +454,7 @@ mod tests {
         assert!(metadata.entry_point_level >= 0);
 
         // Verify node was persisted
-        let node = storage::fetch_node_data(&db, "test_table", "embedding", 1)
+        let node = storage::fetch_node_data(&db, "test_table", "embedding", 1, None)
             .unwrap()
             .expect("Node should exist");
 

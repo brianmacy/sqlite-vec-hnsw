@@ -115,8 +115,8 @@ mod tests {
 
         // Insert some test data
         let vector = vec![1u8; 12];
-        storage::insert_node(&db, "test_table", "embedding", 1, 1, &vector).unwrap();
-        storage::insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5).unwrap();
+        storage::insert_node(&db, "test_table", "embedding", 1, 1, &vector, None).unwrap();
+        storage::insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5, None).unwrap();
 
         // Verify data exists
         let node_count = storage::count_nodes(&db, "test_table", "embedding").unwrap();

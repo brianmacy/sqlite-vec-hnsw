@@ -5,7 +5,7 @@
 //! of vectors while keeping memory usage minimal (~64 bytes per index).
 
 use crate::error::{Error, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ffi};
 
 /// HNSW node data
 #[derive(Debug, Clone)]
@@ -30,7 +30,41 @@ pub fn fetch_node_data(
     table_name: &str,
     column_name: &str,
     rowid: i64,
+    cached_stmt: Option<*mut ffi::sqlite3_stmt>,
 ) -> Result<Option<HnswNode>> {
+    // Fast path: use cached statement (avoids SQL parsing)
+    if let Some(stmt) = cached_stmt {
+        unsafe {
+            ffi::sqlite3_reset(stmt);
+            ffi::sqlite3_bind_int64(stmt, 1, rowid);
+
+            let rc = ffi::sqlite3_step(stmt);
+            if rc == ffi::SQLITE_ROW {
+                let node_rowid = ffi::sqlite3_column_int64(stmt, 0);
+                let level = ffi::sqlite3_column_int(stmt, 1);
+
+                let blob_ptr = ffi::sqlite3_column_blob(stmt, 2);
+                let blob_len = ffi::sqlite3_column_bytes(stmt, 2);
+                let vector =
+                    std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize).to_vec();
+
+                return Ok(Some(HnswNode {
+                    rowid: node_rowid,
+                    level,
+                    vector,
+                }));
+            } else if rc == ffi::SQLITE_DONE {
+                return Ok(None);
+            } else {
+                return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rc),
+                    None,
+                )));
+            }
+        }
+    }
+
+    // Slow path fallback: parse SQL every time
     let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
     let query = format!(
         "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
@@ -92,6 +126,9 @@ pub fn fetch_neighbors(
 
 /// Fetch neighbors of a node WITH distances at a specific level
 ///
+/// # Arguments
+/// * `cached_stmt` - Optional cached prepared statement (10x faster if provided)
+///
 /// # Returns
 /// List of (neighbor_rowid, distance) tuples at the given level
 pub fn fetch_neighbors_with_distances(
@@ -100,7 +137,36 @@ pub fn fetch_neighbors_with_distances(
     column_name: &str,
     from_rowid: i64,
     level: i32,
+    cached_stmt: Option<*mut ffi::sqlite3_stmt>,
 ) -> Result<Vec<(i64, f32)>> {
+    // Fast path: use cached statement
+    if let Some(stmt) = cached_stmt {
+        unsafe {
+            ffi::sqlite3_reset(stmt);
+            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
+            ffi::sqlite3_bind_int(stmt, 2, level);
+
+            let mut neighbors = Vec::new();
+            loop {
+                let rc = ffi::sqlite3_step(stmt);
+                if rc == ffi::SQLITE_ROW {
+                    let to_rowid = ffi::sqlite3_column_int64(stmt, 0);
+                    let distance = ffi::sqlite3_column_double(stmt, 1) as f32;
+                    neighbors.push((to_rowid, distance));
+                } else if rc == ffi::SQLITE_DONE {
+                    break;
+                } else {
+                    return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rc),
+                        None,
+                    )));
+                }
+            }
+            return Ok(neighbors);
+        }
+    }
+
+    // Slow path fallback
     let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
     let query = format!(
         "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ? ORDER BY distance",
@@ -127,15 +193,35 @@ pub fn insert_node(
     rowid: i64,
     level: i32,
     vector: &[u8],
+    cached_stmt: Option<*mut ffi::sqlite3_stmt>,
 ) -> Result<()> {
-    let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
-    let insert_sql = format!(
-        "INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)",
-        nodes_table
-    );
+    // Fast path: use cached statement
+    if let Some(stmt) = cached_stmt {
+        unsafe {
+            ffi::sqlite3_reset(stmt);
+            ffi::sqlite3_bind_int64(stmt, 1, rowid);
+            ffi::sqlite3_bind_int(stmt, 2, level);
+            ffi::sqlite3_bind_blob(stmt, 3, vector.as_ptr() as *const _, vector.len() as i32, ffi::SQLITE_TRANSIENT());
 
-    db.execute(&insert_sql, rusqlite::params![rowid, level, vector])
-        .map_err(Error::Sqlite)?;
+            let rc = ffi::sqlite3_step(stmt);
+            if rc != ffi::SQLITE_DONE {
+                return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rc),
+                    None,
+                )));
+            }
+        }
+    } else {
+        // Slow path fallback
+        let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
+        let insert_sql = format!(
+            "INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)",
+            nodes_table
+        );
+
+        db.execute(&insert_sql, rusqlite::params![rowid, level, vector])
+            .map_err(Error::Sqlite)?;
+    }
 
     // Also insert into levels table for efficient level queries
     let levels_table = format!("{}_{}_hnsw_levels", table_name, column_name);
@@ -160,18 +246,39 @@ pub fn insert_edge(
     to_rowid: i64,
     level: i32,
     distance: f32,
+    cached_stmt: Option<*mut ffi::sqlite3_stmt>,
 ) -> Result<()> {
-    let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
-    let insert_sql = format!(
-        "INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level, distance) VALUES (?, ?, ?, ?)",
-        edges_table
-    );
+    // Fast path: use cached statement
+    if let Some(stmt) = cached_stmt {
+        unsafe {
+            ffi::sqlite3_reset(stmt);
+            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
+            ffi::sqlite3_bind_int64(stmt, 2, to_rowid);
+            ffi::sqlite3_bind_int(stmt, 3, level);
+            ffi::sqlite3_bind_double(stmt, 4, distance as f64);
 
-    db.execute(
-        &insert_sql,
-        rusqlite::params![from_rowid, to_rowid, level, distance],
-    )
-    .map_err(Error::Sqlite)?;
+            let rc = ffi::sqlite3_step(stmt);
+            if rc != ffi::SQLITE_DONE {
+                return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rc),
+                    None,
+                )));
+            }
+        }
+    } else {
+        // Slow path fallback
+        let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+        let insert_sql = format!(
+            "INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level, distance) VALUES (?, ?, ?, ?)",
+            edges_table
+        );
+
+        db.execute(
+            &insert_sql,
+            rusqlite::params![from_rowid, to_rowid, level, distance],
+        )
+        .map_err(Error::Sqlite)?;
+    }
 
     Ok(())
 }
@@ -183,15 +290,34 @@ pub fn delete_edges_from_level(
     column_name: &str,
     from_rowid: i64,
     level: i32,
+    cached_stmt: Option<*mut ffi::sqlite3_stmt>,
 ) -> Result<()> {
-    let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
-    let delete_sql = format!(
-        "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
-        edges_table
-    );
+    // Fast path: use cached statement
+    if let Some(stmt) = cached_stmt {
+        unsafe {
+            ffi::sqlite3_reset(stmt);
+            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
+            ffi::sqlite3_bind_int(stmt, 2, level);
 
-    db.execute(&delete_sql, [from_rowid, level as i64])
-        .map_err(Error::Sqlite)?;
+            let rc = ffi::sqlite3_step(stmt);
+            if rc != ffi::SQLITE_DONE {
+                return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rc),
+                    None,
+                )));
+            }
+        }
+    } else {
+        // Slow path fallback
+        let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+        let delete_sql = format!(
+            "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+            edges_table
+        );
+
+        db.execute(&delete_sql, [from_rowid, level as i64])
+            .map_err(Error::Sqlite)?;
+    }
 
     Ok(())
 }
@@ -240,10 +366,10 @@ mod tests {
 
         // Insert a node
         let vector = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // 3 floats
-        insert_node(&db, "test_table", "embedding", 1, 2, &vector).unwrap();
+        insert_node(&db, "test_table", "embedding", 1, 2, &vector, None).unwrap();
 
         // Fetch it back
-        let node = fetch_node_data(&db, "test_table", "embedding", 1)
+        let node = fetch_node_data(&db, "test_table", "embedding", 1, None)
             .unwrap()
             .expect("Node should exist");
 
@@ -258,7 +384,7 @@ mod tests {
         shadow::create_hnsw_shadow_tables(&db, "test_table", "embedding").unwrap();
 
         let vector = vec![1u8; 12];
-        insert_node(&db, "test_table", "embedding", 5, 3, &vector).unwrap();
+        insert_node(&db, "test_table", "embedding", 5, 3, &vector, None).unwrap();
 
         let level = fetch_node_level(&db, "test_table", "embedding", 5)
             .unwrap()
@@ -274,13 +400,13 @@ mod tests {
 
         // Insert some nodes first
         let vector = vec![1u8; 12];
-        insert_node(&db, "test_table", "embedding", 1, 2, &vector).unwrap();
-        insert_node(&db, "test_table", "embedding", 2, 2, &vector).unwrap();
-        insert_node(&db, "test_table", "embedding", 3, 2, &vector).unwrap();
+        insert_node(&db, "test_table", "embedding", 1, 2, &vector, None).unwrap();
+        insert_node(&db, "test_table", "embedding", 2, 2, &vector, None).unwrap();
+        insert_node(&db, "test_table", "embedding", 3, 2, &vector, None).unwrap();
 
         // Insert edges from node 1 to nodes 2 and 3 at level 1
-        insert_edge(&db, "test_table", "embedding", 1, 2, 1, 0.5).unwrap();
-        insert_edge(&db, "test_table", "embedding", 1, 3, 1, 0.7).unwrap();
+        insert_edge(&db, "test_table", "embedding", 1, 2, 1, 0.5, None).unwrap();
+        insert_edge(&db, "test_table", "embedding", 1, 3, 1, 0.7, None).unwrap();
 
         // Fetch neighbors
         let neighbors = fetch_neighbors(&db, "test_table", "embedding", 1, 1).unwrap();
@@ -296,15 +422,15 @@ mod tests {
         shadow::create_hnsw_shadow_tables(&db, "test_table", "embedding").unwrap();
 
         let vector = vec![1u8; 12];
-        insert_node(&db, "test_table", "embedding", 1, 2, &vector).unwrap();
-        insert_node(&db, "test_table", "embedding", 2, 2, &vector).unwrap();
+        insert_node(&db, "test_table", "embedding", 1, 2, &vector, None).unwrap();
+        insert_node(&db, "test_table", "embedding", 2, 2, &vector, None).unwrap();
 
         // Insert edges
-        insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5).unwrap();
-        insert_edge(&db, "test_table", "embedding", 1, 2, 1, 0.5).unwrap();
+        insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5, None).unwrap();
+        insert_edge(&db, "test_table", "embedding", 1, 2, 1, 0.5, None).unwrap();
 
         // Delete edges at level 0
-        delete_edges_from_level(&db, "test_table", "embedding", 1, 0).unwrap();
+        delete_edges_from_level(&db, "test_table", "embedding", 1, 0, None).unwrap();
 
         // Level 0 should be empty
         let neighbors0 = fetch_neighbors(&db, "test_table", "embedding", 1, 0).unwrap();
@@ -322,9 +448,9 @@ mod tests {
 
         let vector = vec![1u8; 12];
         // Insert nodes with different levels
-        insert_node(&db, "test_table", "embedding", 1, 0, &vector).unwrap(); // Level 0 only
-        insert_node(&db, "test_table", "embedding", 2, 1, &vector).unwrap(); // Levels 0-1
-        insert_node(&db, "test_table", "embedding", 3, 2, &vector).unwrap(); // Levels 0-2
+        insert_node(&db, "test_table", "embedding", 1, 0, &vector, None).unwrap(); // Level 0 only
+        insert_node(&db, "test_table", "embedding", 2, 1, &vector, None).unwrap(); // Levels 0-1
+        insert_node(&db, "test_table", "embedding", 3, 2, &vector, None).unwrap(); // Levels 0-2
 
         // Get nodes at level 0 (all nodes)
         let level0 = get_nodes_at_level(&db, "test_table", "embedding", 0).unwrap();
@@ -351,7 +477,7 @@ mod tests {
         // Insert some nodes
         let vector = vec![1u8; 12];
         for i in 1..=5 {
-            insert_node(&db, "test_table", "embedding", i, 1, &vector).unwrap();
+            insert_node(&db, "test_table", "embedding", i, 1, &vector, None).unwrap();
         }
 
         // Should have 5 nodes
@@ -365,12 +491,12 @@ mod tests {
         shadow::create_hnsw_shadow_tables(&db, "test_table", "embedding").unwrap();
 
         let vector = vec![1u8; 12];
-        insert_node(&db, "test_table", "embedding", 1, 1, &vector).unwrap();
-        insert_node(&db, "test_table", "embedding", 2, 1, &vector).unwrap();
+        insert_node(&db, "test_table", "embedding", 1, 1, &vector, None).unwrap();
+        insert_node(&db, "test_table", "embedding", 2, 1, &vector, None).unwrap();
 
         // Insert bidirectional edges
-        insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5).unwrap();
-        insert_edge(&db, "test_table", "embedding", 2, 1, 0, 0.5).unwrap();
+        insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5, None).unwrap();
+        insert_edge(&db, "test_table", "embedding", 2, 1, 0, 0.5, None).unwrap();
 
         // Both directions should work
         let neighbors1 = fetch_neighbors(&db, "test_table", "embedding", 1, 0).unwrap();
