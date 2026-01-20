@@ -28,6 +28,9 @@ pub enum Error {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+
     #[error("JSON parse error: {0}")]
     JsonParse(#[from] serde_json::Error),
 }
