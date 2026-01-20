@@ -78,6 +78,147 @@ impl HnswStmtCache {
         }
     }
 
+    /// Prepare all statements for this HNSW index
+    ///
+    /// # Safety
+    /// Must be called with a valid sqlite3 database handle
+    unsafe fn prepare(
+        &mut self,
+        db: *mut ffi::sqlite3,
+        table_name: &str,
+        column_name: &str,
+    ) -> crate::error::Result<()> {
+        use std::ffi::CString;
+
+        // Prepare get_node_data: SELECT rowid, level, vector FROM hnsw_nodes WHERE rowid = ?
+        let sql = CString::new(format!(
+            "SELECT rowid, level, vector FROM \"{}_{}_hnsw_nodes\" WHERE rowid = ?",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.get_node_data,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare get_edges: SELECT to_rowid FROM hnsw_edges WHERE from_rowid = ? AND level = ?
+        let sql = CString::new(format!(
+            "SELECT to_rowid FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ? ORDER BY distance",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.get_edges,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare get_edges_with_dist: SELECT to_rowid, distance FROM hnsw_edges WHERE from_rowid = ? AND level = ?
+        let sql = CString::new(format!(
+            "SELECT to_rowid, distance FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ? ORDER BY distance",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.get_edges_with_dist,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare insert_node: INSERT INTO hnsw_nodes (rowid, level, vector) VALUES (?, ?, ?)
+        let sql = CString::new(format!(
+            "INSERT INTO \"{}_{}_hnsw_nodes\" (rowid, level, vector) VALUES (?, ?, ?)",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.insert_node,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare insert_edge: INSERT OR IGNORE INTO hnsw_edges (from_rowid, to_rowid, level, distance) VALUES (?, ?, ?, ?)
+        let sql = CString::new(format!(
+            "INSERT OR IGNORE INTO \"{}_{}_hnsw_edges\" (from_rowid, to_rowid, level, distance) VALUES (?, ?, ?, ?)",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.insert_edge,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare delete_edges_from: DELETE FROM hnsw_edges WHERE from_rowid = ? AND level = ?
+        let sql = CString::new(format!(
+            "DELETE FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ?",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.delete_edges_from,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        Ok(())
+    }
+
     unsafe fn finalize(&mut self) {
         if !self.get_node_data.is_null() {
             ffi::sqlite3_finalize(self.get_node_data);
@@ -424,6 +565,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
 
             // Create HNSW shadow tables for vector columns if using HNSW index type
             if vtab.index_type == IndexType::Hnsw {
+                let mut vec_col_idx = 0;
                 for col in vtab.columns.iter() {
                     if let ColumnType::Vector { .. } = col.col_type {
                         shadow::create_hnsw_shadow_tables_ffi(
@@ -432,6 +574,18 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                             &col.name,
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        // Prepare statements for this vector column
+                        // SAFETY: vtab is valid and we need mutable access to stmt cache
+                        let vtab_mut = &vtab as *const _ as *mut Vec0Tab;
+                        let cache_vec = &mut (*vtab_mut).hnsw_stmt_cache;
+                        if let Some(cache) = cache_vec.get_mut(vec_col_idx) {
+                            cache
+                                .prepare(db_handle, &vtab.table_name, &col.name)
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                        }
+
+                        vec_col_idx += 1;
                     }
                 }
             }
