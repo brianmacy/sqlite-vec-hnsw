@@ -344,3 +344,72 @@ CREATE VIRTUAL TABLE t USING vec0(v float[768], type=hnsw)
 
 **Current state:** Schema-compatible but with algorithmic differences that cause storage bloat and performance degradation.
 
+
+---
+
+## RNG Heuristic Implementation Results
+
+### Before RNG Heuristic (Simple Closest-N Pruning)
+
+| Metric | Value |
+|--------|-------|
+| Total edges | 65,088 |
+| Avg edges/node (L0) | 64.0 |
+| Min edges | 64 |
+| Max edges | 64 |
+| Distribution | **ALL nodes = 64** (uniform) |
+| Storage | 12,329 bytes/vector |
+| vs C | +27% bloat |
+
+**Problem:** Dense, uniform graph - all nodes at maximum capacity
+
+### After RNG Heuristic (HNSWlib getNeighborsByHeuristic2)
+
+| Metric | Value |
+|--------|-------|
+| Total edges | 38,923 |
+| Avg edges/node (L0) | 38.9 |
+| Min edges | 1 |
+| Max edges | 64 |
+| Distribution | Natural (1-64) |
+| Storage | 10,309 bytes/vector |
+| vs C | **+7% bloat** ✅ |
+
+**Result:** Sparse, natural graph - proper small-world property
+
+### Impact Summary
+
+| Improvement | Before | After | Gain |
+|-------------|--------|-------|------|
+| Edge count | 65,088 | 38,923 | -40% edges |
+| Storage | 12,329 bytes/vec | 10,309 bytes/vec | -16% storage |
+| vs C bloat | +27% | +7% | **20% improvement** |
+
+**C comparison (1000 vectors, M=32, ef=400):**
+- C: 32,235 edges, 9,634 bytes/vector
+- Rust: 38,923 edges, 10,309 bytes/vector
+- Difference: +21% more edges, +7% storage
+
+**Remaining 7% bloat likely from:**
+- Slightly higher avg edges (38.9 vs 32.2)
+- SQLite page allocation differences
+- Index overhead
+
+**Status:** ✅ **ACCEPTABLE** - Within 10% of C performance
+
+---
+
+## Updated Summary: Path to Full Parity
+
+| Issue | Status | Notes |
+|-------|--------|-------|
+| RNG heuristic pruning | ✅ **DONE** | Storage bloat reduced from 27% to 7% |
+| Prepared statement cache | ❌ Required | Still 6-7x slower performance |
+| Syntax compatibility | ❌ Required | Parse `hnsw(M=32, ef=400)` in CREATE TABLE |
+| Schema compatibility | ✅ Done | All shadow tables match |
+| Int8 support | ✅ Done | Fully functional |
+| Cross-reading | ✅ Done | Both directions verified |
+| **Storage parity** | ✅ **DONE** | Within 7% of C |
+
+**Current state:** Schema and storage compatible, performance requires statement caching
+

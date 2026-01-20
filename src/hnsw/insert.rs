@@ -37,15 +37,88 @@ fn generate_level(metadata: &HnswMetadata) -> i32 {
     level.min(metadata.params.max_level - 1).max(0)
 }
 
-/// Prune edges to maintain maximum M connections
+/// Prune edges using RNG (Relative Neighborhood Graph) heuristic
 ///
-/// Keeps the M closest neighbors based on distance
-fn prune_edges(candidates: &[(i64, f32)], max_connections: usize) -> Vec<(i64, f32)> {
+/// Based on HNSWlib's getNeighborsByHeuristic2() algorithm.
+/// Promotes diversity by rejecting candidates that are closer to already-selected
+/// neighbors than to the center point. This prevents dense graphs and hub nodes.
+///
+/// # Arguments
+/// * `candidates` - Candidate neighbors with distances to center
+/// * `max_connections` - Maximum number of neighbors to select
+/// * `center_vector` - Optional center vector for distance calculations (if None, falls back to simple pruning)
+/// * `candidate_vectors` - Optional map of candidate vectors (avoids re-fetching)
+/// * `metadata` - HNSW metadata for distance calculations
+///
+/// # Returns
+/// Selected neighbors (may be fewer than max_connections)
+fn prune_edges_with_heuristic(
+    candidates: &[(i64, f32)],
+    max_connections: usize,
+    center_vector: Option<&Vector>,
+    candidate_vectors: Option<&std::collections::HashMap<i64, Vector>>,
+    metadata: Option<&HnswMetadata>,
+) -> Vec<(i64, f32)> {
+    // If no center vector or metadata provided, fall back to simple pruning
+    if center_vector.is_none() || candidate_vectors.is_none() || metadata.is_none() {
+        let mut sorted = candidates.to_vec();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(max_connections);
+        return sorted;
+    }
+
+    let _center = center_vector.unwrap();
+    let vectors = candidate_vectors.unwrap();
+    let meta = metadata.unwrap();
+
+    // If we have fewer candidates than max, return all
+    if candidates.len() <= max_connections {
+        return candidates.to_vec();
+    }
+
+    // Sort candidates by distance to center (closest first)
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    sorted.truncate(max_connections);
-    sorted
+
+    let mut selected = Vec::new();
+
+    // RNG heuristic: process candidates from closest to farthest
+    for (candidate_rowid, dist_to_center) in sorted.iter() {
+        if selected.len() >= max_connections {
+            break;
+        }
+
+        // Get candidate vector
+        let candidate_vec = match vectors.get(candidate_rowid) {
+            Some(v) => v,
+            None => continue, // Skip if vector not available
+        };
+
+        // Check distance to all already-selected neighbors
+        let mut accept = true;
+        for (selected_rowid, _) in selected.iter() {
+            if let Some(selected_vec) = vectors.get(selected_rowid) {
+                // Calculate distance from candidate to this selected neighbor
+                if let Ok(dist_to_selected) =
+                    distance::distance(candidate_vec, selected_vec, meta.distance_metric)
+                {
+                    // RNG heuristic: reject if closer to selected neighbor than to center
+                    if dist_to_selected < *dist_to_center {
+                        accept = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if accept {
+            selected.push((*candidate_rowid, *dist_to_center));
+        }
+    }
+
+    selected
 }
+
 
 /// Insert a vector into the HNSW index
 ///
@@ -135,8 +208,24 @@ pub fn insert_hnsw(
             metadata.params.m as usize
         };
 
-        // Prune to M connections
-        let pruned = prune_edges(&neighbors, max_connections);
+        // Fetch candidate vectors for RNG heuristic pruning
+        let mut candidate_vectors = std::collections::HashMap::new();
+        for (candidate_rowid, _) in neighbors.iter() {
+            if let Some(node) = storage::fetch_node_data(db, table_name, column_name, *candidate_rowid)? {
+                if let Ok(vec) = Vector::from_blob(&node.vector, metadata.element_type, metadata.dimensions as usize) {
+                    candidate_vectors.insert(*candidate_rowid, vec);
+                }
+            }
+        }
+
+        // Prune using RNG heuristic (promotes diversity)
+        let pruned = prune_edges_with_heuristic(
+            &neighbors,
+            max_connections,
+            Some(&new_vec),
+            Some(&candidate_vectors),
+            Some(metadata),
+        );
 
         // Create bidirectional edges
         for (neighbor_rowid, dist) in pruned.iter() {
@@ -173,27 +262,52 @@ pub fn insert_hnsw(
             )?;
 
             if neighbor_edges_with_dist.len() >= max_connections {
-                // Need to prune neighbor's edges
-                // Add the new edge if not already present
-                if !neighbor_edges_with_dist.iter().any(|(r, _)| *r == rowid) {
-                    neighbor_edges_with_dist.push((rowid, *dist));
-                }
+                // Need to prune neighbor's edges using RNG heuristic
+                // Fetch neighbor's vector (the center for pruning)
+                if let Some(neighbor_node) = storage::fetch_node_data(db, table_name, column_name, *neighbor_rowid)? {
+                    if let Ok(neighbor_vec) = Vector::from_blob(&neighbor_node.vector, metadata.element_type, metadata.dimensions as usize) {
+                        // Add the new edge if not already present
+                        if !neighbor_edges_with_dist.iter().any(|(r, _)| *r == rowid) {
+                            neighbor_edges_with_dist.push((rowid, *dist));
+                        }
 
-                // Prune using stored distances (no vector fetches needed!)
-                let pruned_neighbor = prune_edges(&neighbor_edges_with_dist, max_connections);
+                        // Fetch vectors for all candidates
+                        let mut neighbor_candidate_vectors = std::collections::HashMap::new();
+                        neighbor_candidate_vectors.insert(rowid, new_vec.clone()); // New node vector
 
-                // Rebuild neighbor's edges
-                storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv)?;
-                for (ne_rowid, ne_dist) in pruned_neighbor {
-                    storage::insert_edge(
-                        db,
-                        table_name,
-                        column_name,
-                        *neighbor_rowid,
-                        ne_rowid,
-                        lv,
-                        ne_dist,
-                    )?;
+                        for (cand_rowid, _) in neighbor_edges_with_dist.iter() {
+                            if *cand_rowid != rowid {
+                                if let Some(cand_node) = storage::fetch_node_data(db, table_name, column_name, *cand_rowid)? {
+                                    if let Ok(cand_vec) = Vector::from_blob(&cand_node.vector, metadata.element_type, metadata.dimensions as usize) {
+                                        neighbor_candidate_vectors.insert(*cand_rowid, cand_vec);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Prune using RNG heuristic with neighbor as center
+                        let pruned_neighbor = prune_edges_with_heuristic(
+                            &neighbor_edges_with_dist,
+                            max_connections,
+                            Some(&neighbor_vec),
+                            Some(&neighbor_candidate_vectors),
+                            Some(metadata),
+                        );
+
+                        // Rebuild neighbor's edges
+                        storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv)?;
+                        for (ne_rowid, ne_dist) in pruned_neighbor {
+                            storage::insert_edge(
+                                db,
+                                table_name,
+                                column_name,
+                                *neighbor_rowid,
+                                ne_rowid,
+                                lv,
+                                ne_dist,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -309,7 +423,8 @@ mod tests {
     fn test_prune_edges_keeps_closest() {
         let candidates = vec![(1, 0.5), (2, 0.3), (3, 0.7), (4, 0.2), (5, 0.9)];
 
-        let pruned = prune_edges(&candidates, 3);
+        // Test with None (falls back to simple pruning)
+        let pruned = prune_edges_with_heuristic(&candidates, 3, None, None, None);
 
         assert_eq!(pruned.len(), 3);
         // Should keep the 3 closest: (4, 0.2), (2, 0.3), (1, 0.5)
