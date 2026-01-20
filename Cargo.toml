@@ -25,6 +25,10 @@ tempfile = "3.8"
 rand = "0.8"
 criterion = "0.5"
 
+[[bench]]
+name = "vector_operations"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
