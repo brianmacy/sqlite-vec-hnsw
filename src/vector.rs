@@ -173,10 +173,33 @@ impl Vector {
             });
         }
 
-        // TODO: Implement actual addition
-        Err(Error::NotImplemented(
-            "vec_add not yet implemented".to_string(),
-        ))
+        if self.vec_type != other.vec_type {
+            return Err(Error::InvalidVectorType(
+                "Vector types must match for addition".to_string(),
+            ));
+        }
+
+        match self.vec_type {
+            VectorType::Float32 => {
+                let a = self.as_f32()?;
+                let b = other.as_f32()?;
+                let result: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+                Ok(Vector::from_f32(&result))
+            }
+            VectorType::Int8 => {
+                let a = self.as_i8()?;
+                let b = other.as_i8()?;
+                let result: Vec<i8> = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| x.saturating_add(*y))
+                    .collect();
+                Ok(Vector::from_i8(&result))
+            }
+            VectorType::Bit => Err(Error::InvalidVectorType(
+                "Cannot add binary vectors".to_string(),
+            )),
+        }
     }
 
     /// Subtract two vectors element-wise
@@ -188,21 +211,61 @@ impl Vector {
             });
         }
 
-        // TODO: Implement actual subtraction
-        Err(Error::NotImplemented(
-            "vec_sub not yet implemented".to_string(),
-        ))
+        if self.vec_type != other.vec_type {
+            return Err(Error::InvalidVectorType(
+                "Vector types must match for subtraction".to_string(),
+            ));
+        }
+
+        match self.vec_type {
+            VectorType::Float32 => {
+                let a = self.as_f32()?;
+                let b = other.as_f32()?;
+                let result: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x - y).collect();
+                Ok(Vector::from_f32(&result))
+            }
+            VectorType::Int8 => {
+                let a = self.as_i8()?;
+                let b = other.as_i8()?;
+                let result: Vec<i8> = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| x.saturating_sub(*y))
+                    .collect();
+                Ok(Vector::from_i8(&result))
+            }
+            VectorType::Bit => Err(Error::InvalidVectorType(
+                "Cannot subtract binary vectors".to_string(),
+            )),
+        }
     }
 
-    /// Normalize vector to unit length
+    /// Normalize vector to unit length (L2 norm)
     pub fn normalize(&self) -> Result<Vector> {
-        // TODO: Implement normalization
-        Err(Error::NotImplemented(
-            "vec_normalize not yet implemented".to_string(),
-        ))
+        match self.vec_type {
+            VectorType::Float32 => {
+                let vals = self.as_f32()?;
+                let magnitude: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+                if magnitude == 0.0 {
+                    return Err(Error::InvalidParameter(
+                        "Cannot normalize zero vector".to_string(),
+                    ));
+                }
+
+                let result: Vec<f32> = vals.iter().map(|x| x / magnitude).collect();
+                Ok(Vector::from_f32(&result))
+            }
+            VectorType::Int8 => Err(Error::InvalidVectorType(
+                "Cannot normalize Int8 vectors (would lose precision)".to_string(),
+            )),
+            VectorType::Bit => Err(Error::InvalidVectorType(
+                "Cannot normalize binary vectors".to_string(),
+            )),
+        }
     }
 
-    /// Slice vector
+    /// Slice vector (extract sub-vector from start to end, exclusive)
     pub fn slice(&self, start: usize, end: usize) -> Result<Vector> {
         if start >= self.dimensions || end > self.dimensions || start >= end {
             return Err(Error::InvalidParameter(format!(
@@ -211,13 +274,41 @@ impl Vector {
             )));
         }
 
-        // TODO: Implement slicing
-        Err(Error::NotImplemented(
-            "vec_slice not yet implemented".to_string(),
-        ))
+        match self.vec_type {
+            VectorType::Float32 => {
+                let vals = self.as_f32()?;
+                let sliced = vals[start..end].to_vec();
+                Ok(Vector::from_f32(&sliced))
+            }
+            VectorType::Int8 => {
+                let vals = self.as_i8()?;
+                let sliced = vals[start..end].to_vec();
+                Ok(Vector::from_i8(&sliced))
+            }
+            VectorType::Bit => {
+                // For binary vectors, slice at byte boundaries
+                if !start.is_multiple_of(8) || !end.is_multiple_of(8) {
+                    return Err(Error::InvalidParameter(
+                        "Binary vector slice must be at byte boundaries (multiples of 8)"
+                            .to_string(),
+                    ));
+                }
+
+                let start_byte = start / 8;
+                let end_byte = end / 8;
+                let sliced = self.data[start_byte..end_byte].to_vec();
+
+                Ok(Vector {
+                    data: sliced,
+                    dimensions: end - start,
+                    vec_type: VectorType::Bit,
+                })
+            }
+        }
     }
 
-    /// Quantize float32 vector to int8
+    /// Quantize float32 vector to int8 (asymmetric quantization)
+    /// Maps the range [min, max] to [-128, 127]
     pub fn quantize_int8(&self) -> Result<Vector> {
         if self.vec_type != VectorType::Float32 {
             return Err(Error::InvalidVectorType(
@@ -225,18 +316,63 @@ impl Vector {
             ));
         }
 
-        // TODO: Implement quantization
-        Err(Error::NotImplemented(
-            "vec_quantize_int8 not yet implemented".to_string(),
-        ))
+        let vals = self.as_f32()?;
+
+        // Find min and max values
+        let min_val = vals.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_val = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        // Handle edge cases
+        if min_val == max_val {
+            // All values are the same
+            return Ok(Vector::from_i8(&vec![0i8; vals.len()]));
+        }
+
+        // Scale to int8 range [-128, 127]
+        let range = max_val - min_val;
+        let quantized: Vec<i8> = vals
+            .iter()
+            .map(|&v| {
+                let normalized = (v - min_val) / range; // [0, 1]
+                let scaled = normalized * 255.0 - 128.0; // [-128, 127]
+                scaled.round().clamp(-128.0, 127.0) as i8
+            })
+            .collect();
+
+        Ok(Vector::from_i8(&quantized))
     }
 
-    /// Quantize to binary vector
+    /// Quantize to binary vector (threshold at mean)
+    /// Values above mean become 1, below become 0
     pub fn quantize_binary(&self) -> Result<Vector> {
-        // TODO: Implement binary quantization
-        Err(Error::NotImplemented(
-            "vec_quantize_binary not yet implemented".to_string(),
-        ))
+        if self.vec_type != VectorType::Float32 {
+            return Err(Error::InvalidVectorType(
+                "Can only quantize Float32 vectors to binary".to_string(),
+            ));
+        }
+
+        let vals = self.as_f32()?;
+
+        // Calculate mean as threshold
+        let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+
+        // Convert to bits, pack into bytes
+        let num_bytes = vals.len().div_ceil(8);
+        let mut bytes = vec![0u8; num_bytes];
+
+        for (i, &val) in vals.iter().enumerate() {
+            if val >= mean {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                bytes[byte_idx] |= 1 << bit_idx;
+            }
+        }
+
+        Ok(Vector {
+            data: bytes,
+            dimensions: vals.len(),
+            vec_type: VectorType::Bit,
+        })
     }
 }
 
@@ -329,21 +465,46 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_add_not_implemented() {
+    fn test_vector_add() {
         let vec1 = Vector::from_f32(&[1.0, 2.0, 3.0]);
         let vec2 = Vector::from_f32(&[4.0, 5.0, 6.0]);
 
-        let result = vec1.add(&vec2);
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::NotImplemented(_))));
+        let result = vec1.add(&vec2).unwrap();
+        let vals = result.as_f32().unwrap();
+        assert_eq!(vals, &[5.0, 7.0, 9.0]);
     }
 
     #[test]
-    fn test_vector_normalize_not_implemented() {
+    fn test_vector_sub() {
+        let vec1 = Vector::from_f32(&[4.0, 5.0, 6.0]);
+        let vec2 = Vector::from_f32(&[1.0, 2.0, 3.0]);
+
+        let result = vec1.sub(&vec2).unwrap();
+        let vals = result.as_f32().unwrap();
+        assert_eq!(vals, &[3.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_vector_normalize() {
         let vec = Vector::from_f32(&[3.0, 4.0]);
-        let result = vec.normalize();
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::NotImplemented(_))));
+        let result = vec.normalize().unwrap();
+        let vals = result.as_f32().unwrap();
+
+        // 3-4-5 triangle: magnitude is 5
+        assert!((vals[0] - 0.6).abs() < 0.0001);
+        assert!((vals[1] - 0.8).abs() < 0.0001);
+
+        // Verify unit length
+        let magnitude: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((magnitude - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_vector_slice() {
+        let vec = Vector::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let result = vec.slice(1, 4).unwrap();
+        let vals = result.as_f32().unwrap();
+        assert_eq!(vals, &[2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -355,10 +516,26 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_quantize_not_implemented() {
-        let vec = Vector::from_f32(&[0.5, -0.3, 0.8]);
-        let result = vec.quantize_int8();
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::NotImplemented(_))));
+    fn test_vector_quantize_int8() {
+        let vec = Vector::from_f32(&[0.0, 0.5, 1.0]);
+        let result = vec.quantize_int8().unwrap();
+        let vals = result.as_i8().unwrap();
+
+        // Should map [0, 0.5, 1.0] to [-128, 0, 127] approximately
+        assert_eq!(vals.len(), 3);
+        assert!(vals[0] < vals[1]);
+        assert!(vals[1] < vals[2]);
+        assert_eq!(vals[0], -128);
+        assert_eq!(vals[2], 127);
+    }
+
+    #[test]
+    fn test_vector_quantize_binary() {
+        let vec = Vector::from_f32(&[-1.0, -0.5, 0.5, 1.0]);
+        let result = vec.quantize_binary().unwrap();
+
+        // Mean is 0, so values below 0 become 0, above become 1
+        assert_eq!(result.vec_type(), VectorType::Bit);
+        assert_eq!(result.dimensions(), 4);
     }
 }

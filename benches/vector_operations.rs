@@ -1,6 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rusqlite::Connection;
-use sqlite_vec_hnsw;
 
 fn setup_db_with_vectors(num_vectors: usize, dimensions: usize) -> Connection {
     let db = Connection::open_in_memory().unwrap();

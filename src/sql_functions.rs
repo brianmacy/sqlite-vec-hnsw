@@ -27,15 +27,15 @@ pub fn register_all(db: &Connection) -> Result<()> {
     register_vec_type(db)?;
     register_vec_to_json(db)?;
 
-    // Skip unimplemented functions for now
-    let _ = register_vec_add(db);
-    let _ = register_vec_sub(db);
-    let _ = register_vec_normalize(db);
-    let _ = register_vec_slice(db);
+    // Vector operations
+    register_vec_add(db)?;
+    register_vec_sub(db)?;
+    register_vec_normalize(db)?;
+    register_vec_slice(db)?;
 
-    // Quantization - skip unimplemented
-    let _ = register_vec_quantize_int8(db);
-    let _ = register_vec_quantize_binary(db);
+    // Quantization
+    register_vec_quantize_int8(db)?;
+    register_vec_quantize_binary(db)?;
 
     // Metadata
     register_vec_version(db)?;
@@ -251,46 +251,145 @@ fn register_vec_to_json(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn register_vec_add(_db: &Connection) -> Result<()> {
-    // TODO: Implement vec_add() function
-    Err(Error::NotImplemented(
-        "vec_add() not yet implemented".to_string(),
-    ))
+fn register_vec_add(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_add",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let vec1_blob = ctx.get_raw(0).as_blob()?;
+            let vec2_blob = ctx.get_raw(1).as_blob()?;
+
+            // Assume Float32 vectors
+            let vec1 = Vector::from_blob(vec1_blob, VectorType::Float32, vec1_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+            let vec2 = Vector::from_blob(vec2_blob, VectorType::Float32, vec2_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            let result = vec1
+                .add(&vec2)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            Ok(result.as_bytes().to_vec())
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
-fn register_vec_sub(_db: &Connection) -> Result<()> {
-    // TODO: Implement vec_sub() function
-    Err(Error::NotImplemented(
-        "vec_sub() not yet implemented".to_string(),
-    ))
+fn register_vec_sub(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_sub",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let vec1_blob = ctx.get_raw(0).as_blob()?;
+            let vec2_blob = ctx.get_raw(1).as_blob()?;
+
+            let vec1 = Vector::from_blob(vec1_blob, VectorType::Float32, vec1_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+            let vec2 = Vector::from_blob(vec2_blob, VectorType::Float32, vec2_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            let result = vec1
+                .sub(&vec2)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            Ok(result.as_bytes().to_vec())
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
-fn register_vec_normalize(_db: &Connection) -> Result<()> {
-    // TODO: Implement vec_normalize() function
-    Err(Error::NotImplemented(
-        "vec_normalize() not yet implemented".to_string(),
-    ))
+fn register_vec_normalize(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_normalize",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let vec_blob = ctx.get_raw(0).as_blob()?;
+
+            let vec = Vector::from_blob(vec_blob, VectorType::Float32, vec_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            let result = vec
+                .normalize()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            Ok(result.as_bytes().to_vec())
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
-fn register_vec_slice(_db: &Connection) -> Result<()> {
-    // TODO: Implement vec_slice() function
-    Err(Error::NotImplemented(
-        "vec_slice() not yet implemented".to_string(),
-    ))
+fn register_vec_slice(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_slice",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let vec_blob = ctx.get_raw(0).as_blob()?;
+            let start = ctx.get::<i64>(1)? as usize;
+            let end = ctx.get::<i64>(2)? as usize;
+
+            let vec = Vector::from_blob(vec_blob, VectorType::Float32, vec_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            let result = vec
+                .slice(start, end)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            Ok(result.as_bytes().to_vec())
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
-fn register_vec_quantize_int8(_db: &Connection) -> Result<()> {
-    // TODO: Implement vec_quantize_int8() function
-    Err(Error::NotImplemented(
-        "vec_quantize_int8() not yet implemented".to_string(),
-    ))
+fn register_vec_quantize_int8(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_quantize_int8",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let vec_blob = ctx.get_raw(0).as_blob()?;
+
+            let vec = Vector::from_blob(vec_blob, VectorType::Float32, vec_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            let result = vec
+                .quantize_int8()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            Ok(result.as_bytes().to_vec())
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
-fn register_vec_quantize_binary(_db: &Connection) -> Result<()> {
-    // TODO: Implement vec_quantize_binary() function
-    Err(Error::NotImplemented(
-        "vec_quantize_binary() not yet implemented".to_string(),
-    ))
+fn register_vec_quantize_binary(db: &Connection) -> Result<()> {
+    db.create_scalar_function(
+        "vec_quantize_binary",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let vec_blob = ctx.get_raw(0).as_blob()?;
+
+            let vec = Vector::from_blob(vec_blob, VectorType::Float32, vec_blob.len() / 4)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            let result = vec
+                .quantize_binary()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+            Ok(result.as_bytes().to_vec())
+        },
+    )
+    .map_err(Error::Sqlite)?;
+    Ok(())
 }
 
 fn register_vec_version(db: &Connection) -> Result<()> {
