@@ -138,6 +138,15 @@ fn prune_edges_with_heuristic(
 /// 5. Create bidirectional edges
 /// 6. Prune edges to maintain M connections
 /// 7. Update entry point if new node has higher level
+/// Cached prepared statements for HNSW operations
+pub struct HnswStmtCache {
+    pub get_node_data: *mut rusqlite::ffi::sqlite3_stmt,
+    pub get_edges_with_dist: *mut rusqlite::ffi::sqlite3_stmt,
+    pub insert_node: *mut rusqlite::ffi::sqlite3_stmt,
+    pub insert_edge: *mut rusqlite::ffi::sqlite3_stmt,
+    pub delete_edges_from: *mut rusqlite::ffi::sqlite3_stmt,
+}
+
 pub fn insert_hnsw(
     db: &Connection,
     metadata: &mut HnswMetadata,
@@ -145,12 +154,14 @@ pub fn insert_hnsw(
     column_name: &str,
     rowid: i64,
     vector: &[u8],
+    stmt_cache: Option<&HnswStmtCache>,
 ) -> Result<()> {
     // Generate level for new node
     let level = generate_level(metadata);
 
     // Insert node into shadow table
-    storage::insert_node(db, table_name, column_name, rowid, level, vector, None)?;
+    let insert_node_stmt = stmt_cache.map(|c| c.insert_node);
+    storage::insert_node(db, table_name, column_name, rowid, level, vector, insert_node_stmt)?;
 
     // Handle first node case
     if metadata.entry_point_rowid == -1 {
@@ -178,6 +189,7 @@ pub fn insert_hnsw(
             &new_vec,
             current_nearest,
             lv,
+            stmt_cache,
         )?;
         current_nearest = nearest;
     }
@@ -209,9 +221,10 @@ pub fn insert_hnsw(
         };
 
         // Fetch candidate vectors for RNG heuristic pruning
+        let get_node_stmt = stmt_cache.map(|c| c.get_node_data);
         let mut candidate_vectors = std::collections::HashMap::new();
         for (candidate_rowid, _) in neighbors.iter() {
-            if let Some(node) = storage::fetch_node_data(db, table_name, column_name, *candidate_rowid, None)? {
+            if let Some(node) = storage::fetch_node_data(db, table_name, column_name, *candidate_rowid, get_node_stmt)? {
                 if let Ok(vec) = Vector::from_blob(&node.vector, metadata.element_type, metadata.dimensions as usize) {
                     candidate_vectors.insert(*candidate_rowid, vec);
                 }
@@ -228,6 +241,7 @@ pub fn insert_hnsw(
         );
 
         // Create bidirectional edges
+        let insert_edge_stmt = stmt_cache.map(|c| c.insert_edge);
         for (neighbor_rowid, dist) in pruned.iter() {
             // Edge from new node to neighbor
             storage::insert_edge(
@@ -238,7 +252,7 @@ pub fn insert_hnsw(
                 *neighbor_rowid,
                 lv,
                 *dist,
-                None,
+                insert_edge_stmt,
             )?;
 
             // Edge from neighbor to new node
@@ -250,24 +264,25 @@ pub fn insert_hnsw(
                 rowid,
                 lv,
                 *dist,
-                None,
+                insert_edge_stmt,
             )?;
 
             // Check if neighbor now has too many connections, prune if needed
             // Fetch edges WITH distances to avoid recalculating
+            let get_edges_stmt = stmt_cache.map(|c| c.get_edges_with_dist);
             let mut neighbor_edges_with_dist = storage::fetch_neighbors_with_distances(
                 db,
                 table_name,
                 column_name,
                 *neighbor_rowid,
                 lv,
-                None,
+                get_edges_stmt,
             )?;
 
             if neighbor_edges_with_dist.len() >= max_connections {
                 // Need to prune neighbor's edges using RNG heuristic
                 // Fetch neighbor's vector (the center for pruning)
-                if let Some(neighbor_node) = storage::fetch_node_data(db, table_name, column_name, *neighbor_rowid, None)? {
+                if let Some(neighbor_node) = storage::fetch_node_data(db, table_name, column_name, *neighbor_rowid, get_node_stmt)? {
                     if let Ok(neighbor_vec) = Vector::from_blob(&neighbor_node.vector, metadata.element_type, metadata.dimensions as usize) {
                         // Add the new edge if not already present
                         if !neighbor_edges_with_dist.iter().any(|(r, _)| *r == rowid) {
@@ -280,7 +295,7 @@ pub fn insert_hnsw(
 
                         for (cand_rowid, _) in neighbor_edges_with_dist.iter() {
                             if *cand_rowid != rowid {
-                                if let Some(cand_node) = storage::fetch_node_data(db, table_name, column_name, *cand_rowid, None)? {
+                                if let Some(cand_node) = storage::fetch_node_data(db, table_name, column_name, *cand_rowid, get_node_stmt)? {
                                     if let Ok(cand_vec) = Vector::from_blob(&cand_node.vector, metadata.element_type, metadata.dimensions as usize) {
                                         neighbor_candidate_vectors.insert(*cand_rowid, cand_vec);
                                     }
@@ -298,7 +313,8 @@ pub fn insert_hnsw(
                         );
 
                         // Rebuild neighbor's edges
-                        storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv, None)?;
+                        let delete_edges_stmt = stmt_cache.map(|c| c.delete_edges_from);
+                        storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv, delete_edges_stmt)?;
                         for (ne_rowid, ne_dist) in pruned_neighbor {
                             storage::insert_edge(
                                 db,
@@ -308,7 +324,7 @@ pub fn insert_hnsw(
                                 ne_rowid,
                                 lv,
                                 ne_dist,
-                                None,
+                                insert_edge_stmt,
                             )?;
                         }
                     }
@@ -345,15 +361,18 @@ fn find_closest_at_level(
     query_vec: &Vector,
     start_rowid: i64,
     level: i32,
+    stmt_cache: Option<&HnswStmtCache>,
 ) -> Result<i64> {
     let mut current = start_rowid;
     let mut changed = true;
+
+    let get_node_stmt = stmt_cache.map(|c| c.get_node_data);
 
     while changed {
         changed = false;
 
         // Get current node's distance
-        let current_node = storage::fetch_node_data(db, table_name, column_name, current, None)?
+        let current_node = storage::fetch_node_data(db, table_name, column_name, current, get_node_stmt)?
             .ok_or_else(|| Error::InvalidParameter(format!("Node {} not found", current)))?;
 
         let current_vec = Vector::from_blob(
@@ -368,7 +387,7 @@ fn find_closest_at_level(
 
         for neighbor_rowid in neighbors {
             let neighbor_node =
-                storage::fetch_node_data(db, table_name, column_name, neighbor_rowid, None)?;
+                storage::fetch_node_data(db, table_name, column_name, neighbor_rowid, get_node_stmt)?;
             let neighbor_node = match neighbor_node {
                 Some(n) => n,
                 None => continue,
@@ -446,7 +465,7 @@ mod tests {
 
         // Insert first vector
         let vector = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // [1.0, 2.0, 3.0]
-        insert_hnsw(&db, &mut metadata, "test_table", "embedding", 1, &vector).unwrap();
+        insert_hnsw(&db, &mut metadata, "test_table", "embedding", 1, &vector, None).unwrap();
 
         // Verify metadata updated
         assert_eq!(metadata.entry_point_rowid, 1);
@@ -485,7 +504,7 @@ mod tests {
                 0,
                 0,
             ];
-            insert_hnsw(&db, &mut metadata, "test_table", "embedding", i, &vector).unwrap();
+            insert_hnsw(&db, &mut metadata, "test_table", "embedding", i, &vector, None).unwrap();
         }
 
         // Verify all nodes inserted
@@ -508,7 +527,7 @@ mod tests {
         // Insert a few vectors
         for i in 1..=3 {
             let vector = vec![i as u8, 0, 0, 0, i as u8, 0, 0, 0, i as u8, 0, 0, 0];
-            insert_hnsw(&db, &mut metadata, "test_table", "embedding", i, &vector).unwrap();
+            insert_hnsw(&db, &mut metadata, "test_table", "embedding", i, &vector, None).unwrap();
         }
 
         // Check that edges were created (at least for some nodes)

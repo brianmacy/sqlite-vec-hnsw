@@ -73,7 +73,7 @@ pub fn rebuild_hnsw_index(
 
         if let Some(vector) = vector_data {
             // Re-insert into HNSW index
-            insert::insert_hnsw(db, &mut metadata, table_name, column_name, rowid, &vector)?;
+            insert::insert_hnsw(db, &mut metadata, table_name, column_name, rowid, &vector, None)?;
         }
     }
 

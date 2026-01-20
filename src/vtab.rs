@@ -825,6 +825,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         };
 
         // Process vector columns
+        let mut vec_col_idx = 0;
         for (col_idx, col) in self.columns.iter().enumerate() {
             if let ColumnType::Vector {
                 vec_type,
@@ -896,7 +897,21 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                                     )
                                 });
 
-                        // Insert into HNSW graph
+                        // Get statement cache for this vector column
+                        let stmt_cache_ref = if vec_col_idx < self.hnsw_stmt_cache.len() {
+                            let cache = &self.hnsw_stmt_cache[vec_col_idx];
+                            Some(hnsw::insert::HnswStmtCache {
+                                get_node_data: cache.get_node_data,
+                                get_edges_with_dist: cache.get_edges_with_dist,
+                                insert_node: cache.insert_node,
+                                insert_edge: cache.insert_edge,
+                                delete_edges_from: cache.delete_edges_from,
+                            })
+                        } else {
+                            None
+                        };
+
+                        // Insert into HNSW graph with cached statements
                         hnsw::insert::insert_hnsw(
                             &conn,
                             &mut metadata,
@@ -904,12 +919,15 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             &col.name,
                             rowid,
                             &vector_data,
+                            stmt_cache_ref.as_ref(),
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
                         std::mem::forget(conn);
                     }
                 }
+
+                vec_col_idx += 1;
             }
         }
 
@@ -939,6 +957,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         }
 
         // Process vector columns
+        let mut vec_col_idx = 0;
         for (col_idx, col) in self.columns.iter().enumerate() {
             if let ColumnType::Vector {
                 vec_type,
@@ -947,13 +966,17 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             {
                 let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
                 if value_idx >= args.len() {
+                    vec_col_idx += 1;
                     continue;
                 }
 
                 // Get the new vector data
                 let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx)? {
                     Some(data) => data,
-                    None => continue, // NULL vector, skip (could implement DELETE here)
+                    None => {
+                        vec_col_idx += 1;
+                        continue; // NULL vector, skip (could implement DELETE here)
+                    }
                 };
 
                 // Validate byte size
@@ -1052,7 +1075,21 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             metadata.num_nodes = metadata.num_nodes.saturating_sub(1);
                         }
 
-                        // Re-insert with new vector
+                        // Get statement cache for this vector column
+                        let stmt_cache_ref = if vec_col_idx < self.hnsw_stmt_cache.len() {
+                            let cache = &self.hnsw_stmt_cache[vec_col_idx];
+                            Some(hnsw::insert::HnswStmtCache {
+                                get_node_data: cache.get_node_data,
+                                get_edges_with_dist: cache.get_edges_with_dist,
+                                insert_node: cache.insert_node,
+                                insert_edge: cache.insert_edge,
+                                delete_edges_from: cache.delete_edges_from,
+                            })
+                        } else {
+                            None
+                        };
+
+                        // Re-insert with new vector using cached statements
                         hnsw::insert::insert_hnsw(
                             &conn,
                             &mut metadata,
@@ -1060,12 +1097,14 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             &col.name,
                             old_rowid,
                             &vector_data,
+                            stmt_cache_ref.as_ref(),
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                     }
                 }
 
                 std::mem::forget(conn);
+                vec_col_idx += 1;
             }
         }
 
