@@ -163,23 +163,24 @@ pub fn insert_hnsw(
             )?;
 
             // Check if neighbor now has too many connections, prune if needed
-            let neighbor_edges =
-                storage::fetch_neighbors(db, table_name, column_name, *neighbor_rowid, lv)?;
-            if neighbor_edges.len() > max_connections {
+            // Fetch edges WITH distances to avoid recalculating
+            let mut neighbor_edges_with_dist = storage::fetch_neighbors_with_distances(
+                db,
+                table_name,
+                column_name,
+                *neighbor_rowid,
+                lv,
+            )?;
+
+            if neighbor_edges_with_dist.len() >= max_connections {
                 // Need to prune neighbor's edges
-                // Fetch all neighbor's neighbors with distances
-                let mut neighbor_candidates = Vec::new();
-                for ne_rowid in neighbor_edges {
-                    if ne_rowid == rowid {
-                        neighbor_candidates.push((rowid, *dist));
-                    } else {
-                        // Fetch distance from metadata or recalculate
-                        // For now, keep existing edges (simplified pruning)
-                        neighbor_candidates.push((ne_rowid, 0.0));
-                    }
+                // Add the new edge if not already present
+                if !neighbor_edges_with_dist.iter().any(|(r, _)| *r == rowid) {
+                    neighbor_edges_with_dist.push((rowid, *dist));
                 }
 
-                let pruned_neighbor = prune_edges(&neighbor_candidates, max_connections);
+                // Prune using stored distances (no vector fetches needed!)
+                let pruned_neighbor = prune_edges(&neighbor_edges_with_dist, max_connections);
 
                 // Rebuild neighbor's edges
                 storage::delete_edges_from_level(db, table_name, column_name, *neighbor_rowid, lv)?;

@@ -19,7 +19,8 @@ use std::os::raw::c_char;
 use std::ptr;
 
 /// Default chunk size (number of vectors per chunk)
-pub const DEFAULT_CHUNK_SIZE: usize = 256;
+/// Must match C implementation default (1024)
+pub const DEFAULT_CHUNK_SIZE: usize = 1024;
 
 /// Chunk information returned when allocating space for a new vector
 #[derive(Debug, Clone)]
@@ -161,6 +162,50 @@ pub fn create_shadow_tables(
     };
 
     db.execute(&rowids_sql, []).map_err(Error::Sqlite)?;
+
+    // Create _info shadow table (stores version metadata)
+    let info_sql = format!(
+        "CREATE TABLE \"{}\".\"{}_info\" (\
+         key TEXT PRIMARY KEY, \
+         value\
+         );",
+        schema, table_name
+    );
+    db.execute(&info_sql, []).map_err(Error::Sqlite)?;
+
+    // Populate _info table with version information
+    db.execute(
+        &format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION', '0.1.0')",
+            schema, table_name
+        ),
+        [],
+    )
+    .map_err(Error::Sqlite)?;
+    db.execute(
+        &format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION_MAJOR', 0)",
+            schema, table_name
+        ),
+        [],
+    )
+    .map_err(Error::Sqlite)?;
+    db.execute(
+        &format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION_MINOR', 1)",
+            schema, table_name
+        ),
+        [],
+    )
+    .map_err(Error::Sqlite)?;
+    db.execute(
+        &format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION_PATCH', 0)",
+            schema, table_name
+        ),
+        [],
+    )
+    .map_err(Error::Sqlite)?;
 
     // Create vector_chunks shadow tables (one per vector column)
     for i in 0..config.num_vector_columns {
@@ -396,6 +441,39 @@ pub unsafe fn create_shadow_tables_ffi(
 
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &rowids_sql)? };
+
+    // Create _info shadow table (stores version metadata)
+    let info_sql = format!(
+        "CREATE TABLE \"{}\".\"{}_info\" (\
+         key TEXT PRIMARY KEY, \
+         value\
+         );",
+        schema, table_name
+    );
+    unsafe { execute_sql_ffi(db, &info_sql)? };
+
+    // Populate _info table with version information
+    let version_sqls = vec![
+        format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION', '0.1.0')",
+            schema, table_name
+        ),
+        format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION_MAJOR', 0)",
+            schema, table_name
+        ),
+        format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION_MINOR', 1)",
+            schema, table_name
+        ),
+        format!(
+            "INSERT INTO \"{}\".\"{}_info\" (key, value) VALUES ('CREATE_VERSION_PATCH', 0)",
+            schema, table_name
+        ),
+    ];
+    for sql in version_sqls {
+        unsafe { execute_sql_ffi(db, &sql)? };
+    }
 
     // Create vector_chunks shadow tables
     for i in 0..config.num_vector_columns {

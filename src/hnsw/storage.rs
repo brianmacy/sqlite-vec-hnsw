@@ -90,6 +90,35 @@ pub fn fetch_neighbors(
     Ok(neighbors)
 }
 
+/// Fetch neighbors of a node WITH distances at a specific level
+///
+/// # Returns
+/// List of (neighbor_rowid, distance) tuples at the given level
+pub fn fetch_neighbors_with_distances(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+    from_rowid: i64,
+    level: i32,
+) -> Result<Vec<(i64, f32)>> {
+    let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+    let query = format!(
+        "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ? ORDER BY distance",
+        edges_table
+    );
+
+    let mut stmt = db.prepare(&query).map_err(Error::Sqlite)?;
+    let neighbors = stmt
+        .query_map([from_rowid, level as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
+        })
+        .map_err(Error::Sqlite)?
+        .collect::<std::result::Result<Vec<(i64, f32)>, _>>()
+        .map_err(Error::Sqlite)?;
+
+    Ok(neighbors)
+}
+
 /// Insert a new node into the HNSW index
 pub fn insert_node(
     db: &Connection,
