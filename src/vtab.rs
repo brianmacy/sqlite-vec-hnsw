@@ -5,7 +5,7 @@ use crate::distance::DistanceMetric;
 use crate::error::{Error, Result};
 use crate::hnsw::{self, HnswMetadata};
 use crate::shadow;
-use crate::vector::VectorType;
+use crate::vector::{Vector, VectorType};
 use rusqlite::vtab::{
     Context, CreateVTab, Filters, IndexInfo, Inserts, UpdateVTab, Updates, VTab, VTabConnection,
     VTabCursor, sqlite3_vtab, sqlite3_vtab_cursor,
@@ -72,6 +72,9 @@ struct HnswStmtCache {
     insert_edge: *mut ffi::sqlite3_stmt,
     delete_edges_from: *mut ffi::sqlite3_stmt,
     update_meta: *mut ffi::sqlite3_stmt,
+    /// Single batch fetch statement with 64 placeholders
+    /// Unused slots are bound to -1 (won't match any rowid)
+    batch_fetch_nodes: *mut ffi::sqlite3_stmt,
 }
 
 impl HnswStmtCache {
@@ -84,6 +87,7 @@ impl HnswStmtCache {
             insert_edge: std::ptr::null_mut(),
             delete_edges_from: std::ptr::null_mut(),
             update_meta: std::ptr::null_mut(),
+            batch_fetch_nodes: std::ptr::null_mut(),
         }
     }
 
@@ -205,9 +209,11 @@ impl HnswStmtCache {
             )));
         }
 
-        // Prepare update_meta: INSERT OR REPLACE INTO hnsw_meta (key, value) VALUES (?, ?)
+        // Prepare update_meta: single UPDATE for dynamic metadata fields
         let sql = CString::new(format!(
-            "INSERT OR REPLACE INTO \"{}_{}_hnsw_meta\" (key, value) VALUES (?, ?)",
+            "UPDATE \"{}_{}_hnsw_meta\" SET \
+             entry_point_rowid = ?, entry_point_level = ?, num_nodes = ?, hnsw_version = ? \
+             WHERE id = 1",
             table_name, column_name
         ))
         .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
@@ -217,6 +223,29 @@ impl HnswStmtCache {
             sql.as_ptr(),
             -1,
             &mut self.update_meta,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare batch_fetch_nodes with 16 placeholders (pad unused with -1)
+        let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
+        let placeholders = (0..16).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = CString::new(format!(
+            "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+            nodes_table, placeholders
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.batch_fetch_nodes,
             std::ptr::null_mut(),
         );
         if rc != ffi::SQLITE_OK {
@@ -258,6 +287,11 @@ impl HnswStmtCache {
         if !self.update_meta.is_null() {
             ffi::sqlite3_finalize(self.update_meta);
             self.update_meta = std::ptr::null_mut();
+        }
+        // Finalize batch fetch statement
+        if !self.batch_fetch_nodes.is_null() {
+            ffi::sqlite3_finalize(self.batch_fetch_nodes);
+            self.batch_fetch_nodes = std::ptr::null_mut();
         }
     }
 }
@@ -851,10 +885,21 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     continue;
                 }
 
-                // Get the vector data as raw bytes
-                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx)? {
-                    Some(data) => data,
-                    None => continue, // NULL vector, skip
+                // Get the vector data as raw bytes - try blob first, then JSON text
+                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => continue, // NULL vector, skip
+                    Err(_) => {
+                        // Not a blob, try as JSON text string
+                        match args.get::<Option<String>>(value_idx)? {
+                            Some(json_str) => {
+                                let vector = Vector::from_json(&json_str, *vec_type)
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                                vector.as_bytes().to_vec()
+                            }
+                            None => continue, // NULL vector, skip
+                        }
+                    }
                 };
 
                 // Validate the byte size matches expected dimensions
@@ -957,7 +1002,10 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             conn.prepare_or_reuse(
                                 &mut cache.update_meta,
                                 &format!(
-                                    "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
+                                    "UPDATE \"{}\" SET \
+                                     entry_point_rowid = ?, entry_point_level = ?, \
+                                     num_nodes = ?, hnsw_version = ? \
+                                     WHERE id = 1",
                                     meta_table
                                 ),
                             )
@@ -971,6 +1019,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                                 insert_edge: cache.insert_edge,
                                 delete_edges_from: cache.delete_edges_from,
                                 update_meta: cache.update_meta,
+                                batch_fetch_nodes: cache.batch_fetch_nodes,
                             })
                         } else {
                             None
@@ -1035,12 +1084,26 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     continue;
                 }
 
-                // Get the new vector data
-                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx)? {
-                    Some(data) => data,
-                    None => {
+                // Get the new vector data - try blob first, then JSON text
+                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
                         vec_col_idx += 1;
                         continue; // NULL vector, skip (could implement DELETE here)
+                    }
+                    Err(_) => {
+                        // Not a blob, try as JSON text string
+                        match args.get::<Option<String>>(value_idx)? {
+                            Some(json_str) => {
+                                let vector = Vector::from_json(&json_str, *vec_type)
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                                vector.as_bytes().to_vec()
+                            }
+                            None => {
+                                vec_col_idx += 1;
+                                continue; // NULL vector, skip
+                            }
+                        }
                     }
                 };
 
@@ -1204,6 +1267,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                                 insert_edge: cache.insert_edge,
                                 delete_edges_from: cache.delete_edges_from,
                                 update_meta: cache.update_meta,
+                                batch_fetch_nodes: cache.batch_fetch_nodes,
                             })
                         } else {
                             None

@@ -56,11 +56,34 @@ fn vector_from_sql(value: ValueRef, vec_type: VectorType) -> Result<Vector> {
             Vector::from_json(json_str, vec_type)
         }
         ValueRef::Blob(b) => {
-            // Determine dimensions from blob size
+            // Validate and determine dimensions from blob size
             let dimensions = match vec_type {
-                VectorType::Float32 => b.len() / 4,
-                VectorType::Int8 => b.len(),
-                VectorType::Bit => b.len() * 8,
+                VectorType::Float32 => {
+                    // Must be a multiple of 4 bytes and non-empty
+                    if b.is_empty() || b.len() % 4 != 0 {
+                        return Err(Error::InvalidVectorFormat(format!(
+                            "Float32 blob must be a non-zero multiple of 4 bytes, got {} bytes",
+                            b.len()
+                        )));
+                    }
+                    b.len() / 4
+                }
+                VectorType::Int8 => {
+                    if b.is_empty() {
+                        return Err(Error::InvalidVectorFormat(
+                            "Int8 blob must not be empty".to_string(),
+                        ));
+                    }
+                    b.len()
+                }
+                VectorType::Bit => {
+                    if b.is_empty() {
+                        return Err(Error::InvalidVectorFormat(
+                            "Bit blob must not be empty".to_string(),
+                        ));
+                    }
+                    b.len() * 8
+                }
             };
             Vector::from_blob(b, vec_type, dimensions)
         }
@@ -461,32 +484,25 @@ fn register_vec_rebuild_hnsw(db: &Connection) -> Result<()> {
             // 3. Resetting metadata (entry_point=-1) ensures fresh graph construction
             let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-            // Step 3: Reset/update metadata
-            conn.execute(
-                &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('entry_point_rowid', '-1')", meta_table),
-                []
-            )?;
-            conn.execute(
-                &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('num_nodes', '0')", meta_table),
-                []
-            )?;
-            conn.execute(
-                &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('hnsw_version', '1')", meta_table),
-                []
-            )?;
-
+            // Step 3: Reset/update metadata (single-row schema)
+            // Build UPDATE with optional new params
+            let mut update_parts = vec![
+                "entry_point_rowid = -1".to_string(),
+                "entry_point_level = -1".to_string(),
+                "num_nodes = 0".to_string(),
+                "hnsw_version = 1".to_string(),
+            ];
             if let Some(m) = new_m {
-                conn.execute(
-                    &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('M', '{}')", meta_table, m),
-                    []
-                )?;
+                update_parts.push(format!("m = {}", m));
+                update_parts.push(format!("max_m0 = {}", m * 2));
             }
             if let Some(ef) = new_ef_construction {
-                conn.execute(
-                    &format!("INSERT OR REPLACE INTO \"{}\" (key, value) VALUES ('ef_construction', '{}')", meta_table, ef),
-                    []
-                )?;
+                update_parts.push(format!("ef_construction = {}", ef));
             }
+            conn.execute(
+                &format!("UPDATE \"{}\" SET {} WHERE id = 1", meta_table, update_parts.join(", ")),
+                []
+            )?;
 
             // Step 4: Trigger rebuild by copying to temp, delete, and re-insert
             // This causes all vectors to be re-inserted through the HNSW insert path

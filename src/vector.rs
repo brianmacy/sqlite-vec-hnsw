@@ -1,6 +1,7 @@
 //! Vector types and operations
 
 use crate::error::{Error, Result};
+use bytemuck::cast_slice;
 use serde::{Deserialize, Serialize};
 
 /// Vector element types
@@ -120,7 +121,42 @@ impl Vector {
         &self.data
     }
 
+    /// Get data as f32 slice WITHOUT allocation (zero-copy)
+    ///
+    /// Uses bytemuck for safe reinterpretation of bytes as f32.
+    /// This is the preferred method for hot paths like distance calculation.
+    ///
+    /// # Panics
+    /// Panics if vector type is not Float32 (debug builds only)
+    #[inline]
+    pub fn as_f32_slice(&self) -> &[f32] {
+        debug_assert_eq!(
+            self.vec_type,
+            VectorType::Float32,
+            "as_f32_slice called on non-Float32 vector"
+        );
+        cast_slice(&self.data)
+    }
+
+    /// Get data as i8 slice WITHOUT allocation (zero-copy)
+    ///
+    /// Uses bytemuck for safe reinterpretation of bytes as i8.
+    /// This is the preferred method for hot paths like distance calculation.
+    ///
+    /// # Panics
+    /// Panics if vector type is not Int8 (debug builds only)
+    #[inline]
+    pub fn as_i8_slice(&self) -> &[i8] {
+        debug_assert_eq!(
+            self.vec_type,
+            VectorType::Int8,
+            "as_i8_slice called on non-Int8 vector"
+        );
+        cast_slice(&self.data)
+    }
+
     /// Convert to f32 slice (for Float32 vectors)
+    /// NOTE: This allocates! Use as_f32_slice() for zero-copy access in hot paths.
     pub fn as_f32(&self) -> Result<Vec<f32>> {
         if self.vec_type != VectorType::Float32 {
             return Err(Error::InvalidVectorType(
@@ -537,5 +573,59 @@ mod tests {
         // Mean is 0, so values below 0 become 0, above become 1
         assert_eq!(result.vec_type(), VectorType::Bit);
         assert_eq!(result.dimensions(), 4);
+    }
+
+    #[test]
+    fn test_vector_from_blob_float32() {
+        // Create blob from known f32 values in little-endian format
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut blob: Vec<u8> = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let vec = Vector::from_blob(&blob, VectorType::Float32, 3).unwrap();
+
+        assert_eq!(vec.vec_type(), VectorType::Float32);
+        assert_eq!(vec.dimensions(), 3);
+        assert_eq!(vec.as_f32().unwrap(), values);
+    }
+
+    #[test]
+    fn test_vector_from_blob_int8() {
+        let values: Vec<i8> = vec![-128, 0, 127];
+        let blob: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+
+        let vec = Vector::from_blob(&blob, VectorType::Int8, 3).unwrap();
+
+        assert_eq!(vec.vec_type(), VectorType::Int8);
+        assert_eq!(vec.dimensions(), 3);
+        assert_eq!(vec.as_i8().unwrap(), values);
+    }
+
+    #[test]
+    fn test_vector_from_blob_bit() {
+        // 16 bits = 2 bytes, bits set: 0, 2, 8, 15
+        let blob: Vec<u8> = vec![0b00000101, 0b10000001];
+
+        let vec = Vector::from_blob(&blob, VectorType::Bit, 16).unwrap();
+
+        assert_eq!(vec.vec_type(), VectorType::Bit);
+        assert_eq!(vec.dimensions(), 16);
+        assert_eq!(vec.as_bytes(), &blob);
+    }
+
+    #[test]
+    fn test_vector_from_json_bit_not_implemented() {
+        let json = "[1, 0, 1, 0]";
+        let result = Vector::from_json(json, VectorType::Bit);
+
+        assert!(result.is_err());
+        match result {
+            Err(Error::NotImplemented(msg)) => {
+                assert!(msg.contains("Binary vector from JSON"));
+            }
+            _ => panic!("Expected NotImplemented error"),
+        }
     }
 }

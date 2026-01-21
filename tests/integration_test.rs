@@ -771,3 +771,235 @@ fn test_knn_end_to_end() {
         }
     }
 }
+
+#[test]
+fn test_vec_bit_scalar_function() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Test vec_bit function with a blob - 8 bits = 1 byte
+    // Create a blob with value 0b10101010
+    let result: SqliteResult<Vec<u8>> =
+        db.query_row("SELECT vec_bit(X'AA')", [], |row| row.get(0));
+
+    assert!(result.is_ok(), "vec_bit should work with blob input");
+    let data = result.unwrap();
+    assert_eq!(data.len(), 1, "Should be 1 byte for 8 bits");
+    assert_eq!(data[0], 0xAA, "Should preserve the bit pattern");
+}
+
+#[test]
+fn test_vec_f32_blob_input() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Test vec_f32 with blob input
+    // 1.0f32 in little-endian is 0x3F800000
+    // 2.0f32 in little-endian is 0x40000000
+    // 3.0f32 in little-endian is 0x40400000
+    let result: SqliteResult<Vec<u8>> = db.query_row(
+        "SELECT vec_f32(X'0000803F0000004000004040')",
+        [],
+        |row| row.get(0),
+    );
+
+    assert!(result.is_ok(), "vec_f32 should work with blob input");
+    let data = result.unwrap();
+    assert_eq!(data.len(), 12, "Should be 12 bytes for 3 float32 values");
+
+    // Verify roundtrip - use vec_to_json to check values
+    let json: String = db
+        .query_row(
+            "SELECT vec_to_json(vec_f32(X'0000803F0000004000004040'))",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(json, "[1.0,2.0,3.0]", "Should decode to correct float values");
+}
+
+#[test]
+fn test_vec_int8_blob_input() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Test vec_int8 with blob input
+    // Values: -128 (0x80), 0 (0x00), 127 (0x7F)
+    let result: SqliteResult<Vec<u8>> =
+        db.query_row("SELECT vec_int8(X'80007F')", [], |row| row.get(0));
+
+    assert!(result.is_ok(), "vec_int8 should work with blob input");
+    let data = result.unwrap();
+    assert_eq!(data.len(), 3, "Should be 3 bytes for 3 int8 values");
+
+    // Verify roundtrip - use vec_to_json to check values
+    let json: String = db
+        .query_row("SELECT vec_to_json(vec_int8(X'80007F'))", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(
+        json, "[-128,0,127]",
+        "Should decode to correct int8 values"
+    );
+}
+
+#[test]
+fn test_vec_int8_json_input() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Test vec_int8 function with JSON input
+    let result: SqliteResult<Vec<u8>> =
+        db.query_row("SELECT vec_int8('[-128, 0, 127]')", [], |row| row.get(0));
+
+    assert!(result.is_ok(), "vec_int8 should work with JSON input");
+    let data = result.unwrap();
+    assert_eq!(data.len(), 3, "Should be 3 bytes for 3 int8 values");
+
+    // Verify values via roundtrip
+    let json: String = db
+        .query_row("SELECT vec_to_json(vec_int8('[-128, 0, 127]'))", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(json, "[-128,0,127]", "Should preserve int8 values");
+}
+
+#[test]
+fn test_insert_direct_json_float32() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create a vec0 table
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_json USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert using direct JSON string (without vec_f32 wrapper)
+    let result = db.execute(
+        "INSERT INTO vec_json(rowid, embedding) VALUES (1, '[1.0, 2.0, 3.0]')",
+        [],
+    );
+
+    assert!(result.is_ok(), "Direct JSON INSERT should work: {:?}", result.err());
+
+    // Verify the data was stored correctly
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vec_json", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "Should have 1 row");
+
+    // Verify shadow tables were created
+    let shadow_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'vec_json_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(shadow_count > 0, "Should have shadow tables created");
+}
+
+#[test]
+fn test_insert_direct_json_int8() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create a vec0 table with int8 vectors
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_json_i8 USING vec0(embedding int8[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert using direct JSON string (without vec_int8 wrapper)
+    let result = db.execute(
+        "INSERT INTO vec_json_i8(rowid, embedding) VALUES (1, '[-128, 0, 127]')",
+        [],
+    );
+
+    assert!(result.is_ok(), "Direct JSON INSERT for int8 should work: {:?}", result.err());
+
+    // Verify the data was stored correctly
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vec_json_i8", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "Should have 1 row");
+}
+
+#[test]
+fn test_update_direct_json() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create a vec0 table
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_upd_json USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert with blob method
+    db.execute(
+        "INSERT INTO vec_upd_json(rowid, embedding) VALUES (1, vec_f32('[1.0, 2.0, 3.0]'))",
+        [],
+    )
+    .unwrap();
+
+    // Update using direct JSON string (without vec_f32 wrapper)
+    let result = db.execute(
+        "UPDATE vec_upd_json SET embedding = '[4.0, 5.0, 6.0]' WHERE rowid = 1",
+        [],
+    );
+
+    assert!(result.is_ok(), "Direct JSON UPDATE should work: {:?}", result.err());
+}
+
+#[test]
+fn test_insert_both_methods_equivalent() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create table
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_equiv USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert via vec_f32 wrapper
+    db.execute(
+        "INSERT INTO vec_equiv(rowid, embedding) VALUES (1, vec_f32('[1.0, 2.0, 3.0]'))",
+        [],
+    )
+    .unwrap();
+
+    // Insert via direct JSON
+    db.execute(
+        "INSERT INTO vec_equiv(rowid, embedding) VALUES (2, '[1.0, 2.0, 3.0]')",
+        [],
+    )
+    .unwrap();
+
+    // Both rows should exist
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vec_equiv", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "Both insert methods should work");
+
+    // Verify shadow tables exist and have data
+    let shadow_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'vec_equiv_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(shadow_count >= 3, "Should have shadow tables for vec_equiv");
+}
