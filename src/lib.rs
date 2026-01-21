@@ -115,8 +115,13 @@ pub fn init_with_pragmas(db: &Connection) -> Result<()> {
 pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
     db: *mut ffi::sqlite3,
     _err_msg: *mut *mut std::os::raw::c_char,
-    _api: *mut ffi::sqlite3_api_routines,
+    p_api: *mut ffi::sqlite3_api_routines,
 ) -> std::os::raw::c_int {
+    // Initialize the SQLite API routines pointer (required for loadable extensions)
+    if unsafe { ffi::rusqlite_extension_init2(p_api) }.is_err() {
+        return ffi::SQLITE_ERROR;
+    }
+
     // SAFETY: We're being called by SQLite's extension loader with a valid db handle
     match std::panic::catch_unwind(|| {
         // Create a connection wrapper from the raw handle
@@ -128,7 +133,11 @@ pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
 
         // Initialize the extension
         match init(&conn) {
-            Ok(()) => ffi::SQLITE_OK,
+            Ok(()) => {
+                // Don't drop the connection - SQLite owns it
+                std::mem::forget(conn);
+                ffi::SQLITE_OK
+            }
             Err(_) => ffi::SQLITE_ERROR,
         }
     }) {
