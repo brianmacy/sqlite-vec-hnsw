@@ -295,32 +295,18 @@ pub fn create_hnsw_shadow_tables(
     );
     db.execute(&nodes_sql, []).map_err(Error::Sqlite)?;
 
-    // Create edges table (no distance column - we can still read C databases)
+    // Create edges table - WITHOUT ROWID clusters edges by (from_rowid, level)
+    // for efficient neighbor lookups. No separate index needed.
     let edges_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
          from_rowid INTEGER NOT NULL, \
          to_rowid INTEGER NOT NULL, \
          level INTEGER NOT NULL, \
-         PRIMARY KEY (from_rowid, to_rowid, level)\
-         )",
+         PRIMARY KEY (from_rowid, level, to_rowid)\
+         ) WITHOUT ROWID",
         table_name, column_name
     );
     db.execute(&edges_sql, []).map_err(Error::Sqlite)?;
-
-    // Create indexes for efficient traversal
-    let index_from_sql = format!(
-        "CREATE INDEX IF NOT EXISTS \"{}_{}_hnsw_edges_from_level\" \
-         ON \"{}_{}_hnsw_edges\"(from_rowid, level)",
-        table_name, column_name, table_name, column_name
-    );
-    db.execute(&index_from_sql, []).map_err(Error::Sqlite)?;
-
-    let index_to_sql = format!(
-        "CREATE INDEX IF NOT EXISTS \"{}_{}_hnsw_edges_to_level\" \
-         ON \"{}_{}_hnsw_edges\"(to_rowid, level)",
-        table_name, column_name, table_name, column_name
-    );
-    db.execute(&index_to_sql, []).map_err(Error::Sqlite)?;
 
     // Create levels table
     let levels_sql = format!(
@@ -562,35 +548,19 @@ pub unsafe fn create_hnsw_shadow_tables_ffi(
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &nodes_sql)? };
 
-    // Create edges table (no distance column - we can still read C databases)
+    // Create edges table - WITHOUT ROWID clusters edges by (from_rowid, level)
+    // for efficient neighbor lookups. No separate index needed.
     let edges_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
          from_rowid INTEGER NOT NULL, \
          to_rowid INTEGER NOT NULL, \
          level INTEGER NOT NULL, \
-         PRIMARY KEY (from_rowid, to_rowid, level)\
-         )",
+         PRIMARY KEY (from_rowid, level, to_rowid)\
+         ) WITHOUT ROWID",
         table_name, column_name
     );
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &edges_sql)? };
-
-    // Create indexes
-    let index_from_sql = format!(
-        "CREATE INDEX IF NOT EXISTS \"{}_{}_hnsw_edges_from_level\" \
-         ON \"{}_{}_hnsw_edges\"(from_rowid, level)",
-        table_name, column_name, table_name, column_name
-    );
-    // SAFETY: execute_sql_ffi is called with a valid database handle
-    unsafe { execute_sql_ffi(db, &index_from_sql)? };
-
-    let index_to_sql = format!(
-        "CREATE INDEX IF NOT EXISTS \"{}_{}_hnsw_edges_to_level\" \
-         ON \"{}_{}_hnsw_edges\"(to_rowid, level)",
-        table_name, column_name, table_name, column_name
-    );
-    // SAFETY: execute_sql_ffi is called with a valid database handle
-    unsafe { execute_sql_ffi(db, &index_to_sql)? };
 
     // Create levels table
     let levels_sql = format!(

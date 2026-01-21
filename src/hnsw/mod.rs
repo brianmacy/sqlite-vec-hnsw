@@ -223,58 +223,46 @@ impl HnswMetadata {
         }))
     }
 
-    /// Save metadata to shadow table
+    /// Save metadata to shadow table (batched multi-row INSERT)
     pub fn save_to_db(&self, db: &Connection, table_name: &str, column_name: &str) -> Result<()> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
+
+        // Batch all metadata in one multi-row INSERT
         let update_sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES \
+             ('M', ?), ('max_M0', ?), ('ef_construction', ?), ('ef_search', ?), \
+             ('max_level', ?), ('level_factor', ?), ('entry_point_rowid', ?), \
+             ('entry_point_level', ?), ('num_nodes', ?), ('dimensions', ?), \
+             ('element_type', ?), ('distance_metric', ?), ('rng_seed', ?), \
+             ('hnsw_version', ?)",
             meta_table
         );
 
-        db.execute(&update_sql, ["M", &self.params.m.to_string()])?;
-        db.execute(&update_sql, ["max_M0", &self.params.max_m0.to_string()])?;
         db.execute(
             &update_sql,
-            ["ef_construction", &self.params.ef_construction.to_string()],
-        )?;
-        db.execute(
-            &update_sql,
-            ["ef_search", &self.params.ef_search.to_string()],
-        )?;
-        db.execute(
-            &update_sql,
-            ["max_level", &self.params.max_level.to_string()],
-        )?;
-        db.execute(
-            &update_sql,
-            ["level_factor", &self.params.level_factor.to_string()],
-        )?;
-        db.execute(
-            &update_sql,
-            ["entry_point_rowid", &self.entry_point_rowid.to_string()],
-        )?;
-        db.execute(
-            &update_sql,
-            ["entry_point_level", &self.entry_point_level.to_string()],
-        )?;
-        db.execute(&update_sql, ["num_nodes", &self.num_nodes.to_string()])?;
-        db.execute(&update_sql, ["dimensions", &self.dimensions.to_string()])?;
-        db.execute(&update_sql, ["element_type", self.element_type.as_str()])?;
-        db.execute(
-            &update_sql,
-            ["distance_metric", self.distance_metric.as_str()],
-        )?;
-        db.execute(&update_sql, ["rng_seed", &self.rng_seed.to_string()])?;
-        db.execute(
-            &update_sql,
-            ["hnsw_version", &self.hnsw_version.to_string()],
+            rusqlite::params![
+                self.params.m.to_string(),
+                self.params.max_m0.to_string(),
+                self.params.ef_construction.to_string(),
+                self.params.ef_search.to_string(),
+                self.params.max_level.to_string(),
+                self.params.level_factor.to_string(),
+                self.entry_point_rowid.to_string(),
+                self.entry_point_level.to_string(),
+                self.num_nodes.to_string(),
+                self.dimensions.to_string(),
+                self.element_type.as_str(),
+                self.distance_metric.as_str(),
+                self.rng_seed.to_string(),
+                self.hnsw_version.to_string(),
+            ],
         )?;
 
         Ok(())
     }
 
     /// Save only dynamic fields that change during operations
-    /// This matches C implementation which updates fields individually
+    /// Uses batched multi-row INSERT for efficiency
     /// Only saves: entry_point, num_nodes, hnsw_version
     pub fn save_dynamic_to_db(
         &self,
@@ -283,24 +271,25 @@ impl HnswMetadata {
         column_name: &str,
     ) -> Result<()> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
+
+        // Batch all dynamic fields in one multi-row INSERT
         let update_sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES \
+             ('entry_point_rowid', ?), \
+             ('entry_point_level', ?), \
+             ('num_nodes', ?), \
+             ('hnsw_version', ?)",
             meta_table
         );
 
-        // Only update fields that change during insert/delete operations
         db.execute(
             &update_sql,
-            ["entry_point_rowid", &self.entry_point_rowid.to_string()],
-        )?;
-        db.execute(
-            &update_sql,
-            ["entry_point_level", &self.entry_point_level.to_string()],
-        )?;
-        db.execute(&update_sql, ["num_nodes", &self.num_nodes.to_string()])?;
-        db.execute(
-            &update_sql,
-            ["hnsw_version", &self.hnsw_version.to_string()],
+            rusqlite::params![
+                self.entry_point_rowid.to_string(),
+                self.entry_point_level.to_string(),
+                self.num_nodes.to_string(),
+                self.hnsw_version.to_string(),
+            ],
         )?;
 
         Ok(())

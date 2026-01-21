@@ -514,6 +514,42 @@ pub fn get_nodes_at_level(
     Ok(rowids)
 }
 
+/// Fetch neighbors with their node data in a single JOIN query
+/// Combines fetch_neighbors_cached + fetch_nodes_batch into one query
+/// Query: SELECT n.rowid, n.level, n.vector FROM edges e JOIN nodes n ON e.to_rowid = n.rowid WHERE e.from_rowid = ? AND e.level = ?
+pub fn fetch_neighbor_nodes_joined(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+    from_rowid: i64,
+    level: i32,
+) -> Result<Vec<HnswNode>> {
+    let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+    let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
+
+    let query = format!(
+        "SELECT n.rowid, n.level, n.vector FROM \"{}\" e \
+         JOIN \"{}\" n ON e.to_rowid = n.rowid \
+         WHERE e.from_rowid = ? AND e.level = ?",
+        edges_table, nodes_table
+    );
+
+    let mut stmt = db.prepare(&query).map_err(Error::Sqlite)?;
+    let nodes = stmt
+        .query_map([from_rowid, level as i64], |row| {
+            Ok(HnswNode {
+                rowid: row.get(0)?,
+                level: row.get(1)?,
+                vector: row.get(2)?,
+            })
+        })
+        .map_err(Error::Sqlite)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::Sqlite)?;
+
+    Ok(nodes)
+}
+
 /// Count total nodes in the index
 pub fn count_nodes(db: &Connection, table_name: &str, column_name: &str) -> Result<i32> {
     let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);

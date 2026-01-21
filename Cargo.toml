@@ -2,10 +2,10 @@
 name = "sqlite-vec-hnsw"
 version = "0.1.0"
 edition = "2024"
-authors = ["Senzing"]
+authors = ["Brian Macy"]
 license = "Apache-2.0"
 description = "SQLite extension for vector search with HNSW indexing"
-repository = "https://github.com/senzing/sqlite-vec-hnsw"
+repository = "https://github.com/brianmacy/sqlite-vec-hnsw"
 
 [lib]
 name = "sqlite_vec_hnsw"
@@ -32,6 +32,9 @@ harness = false
 [[bench]]
 name = "recall_benchmark"
 harness = false
+
+[profile.dev]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

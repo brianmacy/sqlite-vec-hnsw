@@ -211,7 +211,7 @@ pub fn search_layer(
             break;
         }
 
-        // Get neighbors of this candidate at the current level
+        // Get neighbors of this candidate at the current level (rowids only - cheap)
         let cached_edges_stmt = ctx.stmt_cache.and_then(|c| c.get_edges);
         let neighbors = storage::fetch_neighbors_cached(
             ctx.db,
@@ -222,25 +222,32 @@ pub fn search_layer(
             cached_edges_stmt,
         )?;
 
-        for neighbor_rowid in neighbors {
-            if visited.contains(&neighbor_rowid) {
-                continue;
-            }
-            visited.insert(neighbor_rowid);
+        // Filter to unvisited neighbors and mark them visited BEFORE expensive fetch
+        let unvisited_neighbors: Vec<i64> = neighbors
+            .into_iter()
+            .filter(|&rowid| {
+                if visited.contains(&rowid) {
+                    false
+                } else {
+                    visited.insert(rowid);
+                    true
+                }
+            })
+            .collect();
 
-            // Fetch neighbor vector and calculate distance
-            let neighbor_node = storage::fetch_node_data(
-                ctx.db,
-                ctx.table_name,
-                ctx.column_name,
-                neighbor_rowid,
-                cached_node_stmt,
-            )?;
-            let neighbor_node = match neighbor_node {
-                Some(n) => n,
-                None => continue, // Node deleted
-            };
+        if unvisited_neighbors.is_empty() {
+            continue;
+        }
 
+        // BATCH FETCH: Get ONLY unvisited neighbor nodes (expensive, but minimized set)
+        let neighbor_nodes = storage::fetch_nodes_batch(
+            ctx.db,
+            ctx.table_name,
+            ctx.column_name,
+            &unvisited_neighbors,
+        )?;
+
+        for neighbor_node in neighbor_nodes {
             let neighbor_vec = Vector::from_blob(
                 &neighbor_node.vector,
                 ctx.metadata.element_type,
@@ -252,12 +259,12 @@ pub fn search_layer(
             // Check if this neighbor is better than our worst result (or we have room)
             if results.len() < ef || neighbor_dist < results.peek().unwrap().distance {
                 candidates.push(MinCandidate {
-                    rowid: neighbor_rowid,
+                    rowid: neighbor_node.rowid,
                     distance: neighbor_dist,
                 });
 
                 results.push(MaxCandidate {
-                    rowid: neighbor_rowid,
+                    rowid: neighbor_node.rowid,
                     distance: neighbor_dist,
                 });
 

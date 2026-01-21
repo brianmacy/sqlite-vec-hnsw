@@ -8,8 +8,8 @@
 
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -48,13 +48,20 @@ struct StressStats {
     search_errors: AtomicU64,
 }
 
-/// Opens a connection with proper multi-threaded settings
+/// Opens a connection with proper multi-threaded settings and C benchmark pragmas
 fn open_connection(db_path: &PathBuf, busy_timeout_ms: u32) -> Result<Connection, String> {
     let db = Connection::open(db_path).map_err(|e| e.to_string())?;
 
     // Set busy timeout to handle contention
     db.busy_timeout(Duration::from_millis(busy_timeout_ms as u64))
         .map_err(|e| e.to_string())?;
+
+    // Apply C benchmark pragma settings (page_size is already set on DB file)
+    db.execute_batch(
+        "PRAGMA cache_size=10000;
+         PRAGMA temp_store=MEMORY;",
+    )
+    .map_err(|e| e.to_string())?;
 
     // Initialize the extension
     sqlite_vec_hnsw::init(&db).map_err(|e| e.to_string())?;
@@ -92,7 +99,10 @@ fn insert_worker(
     let db = match open_connection(&db_path, config.busy_timeout_ms) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("Insert thread {} failed to open connection: {}", thread_id, e);
+            eprintln!(
+                "Insert thread {} failed to open connection: {}",
+                thread_id, e
+            );
             return;
         }
     };
@@ -118,7 +128,10 @@ fn insert_worker(
                 stats.inserts_completed.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
-                eprintln!("Insert thread {} error on rowid {}: {}", thread_id, rowid, e);
+                eprintln!(
+                    "Insert thread {} error on rowid {}: {}",
+                    thread_id, rowid, e
+                );
                 stats.insert_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -136,7 +149,10 @@ fn search_worker(
     let db = match open_connection(&db_path, config.busy_timeout_ms) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("Search thread {} failed to open connection: {}", thread_id, e);
+            eprintln!(
+                "Search thread {} failed to open connection: {}",
+                thread_id, e
+            );
             return;
         }
     };
@@ -199,9 +215,17 @@ fn test_multithread_insert_search_stress() {
 
     println!("\n=== Multi-threaded Insert/Search Stress Test ===\n");
 
-    // Setup: Create database with WAL mode
+    // Setup: 16k pages + WAL for concurrent access
     {
         let db = Connection::open(&db_path).unwrap();
+
+        db.execute_batch(
+            "PRAGMA page_size=16384;
+             PRAGMA cache_size=10000;
+             PRAGMA temp_store=MEMORY;",
+        )
+        .unwrap();
+
         sqlite_vec_hnsw::init(&db).unwrap();
 
         // Enable WAL mode for concurrent access
@@ -209,7 +233,11 @@ fn test_multithread_insert_search_stress() {
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
             .unwrap();
         println!("Journal mode: {}", journal_mode);
-        assert_eq!(journal_mode.to_uppercase(), "WAL", "WAL mode required for concurrent access");
+        assert_eq!(
+            journal_mode.to_uppercase(),
+            "WAL",
+            "WAL mode required for concurrent access"
+        );
 
         // Create table
         db.execute(
@@ -278,7 +306,10 @@ fn test_multithread_insert_search_stress() {
     println!("\n=== Results ===");
     println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
     println!("Inserts completed: {} ({} errors)", inserts, insert_errors);
-    println!("Searches completed: {} ({} errors)", searches, search_errors);
+    println!(
+        "Searches completed: {} ({} errors)",
+        searches, search_errors
+    );
     println!(
         "Insert throughput: {:.1} vec/sec",
         inserts as f64 / elapsed.as_secs_f64()
@@ -367,17 +398,20 @@ fn test_multithread_heavy_contention() {
 
     println!("\n=== BRUTAL Heavy Contention Test ===\n");
 
-    // Setup
+    // Setup with WAL mode for concurrent access
     {
         let db = Connection::open(&db_path).unwrap();
-        sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=10000;
+             PRAGMA temp_store=MEMORY;
              PRAGMA wal_autocheckpoint=1000;",
         )
         .unwrap();
+
+        sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
             "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[64])",
@@ -471,16 +505,21 @@ fn test_multithread_long_running() {
     println!("\n=== 60-Second Stress Test Baseline ===\n");
     println!("Config: 16 insert threads, 4 search threads, 128D vectors, k=50\n");
 
-    // Setup
+    // Setup - WAL mode for concurrent access
+    // 16k pages may help with WITHOUT ROWID clustered edges (M=64 = ~1KB per node)
     {
         let db = Connection::open(&db_path).unwrap();
-        sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;",
+            "PRAGMA page_size=16384;
+             PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=10000;
+             PRAGMA temp_store=MEMORY;",
         )
         .unwrap();
+
+        sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
             "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128])",
@@ -611,13 +650,22 @@ fn test_multithread_long_running() {
     println!("Duration:        {:.2}s", elapsed.as_secs_f64());
     println!("Total Inserts:   {} ({} errors)", inserts, insert_errors);
     println!("Total Searches:  {} ({} errors)", searches, search_errors);
-    println!("Insert Rate:     {:.0} vec/sec", inserts as f64 / elapsed.as_secs_f64());
-    println!("Search Rate:     {:.0} queries/sec", searches as f64 / elapsed.as_secs_f64());
+    println!(
+        "Insert Rate:     {:.0} vec/sec",
+        inserts as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "Search Rate:     {:.0} queries/sec",
+        searches as f64 / elapsed.as_secs_f64()
+    );
     println!("{}", "-".repeat(60));
     println!("Vectors in DB:   {}", count);
     println!("HNSW Nodes:      {}", node_count);
     println!("HNSW Edges:      {}", edge_count);
-    println!("Integrity:       {}", if count == node_count { "PASS" } else { "FAIL" });
+    println!(
+        "Integrity:       {}",
+        if count == node_count { "PASS" } else { "FAIL" }
+    );
     println!("{}", "=".repeat(60));
 
     assert_eq!(count, node_count, "Vector count must match HNSW node count");

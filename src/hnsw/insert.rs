@@ -231,7 +231,14 @@ fn prune_neighbor_if_needed(
 
     // Only delete the edges that need to be removed
     if !edges_to_delete.is_empty() {
-        storage::delete_edges_batch(db, table_name, column_name, neighbor_rowid, level, &edges_to_delete)?;
+        storage::delete_edges_batch(
+            db,
+            table_name,
+            column_name,
+            neighbor_rowid,
+            level,
+            &edges_to_delete,
+        )?;
     }
     PRUNE_DELETE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
