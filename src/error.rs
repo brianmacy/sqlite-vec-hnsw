@@ -7,7 +7,7 @@ pub enum Error {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    #[error("Invalid vector format: {0}")]
+    #[error("Vector parsing error: {0}")]
     InvalidVectorFormat(String),
 
     #[error("Dimension mismatch: expected {expected}, got {actual}")]
@@ -31,7 +31,7 @@ pub enum Error {
     #[error("Invalid state: {0}")]
     InvalidState(String),
 
-    #[error("JSON parse error: {0}")]
+    #[error("JSON parsing error: {0}")]
     JsonParse(#[from] serde_json::Error),
 }
 
