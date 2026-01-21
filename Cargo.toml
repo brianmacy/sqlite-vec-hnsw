@@ -20,6 +20,13 @@ serde_json = "1.0"
 thiserror = "1.0"
 simsimd = "6.3"
 
+[features]
+default = []
+# Enable to register additional module/entry point aliases via environment variables:
+# - SQLITE_VEC_MODULE_ALIAS: Register module under this additional name
+# - SQLITE_VEC_ENTRY_POINT_ALIAS: Export entry point with this additional name
+loadable_extension_alias = []
+
 [dev-dependencies]
 tempfile = "3.8"
 rand = "0.8"

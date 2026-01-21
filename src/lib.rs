@@ -113,19 +113,34 @@ pub fn init_with_pragmas(db: &Connection) -> Result<()> {
 /// It must follow SQLite's extension initialization conventions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
-    _db: *mut ffi::sqlite3,
+    db: *mut ffi::sqlite3,
     _err_msg: *mut *mut std::os::raw::c_char,
-    api: *mut ffi::sqlite3_api_routines,
+    _api: *mut ffi::sqlite3_api_routines,
 ) -> std::os::raw::c_int {
-    // Initialize SQLite API
-    if api.is_null() {
-        return ffi::SQLITE_ERROR;
-    }
+    // SAFETY: We're being called by SQLite's extension loader with a valid db handle
+    match std::panic::catch_unwind(|| {
+        // Create a connection wrapper from the raw handle
+        // SAFETY: db is a valid sqlite3 handle provided by SQLite
+        let conn = match unsafe { Connection::from_handle(db) } {
+            Ok(c) => c,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
 
-    // TODO: Implement full extension initialization
-    // For now, return unimplemented
-    ffi::SQLITE_ERROR
+        // Initialize the extension
+        match init(&conn) {
+            Ok(()) => ffi::SQLITE_OK,
+            Err(_) => ffi::SQLITE_ERROR,
+        }
+    }) {
+        Ok(result) => result,
+        Err(_) => ffi::SQLITE_ERROR,
+    }
 }
+
+// Include additional entry point alias if compiled with loadable_extension_alias feature
+// and SQLITE_VEC_ENTRY_POINT_ALIAS environment variable was set at build time
+#[cfg(feature = "loadable_extension_alias")]
+include!(concat!(env!("OUT_DIR"), "/entry_point_alias.rs"));
 
 #[cfg(test)]
 mod tests {

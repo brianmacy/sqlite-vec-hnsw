@@ -17,9 +17,17 @@ use std::os::raw::c_int;
 /// Register the vec0 virtual table module
 pub fn register_vec0_module(db: &Connection) -> Result<()> {
     // Use update_module_with_tx to support CREATE/INSERT/UPDATE/DELETE + transactions
-    let module = rusqlite::vtab::update_module_with_tx::<Vec0Tab>();
-    db.create_module("vec0", module, None)
+    db.create_module("vec0", rusqlite::vtab::update_module_with_tx::<Vec0Tab>(), None)
         .map_err(Error::Sqlite)?;
+
+    // If compiled with loadable_extension_alias feature and SQLITE_VEC_MODULE_ALIAS is set,
+    // also register the module under that alias name
+    #[cfg(feature = "loadable_extension_alias")]
+    if let Some(alias) = option_env!("SQLITE_VEC_MODULE_ALIAS") {
+        db.create_module(alias, rusqlite::vtab::update_module_with_tx::<Vec0Tab>(), None)
+            .map_err(Error::Sqlite)?;
+    }
+
     Ok(())
 }
 
