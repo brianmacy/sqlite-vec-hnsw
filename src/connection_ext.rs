@@ -44,8 +44,6 @@ impl ConnectionExt for Connection {
             return Ok(());
         }
 
-        eprintln!("PREPARE: {}", &sql[..60.min(sql.len())]);
-
         // Prepare the statement on this connection
         let c_sql = CString::new(sql)
             .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;

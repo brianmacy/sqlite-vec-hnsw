@@ -127,7 +127,7 @@ fn prune_neighbor_if_needed(
     _new_vec: &Vector,
     stmt_cache: Option<&HnswStmtCache>,
     get_edges_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
-    insert_edge_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
+    _insert_edge_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
 ) -> Result<()> {
     PRUNE_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -167,21 +167,22 @@ fn prune_neighbor_if_needed(
         metadata.dimensions as usize,
     )?;
 
-    // Fetch vectors for all candidate edges and compute distances to center
-    let mut candidates: Vec<(i64, f32, Vec<u8>)> = Vec::with_capacity(neighbor_edges.len());
-    for &edge_rowid in &neighbor_edges {
-        if let Ok(Some(node)) =
-            storage::fetch_node_data(db, table_name, column_name, edge_rowid, get_node_stmt)
-        {
-            let candidate_vec = Vector::from_blob(
-                &node.vector,
-                metadata.element_type,
-                metadata.dimensions as usize,
-            )?;
-            let dist =
-                crate::distance::distance(&center_vec, &candidate_vec, metadata.distance_metric)?;
-            candidates.push((edge_rowid, dist, node.vector));
-        }
+    // BATCH FETCH: Get all candidate nodes in one query
+    let t_batch = Instant::now();
+    let candidate_nodes = storage::fetch_nodes_batch(db, table_name, column_name, &neighbor_edges)?;
+    PRUNE_FETCH_TIME.fetch_add(t_batch.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+    // Build candidates with distances
+    let mut candidates: Vec<(i64, f32, Vec<u8>)> = Vec::with_capacity(candidate_nodes.len());
+    for node in candidate_nodes {
+        let candidate_vec = Vector::from_blob(
+            &node.vector,
+            metadata.element_type,
+            metadata.dimensions as usize,
+        )?;
+        let dist =
+            crate::distance::distance(&center_vec, &candidate_vec, metadata.distance_metric)?;
+        candidates.push((node.rowid, dist, node.vector));
     }
 
     // Sort by distance to center (closest first)
@@ -218,33 +219,23 @@ fn prune_neighbor_if_needed(
 
     PRUNE_EDGES_REINSERTED.fetch_add(selected.len() as u64, Ordering::Relaxed);
 
-    // Delete all edges at this level
+    // DELTA UPDATE: Only delete edges that weren't selected (avoid delete+reinsert for survivors)
     let t = Instant::now();
-    let delete_stmt = stmt_cache.map(|c| c.delete_edges_from);
-    storage::delete_edges_from_level(
-        db,
-        table_name,
-        column_name,
-        neighbor_rowid,
-        level,
-        delete_stmt,
-    )?;
+    use std::collections::HashSet;
+    let selected_set: HashSet<i64> = selected.into_iter().collect();
+    let edges_to_delete: Vec<i64> = neighbor_edges
+        .iter()
+        .filter(|&rowid| !selected_set.contains(rowid))
+        .copied()
+        .collect();
+
+    // Only delete the edges that need to be removed
+    if !edges_to_delete.is_empty() {
+        storage::delete_edges_batch(db, table_name, column_name, neighbor_rowid, level, &edges_to_delete)?;
+    }
     PRUNE_DELETE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-    // Re-insert only the selected diverse neighbors
-    let t = Instant::now();
-    for to_rowid in &selected {
-        storage::insert_edge(
-            db,
-            table_name,
-            column_name,
-            neighbor_rowid,
-            *to_rowid,
-            level,
-            insert_edge_stmt,
-        )?;
-    }
-    PRUNE_REINSERT_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    // No re-insert needed - we kept the survivors in place!
 
     Ok(())
 }
@@ -383,37 +374,22 @@ pub fn insert_hnsw(
         // No need to re-fetch vectors - distances are computed during search
         let selected: Vec<(i64, f32)> = neighbors.into_iter().take(max_connections).collect();
 
-        // Insert bidirectional edges and prune (matches C: single loop)
-        let insert_edge_stmt = stmt_cache.map(|c| c.insert_edge);
-        let get_edges_stmt = stmt_cache.map(|c| c.get_edges);
-        let _delete_edges_stmt = stmt_cache.map(|c| c.delete_edges_from);
-
+        // Batch insert all edges for this level
+        let t = Instant::now();
+        let mut edges_to_insert: Vec<(i64, i64, i32)> = Vec::with_capacity(selected.len() * 2);
         for (neighbor_rowid, _dist) in selected.iter() {
             // Edge: new_node -> neighbor
-            let t = Instant::now();
-            storage::insert_edge(
-                db,
-                table_name,
-                column_name,
-                rowid,
-                *neighbor_rowid,
-                lv,
-                insert_edge_stmt,
-            )?;
-
+            edges_to_insert.push((rowid, *neighbor_rowid, lv));
             // Edge: neighbor -> new_node (bidirectional)
-            storage::insert_edge(
-                db,
-                table_name,
-                column_name,
-                *neighbor_rowid,
-                rowid,
-                lv,
-                insert_edge_stmt,
-            )?;
-            INSERT_EDGE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            edges_to_insert.push((*neighbor_rowid, rowid, lv));
+        }
+        storage::insert_edges_batch(db, table_name, column_name, &edges_to_insert)?;
+        INSERT_EDGE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-            // Prune neighbor immediately after inserting (matches C)
+        // Prune neighbors that may now exceed max_connections
+        let get_edges_stmt = stmt_cache.map(|c| c.get_edges);
+        let insert_edge_stmt = stmt_cache.map(|c| c.insert_edge);
+        for (neighbor_rowid, _dist) in selected.iter() {
             let t = Instant::now();
             prune_neighbor_if_needed(
                 db,

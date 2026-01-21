@@ -322,6 +322,135 @@ pub fn insert_edge(
     Ok(())
 }
 
+/// Insert multiple edges in a single batch operation
+/// Uses multi-row INSERT for efficiency: INSERT INTO edges VALUES (?,?,?),(?,?,?),...
+pub fn insert_edges_batch(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+    edges: &[(i64, i64, i32)], // (from_rowid, to_rowid, level)
+) -> Result<()> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+
+    let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+
+    // Build multi-row INSERT: INSERT OR IGNORE INTO edges (from_rowid, to_rowid, level) VALUES (?,?,?),(?,?,?),...
+    // SQLite supports up to 999 parameters, so batch in chunks of 333 edges (3 params each)
+    const MAX_EDGES_PER_BATCH: usize = 333;
+
+    for chunk in edges.chunks(MAX_EDGES_PER_BATCH) {
+        let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "(?,?,?)").collect();
+        let sql = format!(
+            "INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES {}",
+            edges_table,
+            placeholders.join(",")
+        );
+
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
+        for (from_rowid, to_rowid, level) in chunk {
+            params.push((*from_rowid).into());
+            params.push((*to_rowid).into());
+            params.push((*level as i64).into());
+        }
+
+        db.execute(&sql, rusqlite::params_from_iter(params))
+            .map_err(Error::Sqlite)?;
+    }
+
+    Ok(())
+}
+
+/// Fetch multiple nodes in a single batch operation
+/// Uses SELECT ... WHERE rowid IN (?, ?, ...) for efficiency
+pub fn fetch_nodes_batch(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+    rowids: &[i64],
+) -> Result<Vec<HnswNode>> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
+
+    // SQLite supports up to 999 parameters, batch if needed
+    const MAX_ROWIDS_PER_BATCH: usize = 999;
+    let mut all_nodes = Vec::with_capacity(rowids.len());
+
+    for chunk in rowids.chunks(MAX_ROWIDS_PER_BATCH) {
+        let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "?").collect();
+        let sql = format!(
+            "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+            nodes_table,
+            placeholders.join(",")
+        );
+
+        let params: Vec<rusqlite::types::Value> = chunk.iter().map(|&r| r.into()).collect();
+
+        let mut stmt = db.prepare(&sql).map_err(Error::Sqlite)?;
+        let nodes = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                Ok(HnswNode {
+                    rowid: row.get(0)?,
+                    level: row.get(1)?,
+                    vector: row.get(2)?,
+                })
+            })
+            .map_err(Error::Sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Sqlite)?;
+
+        all_nodes.extend(nodes);
+    }
+
+    Ok(all_nodes)
+}
+
+/// Delete specific edges from a node at a specific level (delta update)
+/// Uses DELETE ... WHERE to_rowid IN (?, ?, ...) for efficiency
+pub fn delete_edges_batch(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+    from_rowid: i64,
+    level: i32,
+    to_rowids: &[i64],
+) -> Result<()> {
+    if to_rowids.is_empty() {
+        return Ok(());
+    }
+
+    let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+
+    // SQLite supports up to 999 parameters, batch if needed
+    // We use 2 params for from_rowid and level, leaving 997 for to_rowids
+    const MAX_ROWIDS_PER_BATCH: usize = 997;
+
+    for chunk in to_rowids.chunks(MAX_ROWIDS_PER_BATCH) {
+        let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "?").collect();
+        let sql = format!(
+            "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ? AND to_rowid IN ({})",
+            edges_table,
+            placeholders.join(",")
+        );
+
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+        params.push(from_rowid.into());
+        params.push((level as i64).into());
+        for &to_rowid in chunk {
+            params.push(to_rowid.into());
+        }
+
+        db.execute(&sql, rusqlite::params_from_iter(params))
+            .map_err(Error::Sqlite)?;
+    }
+
+    Ok(())
+}
+
 /// Delete all outgoing edges from a node at a specific level
 pub fn delete_edges_from_level(
     db: &Connection,
