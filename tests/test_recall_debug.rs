@@ -28,12 +28,20 @@ fn test_simple_hnsw_recall_4d() {
 
     // Check HNSW metadata (single-row schema)
     println!("\n=== HNSW Metadata ===");
-    let (m, ef_construction, ef_search, entry_point_rowid, num_nodes): (i32, i32, i32, i64, i32) = db
-        .query_row(
+    let (m, ef_construction, ef_search, entry_point_rowid, num_nodes): (i32, i32, i32, i64, i32) =
+        db.query_row(
             "SELECT m, ef_construction, ef_search, entry_point_rowid, num_nodes \
              FROM vectors_embedding_hnsw_meta WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     println!("  m: {}", m);

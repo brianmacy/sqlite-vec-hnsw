@@ -5,7 +5,7 @@ use crate::distance::DistanceMetric;
 use crate::error::{Error, Result};
 use crate::hnsw::{self, HnswMetadata};
 use crate::shadow;
-use crate::vector::{Vector, VectorType};
+use crate::vector::{IndexQuantization, Vector, VectorType};
 use rusqlite::vtab::{
     Context, CreateVTab, Filters, IndexInfo, Inserts, UpdateVTab, Updates, VTab, VTabConnection,
     VTabCursor, sqlite3_vtab, sqlite3_vtab_cursor,
@@ -17,15 +17,23 @@ use std::os::raw::c_int;
 /// Register the vec0 virtual table module
 pub fn register_vec0_module(db: &Connection) -> Result<()> {
     // Use update_module_with_tx to support CREATE/INSERT/UPDATE/DELETE + transactions
-    db.create_module("vec0", rusqlite::vtab::update_module_with_tx::<Vec0Tab>(), None)
-        .map_err(Error::Sqlite)?;
+    db.create_module(
+        "vec0",
+        rusqlite::vtab::update_module_with_tx::<Vec0Tab>(),
+        None,
+    )
+    .map_err(Error::Sqlite)?;
 
     // If compiled with loadable_extension_alias feature and SQLITE_VEC_MODULE_ALIAS is set,
     // also register the module under that alias name
     #[cfg(feature = "loadable_extension_alias")]
     if let Some(alias) = option_env!("SQLITE_VEC_MODULE_ALIAS") {
-        db.create_module(alias, rusqlite::vtab::update_module_with_tx::<Vec0Tab>(), None)
-            .map_err(Error::Sqlite)?;
+        db.create_module(
+            alias,
+            rusqlite::vtab::update_module_with_tx::<Vec0Tab>(),
+            None,
+        )
+        .map_err(Error::Sqlite)?;
     }
 
     Ok(())
@@ -45,6 +53,9 @@ enum ColumnType {
         vec_type: VectorType,
         #[allow(dead_code)]
         dimensions: usize,
+        /// Quantization for HNSW index storage
+        #[allow(dead_code)]
+        index_quantization: IndexQuantization,
     },
     #[allow(dead_code)]
     PartitionKey,
@@ -352,7 +363,7 @@ impl Vec0Tab {
                 }
             }
 
-            // Parse column definition: "column_name type[dimensions]"
+            // Parse column definition: "column_name type[dimensions] [index_quantization=int8]"
             let parts: Vec<&str> = arg.split_whitespace().collect();
             if parts.is_empty() {
                 continue;
@@ -373,11 +384,22 @@ impl Vec0Tab {
                         Error::InvalidParameter(format!("Invalid dimensions: {}", dims_str))
                     })?;
 
+                    // Parse optional index_quantization option (e.g., "index_quantization=int8")
+                    let mut index_quantization = IndexQuantization::None;
+                    for part in parts.iter().skip(2) {
+                        if let Some((key, value)) = part.split_once('=')
+                            && key.eq_ignore_ascii_case("index_quantization")
+                        {
+                            index_quantization = IndexQuantization::from_str(value)?;
+                        }
+                    }
+
                     columns.push(ColumnDef {
                         name,
                         col_type: ColumnType::Vector {
                             vec_type,
                             dimensions,
+                            index_quantization,
                         },
                     });
                 } else if type_spec.to_uppercase().contains("PARTITION") {
@@ -615,11 +637,20 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             if vtab.index_type == IndexType::Hnsw {
                 let mut vec_col_idx = 0;
                 for col in vtab.columns.iter() {
-                    if let ColumnType::Vector { .. } = col.col_type {
-                        shadow::create_hnsw_shadow_tables_ffi(
+                    if let ColumnType::Vector {
+                        vec_type,
+                        dimensions,
+                        index_quantization,
+                    } = &col.col_type
+                    {
+                        shadow::create_hnsw_shadow_tables_with_metadata_ffi(
                             db_handle,
                             &vtab.table_name,
                             &col.name,
+                            *dimensions as i32,
+                            *vec_type,
+                            DistanceMetric::L2, // TODO: Make configurable
+                            *index_quantization,
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
@@ -878,6 +909,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             if let ColumnType::Vector {
                 vec_type,
                 dimensions,
+                index_quantization,
             } = &col.col_type
             {
                 let value_idx = col_idx + 2; // Skip NULL and rowid args
@@ -910,13 +942,22 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 };
 
                 if vector_data.len() != expected_bytes {
+                    // Provide user-friendly dimension-based error messages
+                    let error_msg = if vector_data.is_empty() {
+                        "zero-length vectors are not supported".to_string()
+                    } else {
+                        let actual_dims = match vec_type {
+                            VectorType::Float32 => vector_data.len() / 4,
+                            VectorType::Int8 => vector_data.len(),
+                            VectorType::Bit => vector_data.len() * 8,
+                        };
+                        format!(
+                            "Dimension mismatch for vector column: expected {} dimensions, got {}",
+                            dimensions, actual_dims
+                        )
+                    };
                     return Err(rusqlite::Error::UserFunctionError(Box::new(
-                        Error::InvalidParameter(format!(
-                            "Vector byte size mismatch: expected {} bytes for {} dimensions, got {} bytes",
-                            expected_bytes,
-                            dimensions,
-                            vector_data.len()
-                        )),
+                        Error::InvalidParameter(error_msg),
                     )));
                 }
 
@@ -929,7 +970,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                         &self.table_name,
                         self.chunk_size,
                         rowid,
-                        col_idx,
+                        vec_col_idx, // Use vector-specific column index, not overall col_idx
                         &vector_data,
                     )
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
@@ -948,11 +989,12 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
                                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                                 .unwrap_or_else(|| {
-                                    // Initialize new HNSW index
-                                    HnswMetadata::new(
+                                    // Initialize new HNSW index with column's index_quantization setting
+                                    HnswMetadata::with_index_quantization(
                                         *dimensions as i32,
                                         *vec_type,
                                         DistanceMetric::L2, // TODO: Make configurable
+                                        *index_quantization,
                                     )
                                 });
 
@@ -1076,6 +1118,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             if let ColumnType::Vector {
                 vec_type,
                 dimensions,
+                index_quantization,
             } = &col.col_type
             {
                 let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
@@ -1115,12 +1158,22 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 };
 
                 if vector_data.len() != expected_bytes {
+                    // Provide user-friendly dimension-based error messages
+                    let error_msg = if vector_data.is_empty() {
+                        "zero-length vectors are not supported".to_string()
+                    } else {
+                        let actual_dims = match vec_type {
+                            VectorType::Float32 => vector_data.len() / 4,
+                            VectorType::Int8 => vector_data.len(),
+                            VectorType::Bit => vector_data.len() * 8,
+                        };
+                        format!(
+                            "Dimension mismatch for vector column: expected {} dimensions, got {}",
+                            dimensions, actual_dims
+                        )
+                    };
                     return Err(rusqlite::Error::UserFunctionError(Box::new(
-                        Error::InvalidParameter(format!(
-                            "Vector byte size mismatch: expected {} bytes, got {}",
-                            expected_bytes,
-                            vector_data.len()
-                        )),
+                        Error::InvalidParameter(error_msg),
                     )));
                 }
 
@@ -1144,7 +1197,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                         &conn,
                         &self.schema_name,
                         &self.table_name,
-                        col_idx,
+                        vec_col_idx, // Use vector-specific column index, not overall col_idx
                         chunk_id,
                         chunk_offset,
                         &vector_data,
@@ -1191,10 +1244,11 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
                                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                                 .unwrap_or_else(|| {
-                                    HnswMetadata::new(
+                                    HnswMetadata::with_index_quantization(
                                         *dimensions as i32,
                                         *vec_type,
                                         DistanceMetric::L2,
+                                        *index_quantization,
                                     )
                                 });
 
@@ -1374,10 +1428,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
         match plan {
             QueryPlan::Knn => {
                 // KNN query - extract query vector and k from args
-                let query_vector: Vec<u8> = args.get(0)?;
-                let k: i64 = args.get(1)?;
-
-                // Find the vector column (first vector column for now)
+                // Find the vector column first (needed to determine vec_type for JSON parsing)
                 let (col_idx, col) = vtab
                     .columns
                     .iter()
@@ -1388,6 +1439,41 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                             "No vector column found for KNN query".to_string(),
                         )))
                     })?;
+
+                // Get the vector type from the column
+                let vec_type = match &col.col_type {
+                    ColumnType::Vector { vec_type, .. } => *vec_type,
+                    _ => unreachable!(), // We already filtered for Vector columns
+                };
+
+                // Get query vector - try blob first, then JSON text string
+                let query_vector: Vec<u8> = match args.get::<Option<Vec<u8>>>(0) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            Error::InvalidParameter("Query vector cannot be NULL".to_string()),
+                        )));
+                    }
+                    Err(_) => {
+                        // Not a blob, try as JSON text string
+                        match args.get::<Option<String>>(0)? {
+                            Some(json_str) => {
+                                let vector = Vector::from_json(&json_str, vec_type)
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                                vector.as_bytes().to_vec()
+                            }
+                            None => {
+                                return Err(rusqlite::Error::UserFunctionError(Box::new(
+                                    Error::InvalidParameter(
+                                        "Query vector cannot be NULL".to_string(),
+                                    ),
+                                )));
+                            }
+                        }
+                    }
+                };
+
+                let k: i64 = args.get(1)?;
 
                 // Execute HNSW search
                 // SAFETY: vtab.db is valid for the lifetime of the virtual table

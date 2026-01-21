@@ -46,6 +46,42 @@ impl VectorType {
     }
 }
 
+/// Index quantization type for HNSW index storage
+///
+/// Controls how vectors are stored in the HNSW index.
+/// The main storage (chunk tables) always stores the original precision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IndexQuantization {
+    /// No quantization - store vectors at original precision
+    #[default]
+    None,
+    /// Quantize float32 vectors to int8 for HNSW index storage (4x space savings)
+    Int8,
+}
+
+impl IndexQuantization {
+    /// Parse from string
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(IndexQuantization::None),
+            "int8" => Ok(IndexQuantization::Int8),
+            _ => Err(Error::InvalidParameter(format!(
+                "Invalid index_quantization value: '{}'. Use 'none' or 'int8'",
+                s
+            ))),
+        }
+    }
+
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IndexQuantization::None => "none",
+            IndexQuantization::Int8 => "int8",
+        }
+    }
+}
+
 /// Vector data container
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vector {
@@ -345,6 +381,8 @@ impl Vector {
 
     /// Quantize float32 vector to int8 (asymmetric quantization)
     /// Maps the range [min, max] to [-128, 127]
+    /// NOTE: This is per-vector quantization - not suitable for HNSW index
+    /// where distances between vectors must be comparable.
     pub fn quantize_int8(&self) -> Result<Vector> {
         if self.vec_type != VectorType::Float32 {
             return Err(Error::InvalidVectorType(
@@ -372,6 +410,36 @@ impl Vector {
                 let normalized = (v - min_val) / range; // [0, 1]
                 let scaled = normalized * 255.0 - 128.0; // [-128, 127]
                 scaled.round().clamp(-128.0, 127.0) as i8
+            })
+            .collect();
+
+        Ok(Vector::from_i8(&quantized))
+    }
+
+    /// Quantize float32 vector to int8 using fixed scale for HNSW index storage
+    /// Maps the range [-1.0, 1.0] to [-127, 127] (symmetric quantization)
+    /// This is suitable for HNSW index where all vectors must use the same scale
+    /// for distances to be comparable.
+    ///
+    /// Most embedding models output normalized vectors with values in [-1, 1].
+    /// Values outside this range are clamped.
+    pub fn quantize_int8_for_index(&self) -> Result<Vector> {
+        if self.vec_type != VectorType::Float32 {
+            return Err(Error::InvalidVectorType(
+                "Can only quantize Float32 vectors".to_string(),
+            ));
+        }
+
+        let vals = self.as_f32()?;
+
+        // Use symmetric quantization with fixed scale
+        // Maps [-1.0, 1.0] to [-127, 127]
+        let quantized: Vec<i8> = vals
+            .iter()
+            .map(|&v| {
+                // Clamp to [-1, 1] range and scale to int8
+                let clamped = v.clamp(-1.0, 1.0);
+                (clamped * 127.0).round() as i8
             })
             .collect();
 
@@ -627,5 +695,37 @@ mod tests {
             }
             _ => panic!("Expected NotImplemented error"),
         }
+    }
+
+    #[test]
+    fn test_index_quantization_from_str() {
+        assert_eq!(
+            IndexQuantization::from_str("none").unwrap(),
+            IndexQuantization::None
+        );
+        assert_eq!(
+            IndexQuantization::from_str("int8").unwrap(),
+            IndexQuantization::Int8
+        );
+        assert_eq!(
+            IndexQuantization::from_str("INT8").unwrap(),
+            IndexQuantization::Int8
+        );
+        assert_eq!(
+            IndexQuantization::from_str("None").unwrap(),
+            IndexQuantization::None
+        );
+        assert!(IndexQuantization::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_index_quantization_as_str() {
+        assert_eq!(IndexQuantization::None.as_str(), "none");
+        assert_eq!(IndexQuantization::Int8.as_str(), "int8");
+    }
+
+    #[test]
+    fn test_index_quantization_default() {
+        assert_eq!(IndexQuantization::default(), IndexQuantization::None);
     }
 }

@@ -5,7 +5,7 @@
 
 use crate::error::Result;
 use crate::hnsw::{HnswMetadata, search, storage};
-use crate::vector::Vector;
+use crate::vector::{IndexQuantization, Vector, VectorType};
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -154,6 +154,12 @@ fn prune_neighbor_if_needed(
     PRUNE_ACTUAL_PRUNES.fetch_add(1, Ordering::Relaxed);
     PRUNE_EDGES_DELETED.fetch_add(neighbor_edges.len() as u64, Ordering::Relaxed);
 
+    // Determine the element type for stored vectors (may be quantized)
+    let stored_element_type = match metadata.index_quantization {
+        IndexQuantization::Int8 if metadata.element_type == VectorType::Float32 => VectorType::Int8,
+        _ => metadata.element_type,
+    };
+
     // Fetch the center vector (the neighbor being pruned)
     let get_node_stmt = stmt_cache.map(|c| c.get_node_data);
     let center_node =
@@ -163,7 +169,7 @@ fn prune_neighbor_if_needed(
             })?;
     let center_vec = Vector::from_blob(
         &center_node.vector,
-        metadata.element_type,
+        stored_element_type,
         metadata.dimensions as usize,
     )?;
 
@@ -177,7 +183,7 @@ fn prune_neighbor_if_needed(
     for node in candidate_nodes {
         let candidate_vec = Vector::from_blob(
             &node.vector,
-            metadata.element_type,
+            stored_element_type,
             metadata.dimensions as usize,
         )?;
         let dist =
@@ -198,7 +204,7 @@ fn prune_neighbor_if_needed(
         }
 
         let candidate_vec =
-            Vector::from_blob(&blob, metadata.element_type, metadata.dimensions as usize)?;
+            Vector::from_blob(&blob, stored_element_type, metadata.dimensions as usize)?;
 
         // RNG heuristic: reject if candidate is closer to any already-selected than to center
         let mut good = true;
@@ -296,7 +302,19 @@ pub fn insert_hnsw(
     // Generate level for new node
     let level = generate_level(metadata);
 
-    // Insert node into shadow table
+    // Quantize vector for HNSW index storage if configured
+    let index_vector: std::borrow::Cow<'_, [u8]> = match metadata.index_quantization {
+        IndexQuantization::Int8 if metadata.element_type == VectorType::Float32 => {
+            // Parse float32 vector and quantize to int8
+            let float_vec =
+                Vector::from_blob(vector, VectorType::Float32, metadata.dimensions as usize)?;
+            let quantized = float_vec.quantize_int8_for_index()?;
+            std::borrow::Cow::Owned(quantized.as_bytes().to_vec())
+        }
+        _ => std::borrow::Cow::Borrowed(vector),
+    };
+
+    // Insert node into shadow table (possibly quantized)
     let insert_node_stmt = stmt_cache.map(|c| c.insert_node);
     storage::insert_node(
         db,
@@ -304,7 +322,7 @@ pub fn insert_hnsw(
         column_name,
         rowid,
         level,
-        vector,
+        &index_vector,
         insert_node_stmt,
     )?;
 
@@ -326,8 +344,20 @@ pub fn insert_hnsw(
         return Ok(());
     }
 
-    // Parse the vector for distance calculations
-    let new_vec = Vector::from_blob(vector, metadata.element_type, metadata.dimensions as usize)?;
+    // Parse and optionally quantize vector for distance calculations during HNSW search
+    // The search vector must match the stored node vector type (may be quantized)
+    let new_vec = match metadata.index_quantization {
+        IndexQuantization::Int8 if metadata.element_type == VectorType::Float32 => {
+            // Parse as float32, then quantize to int8 to match stored vectors
+            let float_vec =
+                Vector::from_blob(vector, VectorType::Float32, metadata.dimensions as usize)?;
+            float_vec.quantize_int8_for_index()?
+        }
+        _ => {
+            // No quantization - use as-is
+            Vector::from_blob(vector, metadata.element_type, metadata.dimensions as usize)?
+        }
+    };
 
     // Find insertion points by searching from entry point down
     let mut current_nearest = metadata.entry_point_rowid;

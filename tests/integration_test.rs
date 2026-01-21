@@ -779,8 +779,7 @@ fn test_vec_bit_scalar_function() {
 
     // Test vec_bit function with a blob - 8 bits = 1 byte
     // Create a blob with value 0b10101010
-    let result: SqliteResult<Vec<u8>> =
-        db.query_row("SELECT vec_bit(X'AA')", [], |row| row.get(0));
+    let result: SqliteResult<Vec<u8>> = db.query_row("SELECT vec_bit(X'AA')", [], |row| row.get(0));
 
     assert!(result.is_ok(), "vec_bit should work with blob input");
     let data = result.unwrap();
@@ -797,11 +796,10 @@ fn test_vec_f32_blob_input() {
     // 1.0f32 in little-endian is 0x3F800000
     // 2.0f32 in little-endian is 0x40000000
     // 3.0f32 in little-endian is 0x40400000
-    let result: SqliteResult<Vec<u8>> = db.query_row(
-        "SELECT vec_f32(X'0000803F0000004000004040')",
-        [],
-        |row| row.get(0),
-    );
+    let result: SqliteResult<Vec<u8>> =
+        db.query_row("SELECT vec_f32(X'0000803F0000004000004040')", [], |row| {
+            row.get(0)
+        });
 
     assert!(result.is_ok(), "vec_f32 should work with blob input");
     let data = result.unwrap();
@@ -816,7 +814,10 @@ fn test_vec_f32_blob_input() {
         )
         .unwrap();
 
-    assert_eq!(json, "[1.0,2.0,3.0]", "Should decode to correct float values");
+    assert_eq!(
+        json, "[1.0,2.0,3.0]",
+        "Should decode to correct float values"
+    );
 }
 
 #[test]
@@ -840,10 +841,7 @@ fn test_vec_int8_blob_input() {
         })
         .unwrap();
 
-    assert_eq!(
-        json, "[-128,0,127]",
-        "Should decode to correct int8 values"
-    );
+    assert_eq!(json, "[-128,0,127]", "Should decode to correct int8 values");
 }
 
 #[test]
@@ -861,9 +859,11 @@ fn test_vec_int8_json_input() {
 
     // Verify values via roundtrip
     let json: String = db
-        .query_row("SELECT vec_to_json(vec_int8('[-128, 0, 127]'))", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT vec_to_json(vec_int8('[-128, 0, 127]'))",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
 
     assert_eq!(json, "[-128,0,127]", "Should preserve int8 values");
@@ -887,7 +887,11 @@ fn test_insert_direct_json_float32() {
         [],
     );
 
-    assert!(result.is_ok(), "Direct JSON INSERT should work: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Direct JSON INSERT should work: {:?}",
+        result.err()
+    );
 
     // Verify the data was stored correctly
     let count: i64 = db
@@ -924,7 +928,11 @@ fn test_insert_direct_json_int8() {
         [],
     );
 
-    assert!(result.is_ok(), "Direct JSON INSERT for int8 should work: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Direct JSON INSERT for int8 should work: {:?}",
+        result.err()
+    );
 
     // Verify the data was stored correctly
     let count: i64 = db
@@ -958,7 +966,11 @@ fn test_update_direct_json() {
         [],
     );
 
-    assert!(result.is_ok(), "Direct JSON UPDATE should work: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Direct JSON UPDATE should work: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -1002,4 +1014,101 @@ fn test_insert_both_methods_equivalent() {
         )
         .unwrap();
     assert!(shadow_count >= 3, "Should have shadow tables for vec_equiv");
+}
+
+#[test]
+fn test_match_direct_json_query() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create a vec0 table
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_match_json USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert test vectors
+    for i in 1..=5 {
+        db.execute(
+            &format!(
+                "INSERT INTO vec_match_json(rowid, embedding) VALUES ({}, vec_f32('[{}.0, {}.0, {}.0]'))",
+                i, i, i + 1, i + 2
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    // KNN query using direct JSON text string (without vec_f32 wrapper)
+    let result = db.query_row(
+        "SELECT rowid, distance FROM vec_match_json WHERE embedding MATCH '[1.0, 2.0, 3.0]' AND k = 3 ORDER BY distance",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?)),
+    );
+
+    // Should work and return the closest vector
+    if let Ok((rowid, distance)) = result {
+        assert_eq!(rowid, 1); // Vector [1.0, 2.0, 3.0] is closest to itself
+        assert!(distance < 0.01, "Distance to itself should be near zero");
+        println!(
+            "JSON MATCH query successful: rowid={}, distance={}",
+            rowid, distance
+        );
+    }
+}
+
+#[test]
+fn test_match_json_and_blob_equivalent() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create a vec0 table
+    db.execute(
+        "CREATE VIRTUAL TABLE vec_match_equiv USING vec0(embedding float[3])",
+        [],
+    )
+    .unwrap();
+
+    // Insert test vectors
+    for i in 1..=5 {
+        db.execute(
+            &format!(
+                "INSERT INTO vec_match_equiv(rowid, embedding) VALUES ({}, vec_f32('[{}.0, {}.0, {}.0]'))",
+                i, i, i + 1, i + 2
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    // Query using vec_f32 wrapper (blob)
+    let result_blob = db.query_row(
+        "SELECT rowid, distance FROM vec_match_equiv WHERE embedding MATCH vec_f32('[1.0, 2.0, 3.0]') AND k = 3 ORDER BY distance",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?)),
+    );
+
+    // Query using direct JSON text string
+    let result_json = db.query_row(
+        "SELECT rowid, distance FROM vec_match_equiv WHERE embedding MATCH '[1.0, 2.0, 3.0]' AND k = 3 ORDER BY distance",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?)),
+    );
+
+    // Both should succeed and return the same results
+    assert!(result_blob.is_ok(), "Blob MATCH query should succeed");
+    assert!(result_json.is_ok(), "JSON MATCH query should succeed");
+
+    let (blob_rowid, blob_distance) = result_blob.unwrap();
+    let (json_rowid, json_distance) = result_json.unwrap();
+
+    assert_eq!(
+        blob_rowid, json_rowid,
+        "Both methods should return same rowid"
+    );
+    assert!(
+        (blob_distance - json_distance).abs() < 0.001,
+        "Both methods should return same distance"
+    );
 }

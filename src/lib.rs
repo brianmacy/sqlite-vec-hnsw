@@ -16,6 +16,7 @@ pub use error::{Error, Result};
 pub use vector::{Vector, VectorType};
 
 use rusqlite::Connection;
+#[cfg(feature = "loadable_extension")]
 use rusqlite::ffi;
 
 /// Initialize the sqlite-vec-hnsw extension
@@ -111,6 +112,7 @@ pub fn init_with_pragmas(db: &Connection) -> Result<()> {
 ///
 /// This function is called by SQLite's extension loading mechanism.
 /// It must follow SQLite's extension initialization conventions.
+#[cfg(feature = "loadable_extension")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
     db: *mut ffi::sqlite3,

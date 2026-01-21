@@ -14,8 +14,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Using forked rusqlite with custom operator support, DB handle access, and integrity check
 # Once PR is merged upstream, switch back to crates.io version
-# Note: loadable_extension is required for building as a SQLite loadable extension
-rusqlite = { git = "https://github.com/brianmacy/rusqlite", branch = "custom-vtab-features", features = ["bundled", "vtab", "blob", "functions", "loadable_extension"] }
+# Base rusqlite without loadable_extension - tests use this
+rusqlite = { git = "https://github.com/brianmacy/rusqlite", branch = "custom-vtab-features", features = ["bundled", "vtab", "blob", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
@@ -24,10 +24,14 @@ bytemuck = { version = "1.14", features = ["derive"] }
 
 [features]
 default = []
+# Enable loadable_extension for building as a SQLite shared library
+# This is automatically enabled in profile.release (see below)
+# For tests/dev, use rusqlite without loadable_extension
+loadable_extension = ["rusqlite/loadable_extension"]
 # Enable to register additional module/entry point aliases via environment variables:
 # - SQLITE_VEC_MODULE_ALIAS: Register module under this additional name
 # - SQLITE_VEC_ENTRY_POINT_ALIAS: Export entry point with this additional name
-loadable_extension_alias = []
+loadable_extension_alias = ["loadable_extension"]
 
 [dev-dependencies]
 tempfile = "3.8"

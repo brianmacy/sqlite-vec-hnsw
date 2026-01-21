@@ -8,7 +8,7 @@ pub mod storage;
 
 use crate::distance::DistanceMetric;
 use crate::error::{Error, Result};
-use crate::vector::VectorType;
+use crate::vector::{IndexQuantization, VectorType};
 use rusqlite::{Connection, OptionalExtension, Statement};
 
 /// HNSW index parameters
@@ -105,6 +105,9 @@ pub struct HnswMetadata {
     pub element_type: VectorType,
     pub distance_metric: DistanceMetric,
 
+    /// Index storage quantization (e.g., int8 for HNSW nodes)
+    pub index_quantization: IndexQuantization,
+
     /// RNG seed for level generation
     pub rng_seed: u32,
 
@@ -115,6 +118,21 @@ pub struct HnswMetadata {
 impl HnswMetadata {
     /// Create new metadata with default parameters
     pub fn new(dimensions: i32, element_type: VectorType, distance_metric: DistanceMetric) -> Self {
+        Self::with_index_quantization(
+            dimensions,
+            element_type,
+            distance_metric,
+            IndexQuantization::None,
+        )
+    }
+
+    /// Create new metadata with specific index quantization
+    pub fn with_index_quantization(
+        dimensions: i32,
+        element_type: VectorType,
+        distance_metric: DistanceMetric,
+        index_quantization: IndexQuantization,
+    ) -> Self {
         use std::collections::hash_map::RandomState;
         use std::hash::BuildHasher;
 
@@ -130,6 +148,7 @@ impl HnswMetadata {
             dimensions,
             element_type,
             distance_metric,
+            index_quantization,
             rng_seed,
             hnsw_version: 1,
         }
@@ -143,11 +162,12 @@ impl HnswMetadata {
     ) -> Result<Option<Self>> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-        // Single SELECT for all metadata
+        // Single SELECT for all metadata (index_quantization is optional for backwards compat)
         let query = format!(
             "SELECT m, max_m0, ef_construction, ef_search, max_level, level_factor, \
              entry_point_rowid, entry_point_level, num_nodes, dimensions, \
-             element_type, distance_metric, rng_seed, hnsw_version \
+             element_type, distance_metric, rng_seed, hnsw_version, \
+             COALESCE(index_quantization, 'none') as index_quantization \
              FROM \"{}\" WHERE id = 1",
             meta_table
         );
@@ -181,6 +201,10 @@ impl HnswMetadata {
                     },
                     rng_seed: row.get::<_, i64>(12)? as u32,
                     hnsw_version: row.get(13)?,
+                    index_quantization: match row.get::<_, String>(14)?.as_str() {
+                        "int8" => IndexQuantization::Int8,
+                        _ => IndexQuantization::None,
+                    },
                 })
             })
             .optional();
@@ -206,8 +230,8 @@ impl HnswMetadata {
             "INSERT OR REPLACE INTO \"{}\" \
              (id, m, max_m0, ef_construction, ef_search, max_level, level_factor, \
               entry_point_rowid, entry_point_level, num_nodes, dimensions, \
-              element_type, distance_metric, rng_seed, hnsw_version) \
-             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              element_type, distance_metric, rng_seed, hnsw_version, index_quantization) \
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             meta_table
         );
 
@@ -228,6 +252,7 @@ impl HnswMetadata {
                 self.distance_metric.as_str(),
                 self.rng_seed as i64,
                 self.hnsw_version,
+                self.index_quantization.as_str(),
             ],
         )?;
 

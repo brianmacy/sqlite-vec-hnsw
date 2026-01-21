@@ -290,7 +290,8 @@ pub fn create_hnsw_shadow_tables(
          element_type TEXT NOT NULL DEFAULT 'float32', \
          distance_metric TEXT NOT NULL DEFAULT 'l2', \
          rng_seed INTEGER NOT NULL DEFAULT 12345, \
-         hnsw_version INTEGER NOT NULL DEFAULT 1\
+         hnsw_version INTEGER NOT NULL DEFAULT 1, \
+         index_quantization TEXT NOT NULL DEFAULT 'none'\
          )",
         table_name, column_name
     );
@@ -544,6 +545,42 @@ pub unsafe fn create_hnsw_shadow_tables_ffi(
     table_name: &str,
     column_name: &str,
 ) -> Result<()> {
+    // Delegate to the new function with default metadata values
+    unsafe {
+        create_hnsw_shadow_tables_with_metadata_ffi(
+            db,
+            table_name,
+            column_name,
+            0, // dimensions (0 = unknown, will be set on first insert)
+            crate::vector::VectorType::Float32,
+            crate::distance::DistanceMetric::L2,
+            crate::vector::IndexQuantization::None,
+        )
+    }
+}
+
+/// Create HNSW shadow tables with specific metadata using raw FFI
+///
+/// # Arguments
+/// * `db` - Database handle
+/// * `table_name` - Name of the virtual table
+/// * `column_name` - Name of the vector column
+/// * `dimensions` - Vector dimensions
+/// * `element_type` - Vector element type (float32, int8, bit)
+/// * `distance_metric` - Distance metric (l2, cosine, l1)
+/// * `index_quantization` - Index quantization mode (none, int8)
+///
+/// # Safety
+/// This function must be called with a valid sqlite3 database handle
+pub unsafe fn create_hnsw_shadow_tables_with_metadata_ffi(
+    db: *mut ffi::sqlite3,
+    table_name: &str,
+    column_name: &str,
+    dimensions: i32,
+    element_type: crate::vector::VectorType,
+    distance_metric: crate::distance::DistanceMetric,
+    index_quantization: crate::vector::IndexQuantization,
+) -> Result<()> {
     // Create metadata table (single row schema - much simpler than key-value)
     let meta_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_meta\" (\
@@ -561,17 +598,32 @@ pub unsafe fn create_hnsw_shadow_tables_ffi(
          element_type TEXT NOT NULL DEFAULT 'float32', \
          distance_metric TEXT NOT NULL DEFAULT 'l2', \
          rng_seed INTEGER NOT NULL DEFAULT 12345, \
-         hnsw_version INTEGER NOT NULL DEFAULT 1\
+         hnsw_version INTEGER NOT NULL DEFAULT 1, \
+         index_quantization TEXT NOT NULL DEFAULT 'none'\
          )",
         table_name, column_name
     );
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &meta_sql)? };
 
-    // Insert default metadata row (uses all defaults)
+    // Generate random seed for HNSW level generation
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let random_state = RandomState::new();
+    let rng_seed = random_state.hash_one(std::time::SystemTime::now()) as i64;
+
+    // Insert metadata row with actual column values
     let insert_meta_sql = format!(
-        "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" (id) VALUES (1)",
-        table_name, column_name
+        "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" \
+         (id, dimensions, element_type, distance_metric, index_quantization, rng_seed) \
+         VALUES (1, {}, '{}', '{}', '{}', {})",
+        table_name,
+        column_name,
+        dimensions,
+        element_type.as_str(),
+        distance_metric.as_str(),
+        index_quantization.as_str(),
+        rng_seed
     );
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &insert_meta_sql)? };

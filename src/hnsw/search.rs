@@ -7,7 +7,7 @@ use crate::distance;
 use crate::error::{Error, Result};
 use crate::hnsw::HnswMetadata;
 use crate::hnsw::storage;
-use crate::vector::Vector;
+use crate::vector::{IndexQuantization, Vector, VectorType};
 use rusqlite::{Connection, ffi};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,12 +217,26 @@ pub fn search_hnsw(
 
     let ef = ef_search.unwrap_or(metadata.params.ef_search).max(k as i32);
 
-    // Parse query vector
-    let query_vec = Vector::from_blob(
-        query_vector,
-        metadata.element_type,
-        metadata.dimensions as usize,
-    )?;
+    // Parse and optionally quantize query vector to match index storage
+    let query_vec = match metadata.index_quantization {
+        IndexQuantization::Int8 if metadata.element_type == VectorType::Float32 => {
+            // Parse as float32, then quantize to match index storage
+            let float_vec = Vector::from_blob(
+                query_vector,
+                VectorType::Float32,
+                metadata.dimensions as usize,
+            )?;
+            float_vec.quantize_int8_for_index()?
+        }
+        _ => {
+            // No quantization - use as-is
+            Vector::from_blob(
+                query_vector,
+                metadata.element_type,
+                metadata.dimensions as usize,
+            )?
+        }
+    };
 
     // Create search context
     let ctx = SearchContext {
@@ -280,9 +294,17 @@ pub fn search_layer(
         Error::InvalidParameter(format!("Entry point node {} not found", entry_rowid))
     })?;
 
+    // Determine the element type for stored vectors (may be quantized)
+    let stored_element_type = match ctx.metadata.index_quantization {
+        IndexQuantization::Int8 if ctx.metadata.element_type == VectorType::Float32 => {
+            VectorType::Int8
+        }
+        _ => ctx.metadata.element_type,
+    };
+
     let entry_vec = Vector::from_blob(
         &entry_node.vector,
-        ctx.metadata.element_type,
+        stored_element_type,
         ctx.metadata.dimensions as usize,
     )?;
 
@@ -302,7 +324,6 @@ pub fn search_layer(
 
     // Main search loop
     while let Some(candidate) = candidates.pop() {
-
         // If closest unexplored candidate is farther than our worst result, we're done
         if let Some(worst) = results.peek()
             && candidate.distance > worst.distance
@@ -353,27 +374,34 @@ pub fn search_layer(
 
         // BATCH FETCH: Get ONLY unvisited neighbor nodes
         // Use cached statement (16 placeholders) for fast path, fallback to dynamic SQL
-        let neighbor_nodes =
-            if let Some(stmt) = ctx.stmt_cache.and_then(|c| c.batch_fetch_nodes).filter(|s| !s.is_null())
-            {
-                // Fast path: use cached prepared statement with 16 placeholders
-                let mut all_nodes = Vec::with_capacity(unvisited_neighbors.len());
-                for chunk in unvisited_neighbors.chunks(16) {
-                    unsafe {
-                        let nodes = storage::fetch_nodes_batch_cached(stmt, 16, chunk)?;
-                        all_nodes.extend(nodes);
-                    }
+        let neighbor_nodes = if let Some(stmt) = ctx
+            .stmt_cache
+            .and_then(|c| c.batch_fetch_nodes)
+            .filter(|s| !s.is_null())
+        {
+            // Fast path: use cached prepared statement with 16 placeholders
+            let mut all_nodes = Vec::with_capacity(unvisited_neighbors.len());
+            for chunk in unvisited_neighbors.chunks(16) {
+                unsafe {
+                    let nodes = storage::fetch_nodes_batch_cached(stmt, 16, chunk)?;
+                    all_nodes.extend(nodes);
                 }
-                all_nodes
-            } else {
-                // Slow path: dynamic SQL (fallback for tests without cache)
-                storage::fetch_nodes_batch(ctx.db, ctx.table_name, ctx.column_name, &unvisited_neighbors)?
-            };
+            }
+            all_nodes
+        } else {
+            // Slow path: dynamic SQL (fallback for tests without cache)
+            storage::fetch_nodes_batch(
+                ctx.db,
+                ctx.table_name,
+                ctx.column_name,
+                &unvisited_neighbors,
+            )?
+        };
 
         for neighbor_node in neighbor_nodes {
             let neighbor_vec = Vector::from_blob(
                 &neighbor_node.vector,
-                ctx.metadata.element_type,
+                stored_element_type,
                 ctx.metadata.dimensions as usize,
             )?;
 
