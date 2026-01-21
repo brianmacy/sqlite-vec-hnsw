@@ -1112,3 +1112,61 @@ fn test_match_json_and_blob_equivalent() {
         "Both methods should return same distance"
     );
 }
+
+#[test]
+fn test_shadow_tables_dropped_with_virtual_table() {
+    let db = create_test_db().expect("Failed to create database");
+    init_extension(&db).expect("Failed to init extension");
+
+    // Create virtual table with vectors
+    db.execute(
+        "CREATE VIRTUAL TABLE test_drop USING vec0(embedding float[4])",
+        [],
+    )
+    .expect("CREATE should succeed");
+
+    db.execute(
+        "INSERT INTO test_drop(rowid, embedding) VALUES (1, vec_f32('[1,2,3,4]'))",
+        [],
+    )
+    .expect("INSERT should succeed");
+
+    // Count tables before drop (should have shadow tables)
+    let tables_before: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    println!("Tables BEFORE drop: {:?}", tables_before);
+    assert!(
+        tables_before.len() > 1,
+        "Should have shadow tables after CREATE"
+    );
+
+    // Drop the virtual table
+    db.execute("DROP TABLE test_drop", [])
+        .expect("DROP should succeed");
+
+    // Count tables after drop (should only have sqlite internal tables)
+    let tables_after: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    println!("Tables AFTER drop: {:?}", tables_after);
+    assert!(
+        tables_after.is_empty(),
+        "Shadow tables should be dropped. Leaked tables: {:?}",
+        tables_after
+    );
+}

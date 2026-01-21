@@ -691,7 +691,46 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             }
         }
 
-        // Shadow tables are dropped automatically by SQLite when the virtual table is dropped
+        // Drop shadow tables manually (SQLite doesn't auto-drop without xShadowName)
+        // SAFETY: db is a valid sqlite3 handle from SQLite
+        let conn = unsafe { Connection::from_handle(self.db)? };
+
+        // Build list of shadow tables to drop
+        let mut shadow_tables = vec![
+            format!("{}_chunks", self.table_name),
+            format!("{}_rowids", self.table_name),
+            format!("{}_info", self.table_name),
+        ];
+
+        // Add vector chunk tables and HNSW tables for each vector column
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if let ColumnType::Vector { .. } = col.col_type {
+                // Vector chunk table
+                shadow_tables.push(format!("{}_vector_chunks{:02}", self.table_name, col_idx));
+
+                // HNSW tables
+                shadow_tables.push(format!("{}_{}_hnsw_nodes", self.table_name, col.name));
+                shadow_tables.push(format!("{}_{}_hnsw_edges", self.table_name, col.name));
+                shadow_tables.push(format!("{}_{}_hnsw_levels", self.table_name, col.name));
+                shadow_tables.push(format!("{}_{}_hnsw_meta", self.table_name, col.name));
+            }
+        }
+
+        // Add auxiliary table if there are auxiliary columns
+        if self
+            .columns
+            .iter()
+            .any(|c| matches!(c.col_type, ColumnType::Auxiliary))
+        {
+            shadow_tables.push(format!("{}_auxiliary", self.table_name));
+        }
+
+        // Drop each shadow table (ignore errors for tables that don't exist)
+        for table in shadow_tables {
+            let _ = conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table), []);
+        }
+
+        std::mem::forget(conn); // Don't close the connection
         Ok(())
     }
 
