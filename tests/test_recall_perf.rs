@@ -10,9 +10,9 @@ fn test_with_params(ef_construction: i32, ef_search: i32) -> (f64, f64, f64, f64
     const NUM_VECTORS: i64 = 1000;
     const K: i64 = 10;
 
-    // Create table
+    // Create table with L2 distance to match ground truth calculation
     db.execute(
-        "CREATE VIRTUAL TABLE test_hnsw USING vec0(embedding float[128])",
+        "CREATE VIRTUAL TABLE test_hnsw USING vec0(embedding float[128] hnsw(distance=l2))",
         [],
     )
     .unwrap();

@@ -97,6 +97,63 @@ pub struct ShadowTablesConfig {
     pub num_partition_columns: usize,
 }
 
+/// Drop all shadow tables for a vec0 virtual table (cleanup before creation)
+///
+/// # Safety
+/// This function must be called with a valid sqlite3 database handle
+pub unsafe fn drop_shadow_tables_ffi(
+    db: *mut ffi::sqlite3,
+    schema: &str,
+    table_name: &str,
+    config: &ShadowTablesConfig,
+    vector_column_names: &[&str],
+) -> Result<()> {
+    // Build list of all possible shadow tables
+    let mut tables_to_drop = vec![
+        format!("\"{}\".\"{}_chunks\"", schema, table_name),
+        format!("\"{}\".\"{}_rowids\"", schema, table_name),
+        format!("\"{}\".\"{}_info\"", schema, table_name),
+        format!("\"{}\".\"{}_auxiliary\"", schema, table_name),
+    ];
+
+    // Vector chunk tables
+    for i in 0..config.num_vector_columns {
+        tables_to_drop.push(format!(
+            "\"{}\".\"{}_vector_chunks{:02}\"",
+            schema, table_name, i
+        ));
+    }
+
+    // Metadata tables
+    for i in 0..config.num_metadata_columns {
+        tables_to_drop.push(format!(
+            "\"{}\".\"{}_metadatachunks{:02}\"",
+            schema, table_name, i
+        ));
+        tables_to_drop.push(format!(
+            "\"{}\".\"{}_metadatatext{:02}\"",
+            schema, table_name, i
+        ));
+    }
+
+    // HNSW tables for each vector column
+    for col_name in vector_column_names {
+        tables_to_drop.push(format!("\"{}_{}_hnsw_meta\"", table_name, col_name));
+        tables_to_drop.push(format!("\"{}_{}_hnsw_nodes\"", table_name, col_name));
+        tables_to_drop.push(format!("\"{}_{}_hnsw_edges\"", table_name, col_name));
+        tables_to_drop.push(format!("\"{}_{}_hnsw_levels\"", table_name, col_name));
+    }
+
+    // Drop each table (ignore errors - table may not exist)
+    for table in tables_to_drop {
+        let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
+        // SAFETY: db is a valid sqlite3 handle passed to this unsafe function
+        let _ = unsafe { execute_sql_ffi(db, &drop_sql) };
+    }
+
+    Ok(())
+}
+
 /// Create all shadow tables for a vec0 virtual table
 ///
 /// # Arguments
@@ -643,6 +700,127 @@ pub unsafe fn create_hnsw_shadow_tables_with_metadata_ffi(
 
     // Create edges table - WITHOUT ROWID clusters edges by (from_rowid, level)
     // for efficient neighbor lookups. No separate index needed.
+    let edges_sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
+         from_rowid INTEGER NOT NULL, \
+         to_rowid INTEGER NOT NULL, \
+         level INTEGER NOT NULL, \
+         PRIMARY KEY (from_rowid, level, to_rowid)\
+         ) WITHOUT ROWID",
+        table_name, column_name
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &edges_sql)? };
+
+    // Create levels table
+    let levels_sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_levels\" (\
+         level INTEGER NOT NULL, \
+         rowid INTEGER NOT NULL, \
+         PRIMARY KEY (level, rowid)\
+         )",
+        table_name, column_name
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &levels_sql)? };
+
+    let index_level_sql = format!(
+        "CREATE INDEX IF NOT EXISTS \"{}_{}_hnsw_levels_level\" \
+         ON \"{}_{}_hnsw_levels\"(level)",
+        table_name, column_name, table_name, column_name
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &index_level_sql)? };
+
+    Ok(())
+}
+
+/// Create HNSW shadow tables with custom parameters using raw FFI
+///
+/// Like `create_hnsw_shadow_tables_with_metadata_ffi` but allows custom M and ef_construction.
+///
+/// # Safety
+/// This function must be called with a valid sqlite3 database handle
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn create_hnsw_shadow_tables_with_params_ffi(
+    db: *mut ffi::sqlite3,
+    table_name: &str,
+    column_name: &str,
+    dimensions: i32,
+    element_type: crate::vector::VectorType,
+    distance_metric: crate::distance::DistanceMetric,
+    index_quantization: crate::vector::IndexQuantization,
+    custom_m: Option<i32>,
+    custom_ef_construction: Option<i32>,
+) -> Result<()> {
+    let m = custom_m.unwrap_or(32);
+    let max_m0 = m * 2; // Standard HNSW: max_m0 = 2*M
+    let ef_construction = custom_ef_construction.unwrap_or(400);
+
+    // Create metadata table
+    let meta_sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_meta\" (\
+         id INTEGER PRIMARY KEY CHECK (id = 1), \
+         m INTEGER NOT NULL DEFAULT 32, \
+         max_m0 INTEGER NOT NULL DEFAULT 64, \
+         ef_construction INTEGER NOT NULL DEFAULT 400, \
+         ef_search INTEGER NOT NULL DEFAULT 200, \
+         max_level INTEGER NOT NULL DEFAULT 16, \
+         level_factor REAL NOT NULL DEFAULT 0.28768207245178085, \
+         entry_point_rowid INTEGER NOT NULL DEFAULT -1, \
+         entry_point_level INTEGER NOT NULL DEFAULT -1, \
+         num_nodes INTEGER NOT NULL DEFAULT 0, \
+         dimensions INTEGER NOT NULL DEFAULT 0, \
+         element_type TEXT NOT NULL DEFAULT 'float32', \
+         distance_metric TEXT NOT NULL DEFAULT 'l2', \
+         rng_seed INTEGER NOT NULL DEFAULT 12345, \
+         hnsw_version INTEGER NOT NULL DEFAULT 1, \
+         index_quantization TEXT NOT NULL DEFAULT 'none'\
+         )",
+        table_name, column_name
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &meta_sql)? };
+
+    // Generate random seed for HNSW level generation
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let random_state = RandomState::new();
+    let rng_seed = random_state.hash_one(std::time::SystemTime::now()) as i64;
+
+    // Insert metadata row with custom M and ef_construction values
+    let insert_meta_sql = format!(
+        "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" \
+         (id, m, max_m0, ef_construction, dimensions, element_type, distance_metric, index_quantization, rng_seed) \
+         VALUES (1, {}, {}, {}, {}, '{}', '{}', '{}', {})",
+        table_name,
+        column_name,
+        m,
+        max_m0,
+        ef_construction,
+        dimensions,
+        element_type.as_str(),
+        distance_metric.as_str(),
+        index_quantization.as_str(),
+        rng_seed
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &insert_meta_sql)? };
+
+    // Create nodes table
+    let nodes_sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_nodes\" (\
+         rowid INTEGER PRIMARY KEY, \
+         level INTEGER NOT NULL, \
+         vector BLOB, \
+         created_at INTEGER DEFAULT (unixepoch())\
+         )",
+        table_name, column_name
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &nodes_sql)? };
+
+    // Create edges table
     let edges_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
          from_rowid INTEGER NOT NULL, \

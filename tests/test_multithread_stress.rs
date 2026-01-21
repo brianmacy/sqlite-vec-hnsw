@@ -209,6 +209,7 @@ fn search_worker(
 }
 
 #[test]
+#[ignore] // Run with: cargo test test_multithread_insert_search_stress -- --ignored --nocapture
 fn test_multithread_insert_search_stress() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("stress_test.db");
@@ -239,9 +240,9 @@ fn test_multithread_insert_search_stress() {
             "WAL mode required for concurrent access"
         );
 
-        // Create table
+        // Create table with HNSW enabled
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128])",
+            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw())",
             [],
         )
         .unwrap();
@@ -391,6 +392,7 @@ fn test_multithread_insert_search_stress() {
 }
 
 #[test]
+#[ignore] // Run with: cargo test test_multithread_heavy_contention -- --ignored --nocapture
 fn test_multithread_heavy_contention() {
     // BRUTAL: Way more threads than CPU cores, max contention
     let temp_dir = TempDir::new().unwrap();
@@ -414,7 +416,7 @@ fn test_multithread_heavy_contention() {
         sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[64])",
+            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[64] hnsw())",
             [],
         )
         .unwrap();

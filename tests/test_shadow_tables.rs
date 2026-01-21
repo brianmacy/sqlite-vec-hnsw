@@ -5,9 +5,9 @@ fn test_shadow_tables_created() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create a virtual table
+    // Create a virtual table with HNSW enabled
     db.execute(
-        "CREATE VIRTUAL TABLE test_vec USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE test_vec USING vec0(embedding float[3] hnsw())",
         [],
     )
     .unwrap();

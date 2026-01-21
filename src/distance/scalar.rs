@@ -82,6 +82,21 @@ pub fn distance_l1_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
     Ok(distance as f32)
 }
 
+/// Cosine distance for Int8 vectors
+/// Uses simsimd which supports i8 cosine distance
+#[inline]
+pub fn distance_cosine_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+    // Zero-copy: reinterpret bytes as i8 slice without allocation
+    let a_vals = a.as_i8_slice();
+    let b_vals = b.as_i8_slice();
+
+    // simsimd::cosine() returns cosine distance (1 - similarity) directly
+    let distance = i8::cosine(a_vals, b_vals)
+        .ok_or_else(|| Error::InvalidParameter("Cosine distance calculation failed".to_string()))?;
+
+    Ok(distance as f32)
+}
+
 /// Hamming distance for binary vectors
 #[inline]
 pub fn distance_hamming_scalar(a: &Vector, b: &Vector) -> Result<f32> {

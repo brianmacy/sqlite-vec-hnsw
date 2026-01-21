@@ -7,8 +7,9 @@ fn test_simple_hnsw_recall_4d() {
     sqlite_vec_hnsw::init(&db).unwrap();
 
     // Create table with small dimensions for easy debugging
+    // Using L2 distance to match ground truth calculation
     db.execute(
-        "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[4])",
+        "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[4] hnsw(distance=l2))",
         [],
     )
     .unwrap();
@@ -156,9 +157,9 @@ fn test_hnsw_recall_128d_100v() {
     const NUM_VECTORS: i64 = 100;
     const K: i64 = 10;
 
-    // Create table
+    // Create table with L2 distance to match ground truth calculation
     db.execute(
-        "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128])",
+        "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw(distance=l2))",
         [],
     )
     .unwrap();

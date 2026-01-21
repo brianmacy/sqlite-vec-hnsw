@@ -82,14 +82,15 @@ fn run_benchmark(use_int8_quantization: bool) -> BenchmarkResult {
     };
 
     // Create table with or without index_quantization
+    // Note: Both tables use hnsw() with distance=l2 to match ground truth calculation
     let create_sql = if use_int8_quantization {
         format!(
-            "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}] index_quantization=int8)",
+            "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}] hnsw(distance=l2, index_quantization=int8))",
             DIMENSIONS
         )
     } else {
         format!(
-            "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}])",
+            "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}] hnsw(distance=l2))",
             DIMENSIONS
         )
     };
@@ -421,9 +422,9 @@ fn run_threaded_benchmark(use_int8_quantization: bool) -> (f64, u64, u64, u64, u
         sqlite_vec_hnsw::init(&db).unwrap();
 
         let create_sql = if use_int8_quantization {
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] index_quantization=int8)"
+            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw(distance=l2, index_quantization=int8))"
         } else {
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128])"
+            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw(distance=l2))"
         };
         db.execute(create_sql, []).unwrap();
     }
@@ -541,12 +542,12 @@ fn test_quantization_large_scale_recall() {
 
         let create_sql = if use_int8 {
             format!(
-                "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}] index_quantization=int8)",
+                "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}] hnsw(distance=l2, index_quantization=int8))",
                 DIMENSIONS
             )
         } else {
             format!(
-                "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}])",
+                "CREATE VIRTUAL TABLE test USING vec0(embedding float[{}] hnsw(distance=l2))",
                 DIMENSIONS
             )
         };

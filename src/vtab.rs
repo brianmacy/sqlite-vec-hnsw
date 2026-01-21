@@ -46,6 +46,30 @@ struct ColumnDef {
     col_type: ColumnType,
 }
 
+/// Custom HNSW parameters for a vector column
+#[derive(Debug, Clone)]
+struct HnswColumnParams {
+    /// Whether HNSW is enabled for this column (hnsw() was specified)
+    enabled: bool,
+    /// M parameter (links per node). None = use default (32)
+    m: Option<i32>,
+    /// ef_construction parameter. None = use default (400)
+    ef_construction: Option<i32>,
+    /// Distance metric. Default is Cosine
+    distance_metric: DistanceMetric,
+}
+
+impl Default for HnswColumnParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            m: None,
+            ef_construction: None,
+            distance_metric: DistanceMetric::Cosine, // Default to cosine
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ColumnType {
     Vector {
@@ -56,6 +80,9 @@ enum ColumnType {
         /// Quantization for HNSW index storage
         #[allow(dead_code)]
         index_quantization: IndexQuantization,
+        /// Custom HNSW parameters from hnsw(...) syntax
+        #[allow(dead_code)]
+        hnsw_params: HnswColumnParams,
     },
     #[allow(dead_code)]
     PartitionKey,
@@ -320,6 +347,37 @@ pub struct Vec0Tab {
     hnsw_stmt_cache: Vec<HnswStmtCache>, // One cache per vector column
 }
 
+/// Extract the hnsw(...) clause from a column definition string.
+/// Returns (string_without_hnsw, Some(hnsw_clause)) or (original_string, None).
+/// Uses regex to handle spaces inside hnsw() by matching balanced parentheses.
+fn extract_hnsw_clause(arg: &str) -> (String, Option<String>) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Compile regex once for efficiency
+    static HNSW_RE: OnceLock<Regex> = OnceLock::new();
+    let re = HNSW_RE.get_or_init(|| {
+        // Match hnsw(...) case-insensitively, capturing content with nested parens
+        // Uses non-greedy match with balanced parens workaround
+        Regex::new(r"(?i)hnsw\([^()]*(?:\([^()]*\)[^()]*)*\)").unwrap()
+    });
+
+    if let Some(m) = re.find(arg) {
+        let hnsw_clause = m.as_str().to_string();
+        let before = arg[..m.start()].trim();
+        let after = arg[m.end()..].trim();
+        let without_hnsw = if before.is_empty() {
+            after.to_string()
+        } else if after.is_empty() {
+            before.to_string()
+        } else {
+            format!("{} {}", before, after)
+        };
+        return (without_hnsw, Some(hnsw_clause));
+    }
+    (arg.to_string(), None)
+}
+
 impl Vec0Tab {
     fn parse_create_args(args: &[&str]) -> Result<(String, String, Vec<ColumnDef>, IndexType)> {
         let mut columns = Vec::new();
@@ -363,8 +421,10 @@ impl Vec0Tab {
                 }
             }
 
-            // Parse column definition: "column_name type[dimensions] [index_quantization=int8]"
-            let parts: Vec<&str> = arg.split_whitespace().collect();
+            // Parse column definition: "column_name type[dimensions] [hnsw(...)]"
+            // First, extract the hnsw(...) clause if present (it may contain spaces)
+            let (arg_without_hnsw, hnsw_clause) = extract_hnsw_clause(arg);
+            let parts: Vec<&str> = arg_without_hnsw.split_whitespace().collect();
             if parts.is_empty() {
                 continue;
             }
@@ -384,13 +444,70 @@ impl Vec0Tab {
                         Error::InvalidParameter(format!("Invalid dimensions: {}", dims_str))
                     })?;
 
-                    // Parse optional index_quantization option (e.g., "index_quantization=int8")
+                    // Parse optional hnsw(...) options after type
+                    // Format: hnsw(M=64, ef_construction=200, index_quantization=int8)
                     let mut index_quantization = IndexQuantization::None;
-                    for part in parts.iter().skip(2) {
-                        if let Some((key, value)) = part.split_once('=')
-                            && key.eq_ignore_ascii_case("index_quantization")
-                        {
-                            index_quantization = IndexQuantization::from_str(value)?;
+                    let mut hnsw_params = HnswColumnParams::default();
+
+                    // First check parts for non-hnsw options (should not exist)
+                    if let Some(part) = parts.get(2) {
+                        // Error on any unrecognized option
+                        return Err(Error::InvalidParameter(format!(
+                            "Unknown vector column option: '{}'. Use hnsw(M=N, ef_construction=N, index_quantization=int8)",
+                            part
+                        )));
+                    }
+
+                    // Now parse the hnsw clause if present
+                    if let Some(hnsw_str) = &hnsw_clause {
+                        // Mark HNSW as enabled for this column
+                        hnsw_params.enabled = true;
+
+                        // Extract parameters from hnsw(...)
+                        let params_str = hnsw_str
+                            .strip_prefix("hnsw(")
+                            .or_else(|| hnsw_str.strip_prefix("HNSW("))
+                            .and_then(|s| s.strip_suffix(')'))
+                            .unwrap_or(""); // Empty params for hnsw()
+
+                        for param in params_str.split(',') {
+                            let param = param.trim();
+                            if param.is_empty() {
+                                continue;
+                            }
+                            let (k, v) = param.split_once('=').ok_or_else(|| {
+                                Error::InvalidParameter(format!(
+                                    "Invalid hnsw parameter: '{}'. Expected key=value format",
+                                    param
+                                ))
+                            })?;
+                            let k = k.trim();
+                            let v = v.trim();
+
+                            if k.eq_ignore_ascii_case("M") {
+                                hnsw_params.m = Some(v.parse().map_err(|_| {
+                                    Error::InvalidParameter(format!(
+                                        "Invalid M value: '{}'. Expected integer",
+                                        v
+                                    ))
+                                })?);
+                            } else if k.eq_ignore_ascii_case("ef_construction") {
+                                hnsw_params.ef_construction = Some(v.parse().map_err(|_| {
+                                    Error::InvalidParameter(format!(
+                                        "Invalid ef_construction value: '{}'. Expected integer",
+                                        v
+                                    ))
+                                })?);
+                            } else if k.eq_ignore_ascii_case("index_quantization") {
+                                index_quantization = IndexQuantization::from_str(v)?;
+                            } else if k.eq_ignore_ascii_case("distance") {
+                                hnsw_params.distance_metric = DistanceMetric::from_str(v)?;
+                            } else {
+                                return Err(Error::InvalidParameter(format!(
+                                    "Unknown hnsw parameter: '{}'. Valid: M, ef_construction, index_quantization, distance",
+                                    k
+                                )));
+                            }
                         }
                     }
 
@@ -400,6 +517,7 @@ impl Vec0Tab {
                             vec_type,
                             dimensions,
                             index_quantization,
+                            hnsw_params,
                         },
                     });
                 } else if type_spec.to_uppercase().contains("PARTITION") {
@@ -625,6 +743,30 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                 has_text_pk: false, // TODO: detect from args
                 num_partition_columns,
             };
+
+            // Collect vector column names for cleanup
+            let vector_column_names: Vec<&str> = vtab
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    if matches!(c.col_type, ColumnType::Vector { .. }) {
+                        Some(c.name.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Drop any existing shadow tables first (cleanup from failed previous CREATE)
+            shadow::drop_shadow_tables_ffi(
+                db_handle,
+                &vtab.schema_name,
+                &vtab.table_name,
+                &config,
+                &vector_column_names,
+            )
+            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
             shadow::create_shadow_tables_ffi(
                 db_handle,
                 &vtab.schema_name,
@@ -633,24 +775,28 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             )
             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-            // Create HNSW shadow tables for vector columns if using HNSW index type
-            if vtab.index_type == IndexType::Hnsw {
-                let mut vec_col_idx = 0;
-                for col in vtab.columns.iter() {
-                    if let ColumnType::Vector {
-                        vec_type,
-                        dimensions,
-                        index_quantization,
-                    } = &col.col_type
-                    {
-                        shadow::create_hnsw_shadow_tables_with_metadata_ffi(
+            // Create HNSW shadow tables for vector columns that have hnsw() enabled
+            let mut vec_col_idx = 0;
+            for col in vtab.columns.iter() {
+                if let ColumnType::Vector {
+                    vec_type,
+                    dimensions,
+                    index_quantization,
+                    hnsw_params,
+                } = &col.col_type
+                {
+                    // Only create HNSW tables if hnsw() was specified
+                    if hnsw_params.enabled {
+                        shadow::create_hnsw_shadow_tables_with_params_ffi(
                             db_handle,
                             &vtab.table_name,
                             &col.name,
                             *dimensions as i32,
                             *vec_type,
-                            DistanceMetric::L2, // TODO: Make configurable
+                            hnsw_params.distance_metric,
                             *index_quantization,
+                            hnsw_params.m,
+                            hnsw_params.ef_construction,
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
@@ -827,65 +973,68 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             shadow::mark_chunk_row_invalid(&conn, &chunks_table, chunk_id, chunk_offset as usize)
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-            // Delete from HNSW index if column is a vector and using HNSW index type
-            if self.index_type == IndexType::Hnsw {
-                for col in &self.columns {
-                    if matches!(col.col_type, ColumnType::Vector { .. }) {
-                        let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
-                        let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
-                        let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
+            // Delete from HNSW index if column is a vector with HNSW enabled
+            for col in &self.columns {
+                if let ColumnType::Vector { hnsw_params, .. } = &col.col_type
+                    && hnsw_params.enabled
+                {
+                    let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
+                    let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
+                    let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
 
-                        // Delete node (ignore errors if table doesn't exist)
-                        let _ = conn.execute(
-                            &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
-                            [rowid],
-                        );
+                    // Delete node (ignore errors if table doesn't exist)
+                    let _ = conn.execute(
+                        &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
+                        [rowid],
+                    );
 
-                        // Delete edges (ignore errors if table doesn't exist)
-                        let _ = conn.execute(
-                            &format!(
-                                "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
-                                edges_table
-                            ),
-                            rusqlite::params![rowid, rowid],
-                        );
+                    // Delete edges (ignore errors if table doesn't exist)
+                    let _ = conn.execute(
+                        &format!(
+                            "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
+                            edges_table
+                        ),
+                        rusqlite::params![rowid, rowid],
+                    );
 
-                        // Delete from levels (ignore errors if table doesn't exist)
-                        let _ = conn.execute(
-                            &format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table),
-                            [rowid],
-                        );
+                    // Delete from levels (ignore errors if table doesn't exist)
+                    let _ = conn.execute(
+                        &format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table),
+                        [rowid],
+                    );
 
-                        // Update metadata if it exists
-                        if let Ok(Some(mut meta)) =
-                            HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
-                        {
-                            meta.num_nodes = meta.num_nodes.saturating_sub(1);
-                            meta.hnsw_version += 1;
+                    // Update metadata if it exists
+                    if let Ok(Some(mut meta)) =
+                        HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
+                    {
+                        meta.num_nodes = meta.num_nodes.saturating_sub(1);
+                        meta.hnsw_version += 1;
 
-                            // If we deleted the entry point, need to find a new one
-                            if meta.entry_point_rowid == rowid {
-                                let new_entry: Option<(i64, i32)> = conn
+                        // If we deleted the entry point, need to find a new one
+                        if meta.entry_point_rowid == rowid {
+                            let new_entry: Option<(i64, i32)> = conn
                                 .query_row(
-                                    &format!("SELECT rowid, level FROM \"{}\" ORDER BY level DESC LIMIT 1", nodes_table),
+                                    &format!(
+                                        "SELECT rowid, level FROM \"{}\" ORDER BY level DESC LIMIT 1",
+                                        nodes_table
+                                    ),
                                     [],
                                     |row| Ok((row.get(0)?, row.get(1)?)),
                                 )
                                 .optional()
                                 .unwrap_or(None);
 
-                                if let Some((new_rowid, new_level)) = new_entry {
-                                    meta.entry_point_rowid = new_rowid;
-                                    meta.entry_point_level = new_level;
-                                } else {
-                                    // No nodes left
-                                    meta.entry_point_rowid = -1;
-                                    meta.entry_point_level = -1;
-                                }
+                            if let Some((new_rowid, new_level)) = new_entry {
+                                meta.entry_point_rowid = new_rowid;
+                                meta.entry_point_level = new_level;
+                            } else {
+                                // No nodes left
+                                meta.entry_point_rowid = -1;
+                                meta.entry_point_level = -1;
                             }
-
-                            let _ = meta.save_to_db(&conn, &self.table_name, &col.name);
                         }
+
+                        let _ = meta.save_to_db(&conn, &self.table_name, &col.name);
                     }
                 }
             }
@@ -949,6 +1098,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 vec_type,
                 dimensions,
                 index_quantization,
+                hnsw_params,
             } = &col.col_type
             {
                 let value_idx = col_idx + 2; // Skip NULL and rowid args
@@ -1015,8 +1165,8 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                 }
 
-                // Also insert into HNSW index if using HNSW index type
-                if self.index_type == IndexType::Hnsw {
+                // Also insert into HNSW index if this column has HNSW enabled
+                if hnsw_params.enabled {
                     // SAFETY: self.db is valid for the lifetime of the virtual table
                     unsafe {
                         let conn = Connection::from_handle(self.db).map_err(|e| {
@@ -1028,11 +1178,11 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
                                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                                 .unwrap_or_else(|| {
-                                    // Initialize new HNSW index with column's index_quantization setting
+                                    // Initialize new HNSW index with column's settings
                                     HnswMetadata::with_index_quantization(
                                         *dimensions as i32,
                                         *vec_type,
-                                        DistanceMetric::L2, // TODO: Make configurable
+                                        hnsw_params.distance_metric,
                                         *index_quantization,
                                     )
                                 });
@@ -1158,6 +1308,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 vec_type,
                 dimensions,
                 index_quantization,
+                hnsw_params,
             } = &col.col_type
             {
                 let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
@@ -1243,10 +1394,8 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     )
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                    // Update HNSW index if column is a vector and using HNSW index type
-                    if self.index_type == IndexType::Hnsw
-                        && matches!(col.col_type, ColumnType::Vector { .. })
-                    {
+                    // Update HNSW index if this column has HNSW enabled
+                    if hnsw_params.enabled {
                         // Delete old HNSW node
                         let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
                         let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
@@ -1286,7 +1435,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                                     HnswMetadata::with_index_quantization(
                                         *dimensions as i32,
                                         *vec_type,
-                                        DistanceMetric::L2,
+                                        hnsw_params.distance_metric,
                                         *index_quantization,
                                     )
                                 });
@@ -1514,56 +1663,62 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
 
                 let k: i64 = args.get(1)?;
 
-                // Execute HNSW search
+                // Check if HNSW is enabled for this column and get distance metric
+                let (hnsw_enabled, distance_metric) =
+                    if let ColumnType::Vector { hnsw_params, .. } = &col.col_type {
+                        (hnsw_params.enabled, hnsw_params.distance_metric)
+                    } else {
+                        (false, DistanceMetric::Cosine) // Default to cosine
+                    };
+
+                // Execute search: HNSW if enabled, otherwise brute-force ENN
                 // SAFETY: vtab.db is valid for the lifetime of the virtual table
                 let results = unsafe {
                     let conn = Connection::from_handle(vtab.db).map_err(|e| {
                         rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
                     })?;
 
-                    let result = match vtab.index_type {
-                        IndexType::Hnsw => {
-                            // HNSW mode: use approximate search, error if index missing
-                            let metadata =
-                                HnswMetadata::load_from_db(&conn, &vtab.table_name, &col.name)
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    let result = if hnsw_enabled {
+                        // HNSW mode: use approximate search
+                        let metadata =
+                            HnswMetadata::load_from_db(&conn, &vtab.table_name, &col.name)
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                            if let Some(meta) = metadata {
-                                hnsw::search::search_hnsw(
-                                    &conn,
-                                    &meta,
-                                    &vtab.table_name,
-                                    &col.name,
-                                    &query_vector,
-                                    k as usize,
-                                    None,
-                                    None, // stmt_cache
-                                )
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
-                            } else {
-                                // HNSW index is missing or corrupted
-                                std::mem::forget(conn);
-                                return Err(rusqlite::Error::UserFunctionError(Box::new(
-                                    Error::InvalidState(format!(
-                                        "HNSW index not available for column '{}'. \
-                                         Check index integrity or rebuild with vec_rebuild_hnsw()",
-                                        col.name
-                                    )),
-                                )));
-                            }
-                        }
-                        IndexType::Enn => {
-                            // ENN mode: exact nearest neighbor via brute force
-                            brute_force_search(
+                        if let Some(meta) = metadata {
+                            hnsw::search::search_hnsw(
                                 &conn,
-                                &vtab.schema_name,
+                                &meta,
                                 &vtab.table_name,
-                                col_idx,
+                                &col.name,
                                 &query_vector,
                                 k as usize,
+                                None,
+                                None, // stmt_cache
                             )
                             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                        } else {
+                            // HNSW index is missing or corrupted
+                            std::mem::forget(conn);
+                            return Err(rusqlite::Error::UserFunctionError(Box::new(
+                                Error::InvalidState(format!(
+                                    "HNSW index not available for column '{}'. \
+                                     Check index integrity or rebuild with vec_rebuild_hnsw()",
+                                    col.name
+                                )),
+                            )));
                         }
+                    } else {
+                        // ENN mode: exact nearest neighbor via brute force
+                        brute_force_search(
+                            &conn,
+                            &vtab.schema_name,
+                            &vtab.table_name,
+                            col_idx,
+                            &query_vector,
+                            k as usize,
+                            distance_metric,
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                     };
 
                     std::mem::forget(conn);
@@ -1763,6 +1918,7 @@ fn brute_force_search(
     column_idx: usize,
     query_vector: &[u8],
     k: usize,
+    distance_metric: DistanceMetric,
 ) -> Result<Vec<(i64, f32)>> {
     use crate::distance;
     use crate::vector::Vector;
@@ -1806,7 +1962,7 @@ fn brute_force_search(
                 Err(_) => continue, // Invalid vector, skip
             };
 
-        let dist = match distance::distance(&query_vec, &vec, DistanceMetric::L2) {
+        let dist = match distance::distance(&query_vec, &vec, distance_metric) {
             Ok(d) => d,
             Err(_) => continue, // Error calculating distance, skip
         };
@@ -1930,7 +2086,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         init(&db).unwrap();
 
-        // Create a vec0 virtual table with one vector column
+        // Create a vec0 virtual table with one vector column (no HNSW)
         db.execute(
             "CREATE VIRTUAL TABLE vec_test USING vec0(embedding float[384])",
             [],
@@ -1962,21 +2118,67 @@ mod tests {
             "Missing _vector_chunks00 table"
         );
 
-        // Check HNSW tables
+        // HNSW tables should NOT exist when hnsw() is not specified
         assert!(
-            tables.contains(&"vec_test_embedding_hnsw_meta".to_string()),
+            !tables.contains(&"vec_test_embedding_hnsw_meta".to_string()),
+            "HNSW meta table should not exist without hnsw()"
+        );
+        assert!(
+            !tables.contains(&"vec_test_embedding_hnsw_nodes".to_string()),
+            "HNSW nodes table should not exist without hnsw()"
+        );
+    }
+
+    #[test]
+    fn test_virtual_table_creation_with_hnsw() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        // Create a vec0 virtual table with HNSW enabled
+        db.execute(
+            "CREATE VIRTUAL TABLE vec_hnsw USING vec0(embedding float[384] hnsw())",
+            [],
+        )
+        .unwrap();
+
+        // Verify shadow tables were created
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_hnsw%' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        println!("Created tables: {:?}", tables);
+
+        // Check that basic shadow tables exist
+        assert!(
+            tables.contains(&"vec_hnsw_chunks".to_string()),
+            "Missing _chunks table"
+        );
+        assert!(
+            tables.contains(&"vec_hnsw_rowids".to_string()),
+            "Missing _rowids table"
+        );
+
+        // Check HNSW tables exist when hnsw() is specified
+        assert!(
+            tables.contains(&"vec_hnsw_embedding_hnsw_meta".to_string()),
             "Missing HNSW meta table"
         );
         assert!(
-            tables.contains(&"vec_test_embedding_hnsw_nodes".to_string()),
+            tables.contains(&"vec_hnsw_embedding_hnsw_nodes".to_string()),
             "Missing HNSW nodes table"
         );
         assert!(
-            tables.contains(&"vec_test_embedding_hnsw_edges".to_string()),
+            tables.contains(&"vec_hnsw_embedding_hnsw_edges".to_string()),
             "Missing HNSW edges table"
         );
         assert!(
-            tables.contains(&"vec_test_embedding_hnsw_levels".to_string()),
+            tables.contains(&"vec_hnsw_embedding_hnsw_levels".to_string()),
             "Missing HNSW levels table"
         );
     }

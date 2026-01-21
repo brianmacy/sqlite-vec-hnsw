@@ -11,9 +11,9 @@ fn test_index_quantization_table_creation() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table with index_quantization option
+    // Create table with index_quantization option inside hnsw()
     db.execute(
-        "CREATE VIRTUAL TABLE test USING vec0(embedding float[8] index_quantization=int8)",
+        "CREATE VIRTUAL TABLE test USING vec0(embedding float[8] hnsw(index_quantization=int8))",
         [],
     )
     .unwrap();
@@ -39,15 +39,15 @@ fn test_index_quantization_table_creation() {
     assert_eq!(index_quant, "int8", "index_quantization should be 'int8'");
 }
 
-/// Test that default index_quantization is 'none'
+/// Test that default index_quantization is 'none' when hnsw() is specified without index_quantization
 #[test]
 fn test_index_quantization_default() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table without index_quantization option
+    // Create table with hnsw() but without index_quantization option
     db.execute(
-        "CREATE VIRTUAL TABLE test USING vec0(embedding float[8])",
+        "CREATE VIRTUAL TABLE test USING vec0(embedding float[8] hnsw())",
         [],
     )
     .unwrap();
@@ -79,9 +79,10 @@ fn test_index_quantization_insert_and_search() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table with index_quantization=int8
+    // Create table with index_quantization=int8 inside hnsw()
+    // Uses default cosine distance which now supports int8
     db.execute(
-        "CREATE VIRTUAL TABLE test USING vec0(embedding float[4] index_quantization=int8)",
+        "CREATE VIRTUAL TABLE test USING vec0(embedding float[4] hnsw(index_quantization=int8))",
         [],
     )
     .unwrap();
@@ -139,9 +140,9 @@ fn test_index_quantization_main_storage_unchanged() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table with index_quantization=int8
+    // Create table with index_quantization=int8 inside hnsw()
     db.execute(
-        "CREATE VIRTUAL TABLE test USING vec0(embedding float[4] index_quantization=int8)",
+        "CREATE VIRTUAL TABLE test USING vec0(embedding float[4] hnsw(index_quantization=int8))",
         [],
     )
     .unwrap();
@@ -185,7 +186,7 @@ fn test_non_vector_columns_before_vector() {
         "CREATE VIRTUAL TABLE test USING vec0(
             id INTEGER,
             label TEXT,
-            embedding float[4]
+            embedding float[4] hnsw()
         )",
         [],
     )
@@ -241,7 +242,7 @@ fn test_update_non_vector_columns_before_vector() {
     db.execute(
         "CREATE VIRTUAL TABLE test USING vec0(
             id INTEGER,
-            embedding float[4]
+            embedding float[4] hnsw()
         )",
         [],
     )

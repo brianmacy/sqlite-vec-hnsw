@@ -130,8 +130,11 @@ fn test_shadow_table_names_match_c() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    db.execute("CREATE VIRTUAL TABLE vecs USING vec0(emb float[3])", [])
-        .unwrap();
+    db.execute(
+        "CREATE VIRTUAL TABLE vecs USING vec0(emb float[3] hnsw())",
+        [],
+    )
+    .unwrap();
 
     println!("\n=== Comparing Shadow Table Names with C ===");
 

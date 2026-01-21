@@ -5,9 +5,9 @@ fn test_scale_10k_vectors() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table with higher dimensional vectors
+    // Create table with higher dimensional vectors and HNSW enabled
     db.execute(
-        "CREATE VIRTUAL TABLE embeddings USING vec0(vector float[128])",
+        "CREATE VIRTUAL TABLE embeddings USING vec0(vector float[128] hnsw())",
         [],
     )
     .unwrap();
@@ -121,9 +121,9 @@ fn test_scale_100k_vectors() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table with production-like dimensions
+    // Create table with production-like dimensions and HNSW enabled
     db.execute(
-        "CREATE VIRTUAL TABLE embeddings USING vec0(vector float[768])",
+        "CREATE VIRTUAL TABLE embeddings USING vec0(vector float[768] hnsw())",
         [],
     )
     .unwrap();

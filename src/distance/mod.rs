@@ -65,6 +65,7 @@ pub fn distance(a: &Vector, b: &Vector, metric: DistanceMetric) -> Result<f32> {
         (VectorType::Float32, DistanceMetric::Cosine) => distance_cosine_f32(a, b),
         (VectorType::Int8, DistanceMetric::L2) => distance_l2_i8(a, b),
         (VectorType::Int8, DistanceMetric::L1) => distance_l1_i8(a, b),
+        (VectorType::Int8, DistanceMetric::Cosine) => distance_cosine_i8(a, b),
         (VectorType::Bit, DistanceMetric::Hamming) => distance_hamming(a, b),
         _ => Err(Error::InvalidDistanceMetric(format!(
             "Distance metric {:?} not supported for vector type {:?}",
@@ -102,6 +103,12 @@ pub fn distance_l2_i8(a: &Vector, b: &Vector) -> Result<f32> {
 /// Pure Rust implementation (simsimd doesn't provide L1 for int8)
 pub fn distance_l1_i8(a: &Vector, b: &Vector) -> Result<f32> {
     scalar::distance_l1_i8_scalar(a, b)
+}
+
+/// Cosine distance for Int8 vectors
+/// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
+pub fn distance_cosine_i8(a: &Vector, b: &Vector) -> Result<f32> {
+    scalar::distance_cosine_i8_scalar(a, b)
 }
 
 /// Hamming distance for binary vectors

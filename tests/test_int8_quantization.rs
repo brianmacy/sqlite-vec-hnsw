@@ -107,9 +107,10 @@ fn test_int8_hnsw_indexing() {
     let db = Connection::open(&db_path).unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table with int8 vectors (should create HNSW tables automatically)
+    // Create table with int8 vectors with HNSW enabled (need hnsw() to create HNSW tables)
+    // Note: int8 vectors work with L2 distance (cosine for int8 also supported via simsimd)
     db.execute(
-        "CREATE VIRTUAL TABLE vectors_int8 USING vec0(embedding int8[128])",
+        "CREATE VIRTUAL TABLE vectors_int8 USING vec0(embedding int8[128] hnsw(distance=l2))",
         [],
     )
     .unwrap();

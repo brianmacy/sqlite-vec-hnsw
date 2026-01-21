@@ -7,7 +7,7 @@ fn test_vec_rebuild_hnsw_basic() {
 
     // Create table with HNSW
     db.execute(
-        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3] hnsw())",
         [],
     )
     .unwrap();
@@ -45,9 +45,9 @@ fn test_vec_rebuild_hnsw_with_params() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    // Create table
+    // Create table with HNSW
     db.execute(
-        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3] hnsw())",
         [],
     )
     .unwrap();
@@ -105,7 +105,7 @@ fn test_vec_rebuild_hnsw_invalid_params() {
     sqlite_vec_hnsw::init(&db).unwrap();
 
     db.execute(
-        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3] hnsw())",
         [],
     )
     .unwrap();
@@ -145,7 +145,7 @@ fn test_vec_rebuild_hnsw_wrong_arg_count() {
     sqlite_vec_hnsw::init(&db).unwrap();
 
     db.execute(
-        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE docs USING vec0(embedding float[3] hnsw())",
         [],
     )
     .unwrap();

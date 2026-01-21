@@ -21,6 +21,7 @@ serde_json = "1.0"
 thiserror = "1.0"
 simsimd = "6.3"
 bytemuck = { version = "1.14", features = ["derive"] }
+regex = "1"
 
 [features]
 default = []

@@ -93,7 +93,7 @@ fn test_shadow_tables_created() {
     let db = create_test_db().expect("Failed to create database");
     init_extension(&db).expect("Failed to init extension");
 
-    // Create a vec0 table
+    // Create a vec0 table (without HNSW)
     db.execute(
         "CREATE VIRTUAL TABLE vec_test USING vec0(embedding float[384])",
         [],
@@ -110,8 +110,9 @@ fn test_shadow_tables_created() {
         .unwrap();
 
     println!("Shadow tables created: {}", shadow_count);
-    // Should have: chunks, rowids, vector_chunks00, and 4 HNSW tables
-    assert!(shadow_count >= 7, "Should have at least 7 shadow tables");
+    // Without hnsw(), should have: chunks, rowids, vector_chunks00, info (4 tables)
+    // HNSW tables are only created when hnsw() is specified
+    assert!(shadow_count >= 4, "Should have at least 4 shadow tables");
 }
 
 #[test]
@@ -672,12 +673,12 @@ fn test_knn_end_to_end() {
     init_extension(&db).expect("Failed to init extension");
 
     db.execute(
-        "CREATE VIRTUAL TABLE vec_knn_test USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE vec_knn_test USING vec0(embedding float[3] hnsw())",
         [],
     )
     .unwrap();
 
-    // Insert test vectors - HNSW index is built automatically
+    // Insert test vectors - HNSW index is built automatically when hnsw() is specified
     db.execute(
         "INSERT INTO vec_knn_test(rowid, embedding) VALUES (1, vec_f32('[1.0, 0.0, 0.0]'))",
         [],

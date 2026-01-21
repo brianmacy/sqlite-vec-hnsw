@@ -9,7 +9,7 @@ fn test_1000_vector_chunk_breakdown() {
     let db = Connection::open(&db_path).unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    db.execute("CREATE VIRTUAL TABLE v USING vec0(e float[768])", [])
+    db.execute("CREATE VIRTUAL TABLE v USING vec0(e float[768] hnsw())", [])
         .unwrap();
     db.execute("BEGIN", []).unwrap();
 

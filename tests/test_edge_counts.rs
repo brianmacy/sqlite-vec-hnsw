@@ -6,8 +6,11 @@ fn test_edge_counts_after_insert() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
-    db.execute("CREATE VIRTUAL TABLE test USING vec0(e float[128])", [])
-        .unwrap();
+    db.execute(
+        "CREATE VIRTUAL TABLE test USING vec0(e float[128] hnsw())",
+        [],
+    )
+    .unwrap();
 
     // Insert 1000 vectors
     db.execute("BEGIN", []).unwrap();

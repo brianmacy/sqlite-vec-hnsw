@@ -13,7 +13,7 @@ fn test_disk_persistence_across_connections() {
         sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128])",
+            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw())",
             [],
         )
         .unwrap();

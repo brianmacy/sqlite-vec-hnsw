@@ -18,9 +18,9 @@ fn test_hnsw_recall_quality() {
         DIMENSIONS, NUM_VECTORS, K
     );
 
-    // Create table with HNSW index
+    // Create table with HNSW index using L2 distance (to match ground truth calculation)
     db.execute(
-        "CREATE VIRTUAL TABLE test_hnsw USING vec0(embedding float[128])",
+        "CREATE VIRTUAL TABLE test_hnsw USING vec0(embedding float[128] hnsw(distance=l2))",
         [],
     )
     .unwrap();
