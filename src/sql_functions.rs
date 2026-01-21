@@ -455,13 +455,11 @@ fn register_vec_rebuild_hnsw(db: &Connection) -> Result<()> {
             );
             let vector_count: i64 = conn.query_row(&count_query, [], |row| row.get(0))?;
 
-            // Step 2: Clear HNSW shadow tables
-            let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
-            let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
+            // Note: We don't explicitly clear HNSW tables because:
+            // 1. Vec0Tab has cached prepared statements that hold locks
+            // 2. The UPDATE restore operation will clean up old nodes per-rowid
+            // 3. Resetting metadata (entry_point=-1) ensures fresh graph construction
             let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
-
-            conn.execute(&format!("DELETE FROM \"{}\"", nodes_table), [])?;
-            conn.execute(&format!("DELETE FROM \"{}\"", edges_table), [])?;
 
             // Step 3: Reset/update metadata
             conn.execute(

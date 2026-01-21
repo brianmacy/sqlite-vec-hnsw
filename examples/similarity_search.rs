@@ -111,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &query_bytes,
         k,
         None, // Use default ef_search from metadata
+        None, // No statement cache in standalone example
     )?;
     let search_duration = search_start.elapsed();
 

@@ -1,5 +1,6 @@
 //! Virtual table implementation for vec0
 
+use crate::connection_ext::ConnectionExt;
 use crate::distance::DistanceMetric;
 use crate::error::{Error, Result};
 use crate::hnsw::{self, HnswMetadata};
@@ -59,10 +60,10 @@ struct HnswStmtCache {
     get_node_data: *mut ffi::sqlite3_stmt,
     get_node_level: *mut ffi::sqlite3_stmt,
     get_edges: *mut ffi::sqlite3_stmt,
-    get_edges_with_dist: *mut ffi::sqlite3_stmt,
     insert_node: *mut ffi::sqlite3_stmt,
     insert_edge: *mut ffi::sqlite3_stmt,
     delete_edges_from: *mut ffi::sqlite3_stmt,
+    update_meta: *mut ffi::sqlite3_stmt,
 }
 
 impl HnswStmtCache {
@@ -71,10 +72,10 @@ impl HnswStmtCache {
             get_node_data: std::ptr::null_mut(),
             get_node_level: std::ptr::null_mut(),
             get_edges: std::ptr::null_mut(),
-            get_edges_with_dist: std::ptr::null_mut(),
             insert_node: std::ptr::null_mut(),
             insert_edge: std::ptr::null_mut(),
             delete_edges_from: std::ptr::null_mut(),
+            update_meta: std::ptr::null_mut(),
         }
     }
 
@@ -82,6 +83,7 @@ impl HnswStmtCache {
     ///
     /// # Safety
     /// Must be called with a valid sqlite3 database handle
+    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn prepare(
         &mut self,
         db: *mut ffi::sqlite3,
@@ -113,7 +115,7 @@ impl HnswStmtCache {
 
         // Prepare get_edges: SELECT to_rowid FROM hnsw_edges WHERE from_rowid = ? AND level = ?
         let sql = CString::new(format!(
-            "SELECT to_rowid FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ? ORDER BY distance",
+            "SELECT to_rowid FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ?",
             table_name, column_name
         ))
         .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
@@ -123,27 +125,6 @@ impl HnswStmtCache {
             sql.as_ptr(),
             -1,
             &mut self.get_edges,
-            std::ptr::null_mut(),
-        );
-        if rc != ffi::SQLITE_OK {
-            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rc),
-                None,
-            )));
-        }
-
-        // Prepare get_edges_with_dist: SELECT to_rowid, distance FROM hnsw_edges WHERE from_rowid = ? AND level = ?
-        let sql = CString::new(format!(
-            "SELECT to_rowid, distance FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ? ORDER BY distance",
-            table_name, column_name
-        ))
-        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
-
-        let rc = ffi::sqlite3_prepare_v2(
-            db,
-            sql.as_ptr(),
-            -1,
-            &mut self.get_edges_with_dist,
             std::ptr::null_mut(),
         );
         if rc != ffi::SQLITE_OK {
@@ -174,9 +155,9 @@ impl HnswStmtCache {
             )));
         }
 
-        // Prepare insert_edge: INSERT OR IGNORE INTO hnsw_edges (from_rowid, to_rowid, level, distance) VALUES (?, ?, ?, ?)
+        // Prepare insert_edge: INSERT OR IGNORE INTO hnsw_edges (from_rowid, to_rowid, level) VALUES (?, ?, ?)
         let sql = CString::new(format!(
-            "INSERT OR IGNORE INTO \"{}_{}_hnsw_edges\" (from_rowid, to_rowid, level, distance) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO \"{}_{}_hnsw_edges\" (from_rowid, to_rowid, level) VALUES (?, ?, ?)",
             table_name, column_name
         ))
         .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
@@ -216,9 +197,31 @@ impl HnswStmtCache {
             )));
         }
 
+        // Prepare update_meta: INSERT OR REPLACE INTO hnsw_meta (key, value) VALUES (?, ?)
+        let sql = CString::new(format!(
+            "INSERT OR REPLACE INTO \"{}_{}_hnsw_meta\" (key, value) VALUES (?, ?)",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.update_meta,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
         Ok(())
     }
 
+    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn finalize(&mut self) {
         if !self.get_node_data.is_null() {
             ffi::sqlite3_finalize(self.get_node_data);
@@ -232,10 +235,6 @@ impl HnswStmtCache {
             ffi::sqlite3_finalize(self.get_edges);
             self.get_edges = std::ptr::null_mut();
         }
-        if !self.get_edges_with_dist.is_null() {
-            ffi::sqlite3_finalize(self.get_edges_with_dist);
-            self.get_edges_with_dist = std::ptr::null_mut();
-        }
         if !self.insert_node.is_null() {
             ffi::sqlite3_finalize(self.insert_node);
             self.insert_node = std::ptr::null_mut();
@@ -247,6 +246,10 @@ impl HnswStmtCache {
         if !self.delete_edges_from.is_null() {
             ffi::sqlite3_finalize(self.delete_edges_from);
             self.delete_edges_from = std::ptr::null_mut();
+        }
+        if !self.update_meta.is_null() {
+            ffi::sqlite3_finalize(self.update_meta);
+            self.update_meta = std::ptr::null_mut();
         }
     }
 }
@@ -260,7 +263,7 @@ pub struct Vec0Tab {
     columns: Vec<ColumnDef>,
     chunk_size: usize,
     index_type: IndexType,
-    db: *mut ffi::sqlite3, // Raw database handle for operations
+    db: *mut ffi::sqlite3,               // Raw database handle for operations
     hnsw_stmt_cache: Vec<HnswStmtCache>, // One cache per vector column
 }
 
@@ -413,6 +416,9 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
         }
 
         // Initialize statement cache (one per vector column)
+        // NOTE: Statements are NOT prepared here - they will be prepared in create()
+        // after shadow tables are created. For existing tables being reopened,
+        // statements are prepared on first use (lazy initialization).
         let num_vector_columns = columns
             .iter()
             .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
@@ -898,14 +904,66 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                                 });
 
                         // Get statement cache for this vector column
+                        // CRITICAL: Lazy prepare statements on THIS connection using extension trait
                         let stmt_cache_ref = if vec_col_idx < self.hnsw_stmt_cache.len() {
+                            let self_mut = self as *const _ as *mut Vec0Tab;
+                                let cache = &mut (&mut *self_mut).hnsw_stmt_cache[vec_col_idx];
+
+                                // Prepare statements lazily on this connection (ConnectionExt trait)
+                                let nodes_table =
+                                    format!("{}_{}_hnsw_nodes", self.table_name, col.name);
+                                let edges_table =
+                                    format!("{}_{}_hnsw_edges", self.table_name, col.name);
+                                let meta_table =
+                                    format!("{}_{}_hnsw_meta", self.table_name, col.name);
+
+                                conn.prepare_or_reuse(
+                                    &mut cache.get_node_data,
+                                    &format!(
+                                        "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
+                                        nodes_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(&mut cache.get_edges,
+                                    &format!("SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?", edges_table))
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(&mut cache.insert_node,
+                                    &format!("INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)", nodes_table))
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(&mut cache.insert_edge,
+                                    &format!("INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES (?, ?, ?)", edges_table))
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(
+                                    &mut cache.delete_edges_from,
+                                    &format!(
+                                        "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                        edges_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(
+                                    &mut cache.update_meta,
+                                    &format!(
+                                        "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
+                                        meta_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
                             let cache = &self.hnsw_stmt_cache[vec_col_idx];
                             Some(hnsw::insert::HnswStmtCache {
                                 get_node_data: cache.get_node_data,
-                                get_edges_with_dist: cache.get_edges_with_dist,
+                                get_edges: cache.get_edges,
                                 insert_node: cache.insert_node,
                                 insert_edge: cache.insert_edge,
                                 delete_edges_from: cache.delete_edges_from,
+                                update_meta: cache.update_meta,
                             })
                         } else {
                             None
@@ -1076,14 +1134,69 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                         }
 
                         // Get statement cache for this vector column
+                        // CRITICAL: Lazy prepare statements on THIS connection using extension trait
                         let stmt_cache_ref = if vec_col_idx < self.hnsw_stmt_cache.len() {
+                            // SAFETY: We need mutable access to the cache to prepare statements
+                            unsafe {
+                                let self_mut = self as *const _ as *mut Vec0Tab;
+                                let cache = &mut (&mut *self_mut).hnsw_stmt_cache[vec_col_idx];
+
+                                // Prepare statements lazily on this connection (ConnectionExt trait)
+                                let nodes_table =
+                                    format!("{}_{}_hnsw_nodes", self.table_name, col.name);
+                                let edges_table =
+                                    format!("{}_{}_hnsw_edges", self.table_name, col.name);
+                                let meta_table =
+                                    format!("{}_{}_hnsw_meta", self.table_name, col.name);
+
+                                conn.prepare_or_reuse(
+                                    &mut cache.get_node_data,
+                                    &format!(
+                                        "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
+                                        nodes_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(&mut cache.get_edges,
+                                    &format!("SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?", edges_table))
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(&mut cache.insert_node,
+                                    &format!("INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)", nodes_table))
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(&mut cache.insert_edge,
+                                    &format!("INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES (?, ?, ?)", edges_table))
+                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(
+                                    &mut cache.delete_edges_from,
+                                    &format!(
+                                        "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                        edges_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                conn.prepare_or_reuse(
+                                    &mut cache.update_meta,
+                                    &format!(
+                                        "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
+                                        meta_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                            }
+
                             let cache = &self.hnsw_stmt_cache[vec_col_idx];
                             Some(hnsw::insert::HnswStmtCache {
                                 get_node_data: cache.get_node_data,
-                                get_edges_with_dist: cache.get_edges_with_dist,
+                                get_edges: cache.get_edges,
                                 insert_node: cache.insert_node,
                                 insert_edge: cache.insert_edge,
                                 delete_edges_from: cache.delete_edges_from,
+                                update_meta: cache.update_meta,
                             })
                         } else {
                             None
@@ -1228,6 +1341,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                                     &query_vector,
                                     k as usize,
                                     None,
+                                    None, // stmt_cache
                                 )
                                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                             } else {

@@ -1,5 +1,6 @@
 //! HNSW (Hierarchical Navigable Small World) index implementation
 
+pub mod cache;
 pub mod insert;
 pub mod rebuild;
 pub mod search;
@@ -270,6 +271,141 @@ impl HnswMetadata {
         )?;
 
         Ok(())
+    }
+
+    /// Save only dynamic fields that change during operations
+    /// This matches C implementation which updates fields individually
+    /// Only saves: entry_point, num_nodes, hnsw_version
+    pub fn save_dynamic_to_db(
+        &self,
+        db: &Connection,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<()> {
+        let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
+        let update_sql = format!(
+            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
+            meta_table
+        );
+
+        // Only update fields that change during insert/delete operations
+        db.execute(
+            &update_sql,
+            ["entry_point_rowid", &self.entry_point_rowid.to_string()],
+        )?;
+        db.execute(
+            &update_sql,
+            ["entry_point_level", &self.entry_point_level.to_string()],
+        )?;
+        db.execute(&update_sql, ["num_nodes", &self.num_nodes.to_string()])?;
+        db.execute(
+            &update_sql,
+            ["hnsw_version", &self.hnsw_version.to_string()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Save dynamic metadata using cached prepared statement (FAST PATH)
+    /// Matches C implementation: uses single prepared statement for all updates
+    ///
+    /// # Safety
+    /// cached_stmt must be a valid prepared statement for:
+    /// INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe fn save_dynamic_to_db_cached(
+        &self,
+        cached_stmt: *mut rusqlite::ffi::sqlite3_stmt,
+        update_entry_point: bool,
+    ) -> Result<()> {
+        use rusqlite::ffi;
+        use std::ffi::CString;
+
+        // Helper to update one metadata field
+        let update_field = |key: &str, value: &str| -> Result<()> {
+            ffi::sqlite3_reset(cached_stmt);
+
+            let key_cstr = CString::new(key)
+                .map_err(|e| Error::InvalidParameter(format!("Invalid key: {}", e)))?;
+            let val_cstr = CString::new(value)
+                .map_err(|e| Error::InvalidParameter(format!("Invalid value: {}", e)))?;
+
+            ffi::sqlite3_bind_text(
+                cached_stmt,
+                1,
+                key_cstr.as_ptr(),
+                -1,
+                ffi::SQLITE_TRANSIENT(),
+            );
+            ffi::sqlite3_bind_text(
+                cached_stmt,
+                2,
+                val_cstr.as_ptr(),
+                -1,
+                ffi::SQLITE_TRANSIENT(),
+            );
+
+            let rc = ffi::sqlite3_step(cached_stmt);
+            ffi::sqlite3_reset(cached_stmt);
+
+            if rc != ffi::SQLITE_DONE {
+                return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rc),
+                    None,
+                )));
+            }
+            Ok(())
+        };
+
+        // Always update num_nodes and hnsw_version
+        update_field("num_nodes", &self.num_nodes.to_string())?;
+        update_field("hnsw_version", &self.hnsw_version.to_string())?;
+
+        // Only update entry_point if it changed
+        if update_entry_point {
+            update_field("entry_point_rowid", &self.entry_point_rowid.to_string())?;
+            update_field("entry_point_level", &self.entry_point_level.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate metadata is current and reload if changed by another connection
+    /// Matches C implementation: hnsw_validate_and_refresh_caches()
+    ///
+    /// Returns Ok(true) if metadata was current, Ok(false) if reloaded, Err on failure
+    pub fn validate_and_refresh(
+        &mut self,
+        db: &Connection,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool> {
+        let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
+
+        // Just check version first (1 query instead of 14)
+        let current_version: Option<i64> = db
+            .query_row(
+                &format!(
+                    "SELECT value FROM \"{}\" WHERE key = 'hnsw_version'",
+                    meta_table
+                ),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|s| s.parse().ok());
+
+        if let Some(curr_ver) = current_version
+            && curr_ver != self.hnsw_version
+        {
+            // Version changed - reload full metadata
+            if let Some(current) = HnswMetadata::load_from_db(db, table_name, column_name)? {
+                *self = current;
+                return Ok(false); // Metadata was stale, reloaded
+            }
+        }
+
+        Ok(true) // Metadata is current
     }
 }
 

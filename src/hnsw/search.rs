@@ -8,8 +8,14 @@ use crate::error::{Error, Result};
 use crate::hnsw::HnswMetadata;
 use crate::hnsw::storage;
 use crate::vector::Vector;
-use rusqlite::Connection;
+use rusqlite::{Connection, ffi};
 use std::collections::{BinaryHeap, HashSet};
+
+/// Cached statement pointers for search operations
+pub struct SearchStmtCache {
+    pub get_node_data: Option<*mut ffi::sqlite3_stmt>,
+    pub get_edges: Option<*mut ffi::sqlite3_stmt>,
+}
 
 /// Search context to reduce parameter count
 pub struct SearchContext<'a> {
@@ -18,35 +24,66 @@ pub struct SearchContext<'a> {
     pub table_name: &'a str,
     pub column_name: &'a str,
     pub query_vec: &'a Vector,
+    pub stmt_cache: Option<&'a SearchStmtCache>,
 }
 
-/// Search candidate with priority ordering
+/// Candidate for exploration - min-heap ordering (closest first)
 #[derive(Debug, Clone)]
-struct SearchCandidate {
+struct MinCandidate {
     rowid: i64,
     distance: f32,
 }
 
-impl PartialEq for SearchCandidate {
+impl PartialEq for MinCandidate {
     fn eq(&self, other: &Self) -> bool {
         self.distance == other.distance && self.rowid == other.rowid
     }
 }
 
-impl Eq for SearchCandidate {}
+impl Eq for MinCandidate {}
 
-impl PartialOrd for SearchCandidate {
+impl PartialOrd for MinCandidate {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for SearchCandidate {
+impl Ord for MinCandidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse ordering for min-heap (closest first)
+        // Reverse ordering for min-heap (closest first when popped)
         other
             .distance
             .partial_cmp(&self.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// Result candidate - max-heap ordering (farthest first)
+#[derive(Debug, Clone)]
+struct MaxCandidate {
+    rowid: i64,
+    distance: f32,
+}
+
+impl PartialEq for MaxCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance && self.rowid == other.rowid
+    }
+}
+
+impl Eq for MaxCandidate {}
+
+impl PartialOrd for MaxCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MaxCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Normal ordering for max-heap (farthest first when peeked/popped)
+        self.distance
+            .partial_cmp(&other.distance)
             .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
@@ -61,9 +98,11 @@ impl Ord for SearchCandidate {
 /// * `query_vector` - Query vector as bytes
 /// * `k` - Number of nearest neighbors to return
 /// * `ef_search` - Dynamic candidate list size (defaults to metadata.params.ef_search)
+/// * `stmt_cache` - Optional cached statements for faster execution
 ///
 /// # Returns
 /// List of (rowid, distance) pairs, sorted by distance
+#[allow(clippy::too_many_arguments)]
 pub fn search_hnsw(
     db: &Connection,
     metadata: &HnswMetadata,
@@ -72,6 +111,7 @@ pub fn search_hnsw(
     query_vector: &[u8],
     k: usize,
     ef_search: Option<i32>,
+    stmt_cache: Option<&SearchStmtCache>,
 ) -> Result<Vec<(i64, f32)>> {
     // Check if index is empty
     if metadata.entry_point_rowid == -1 {
@@ -94,6 +134,7 @@ pub fn search_hnsw(
         table_name,
         column_name,
         query_vec: &query_vec,
+        stmt_cache,
     };
 
     // Start from entry point, search from top level down to level 0
@@ -124,15 +165,23 @@ pub fn search_layer(
     level: i32,
 ) -> Result<Vec<(i64, f32)>> {
     let mut visited = HashSet::new();
-    let mut candidates = BinaryHeap::new();
-    let mut results = BinaryHeap::new();
+    // candidates: min-heap - we explore closest candidates first
+    let mut candidates: BinaryHeap<MinCandidate> = BinaryHeap::new();
+    // results: max-heap - peek() gives us the worst (farthest) result for termination check
+    let mut results: BinaryHeap<MaxCandidate> = BinaryHeap::new();
 
     // Get entry point node
-    let entry_node =
-        storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, entry_rowid, None)?
-            .ok_or_else(|| {
-                Error::InvalidParameter(format!("Entry point node {} not found", entry_rowid))
-            })?;
+    let cached_node_stmt = ctx.stmt_cache.and_then(|c| c.get_node_data);
+    let entry_node = storage::fetch_node_data(
+        ctx.db,
+        ctx.table_name,
+        ctx.column_name,
+        entry_rowid,
+        cached_node_stmt,
+    )?
+    .ok_or_else(|| {
+        Error::InvalidParameter(format!("Entry point node {} not found", entry_rowid))
+    })?;
 
     let entry_vec = Vector::from_blob(
         &entry_node.vector,
@@ -141,12 +190,12 @@ pub fn search_layer(
     )?;
     let entry_dist = distance::distance(ctx.query_vec, &entry_vec, ctx.metadata.distance_metric)?;
 
-    candidates.push(SearchCandidate {
+    candidates.push(MinCandidate {
         rowid: entry_rowid,
-        distance: -entry_dist, // Negative for max-heap (farthest first)
+        distance: entry_dist,
     });
 
-    results.push(SearchCandidate {
+    results.push(MaxCandidate {
         rowid: entry_rowid,
         distance: entry_dist,
     });
@@ -155,22 +204,22 @@ pub fn search_layer(
 
     // Main search loop
     while let Some(candidate) = candidates.pop() {
-        let candidate_dist = -candidate.distance; // Convert back to positive
-
-        // If this candidate is farther than the worst result, we're done
+        // If closest unexplored candidate is farther than our worst result, we're done
         if let Some(worst) = results.peek()
-            && candidate_dist > worst.distance
+            && candidate.distance > worst.distance
         {
             break;
         }
 
         // Get neighbors of this candidate at the current level
-        let neighbors = storage::fetch_neighbors(
+        let cached_edges_stmt = ctx.stmt_cache.and_then(|c| c.get_edges);
+        let neighbors = storage::fetch_neighbors_cached(
             ctx.db,
             ctx.table_name,
             ctx.column_name,
             candidate.rowid,
             level,
+            cached_edges_stmt,
         )?;
 
         for neighbor_rowid in neighbors {
@@ -180,8 +229,13 @@ pub fn search_layer(
             visited.insert(neighbor_rowid);
 
             // Fetch neighbor vector and calculate distance
-            let neighbor_node =
-                storage::fetch_node_data(ctx.db, ctx.table_name, ctx.column_name, neighbor_rowid, None)?;
+            let neighbor_node = storage::fetch_node_data(
+                ctx.db,
+                ctx.table_name,
+                ctx.column_name,
+                neighbor_rowid,
+                cached_node_stmt,
+            )?;
             let neighbor_node = match neighbor_node {
                 Some(n) => n,
                 None => continue, // Node deleted
@@ -195,19 +249,19 @@ pub fn search_layer(
             let neighbor_dist =
                 distance::distance(ctx.query_vec, &neighbor_vec, ctx.metadata.distance_metric)?;
 
-            // Check if this neighbor is better than our worst result
+            // Check if this neighbor is better than our worst result (or we have room)
             if results.len() < ef || neighbor_dist < results.peek().unwrap().distance {
-                candidates.push(SearchCandidate {
-                    rowid: neighbor_rowid,
-                    distance: -neighbor_dist,
-                });
-
-                results.push(SearchCandidate {
+                candidates.push(MinCandidate {
                     rowid: neighbor_rowid,
                     distance: neighbor_dist,
                 });
 
-                // Trim results to ef
+                results.push(MaxCandidate {
+                    rowid: neighbor_rowid,
+                    distance: neighbor_dist,
+                });
+
+                // Trim results to ef (removes farthest)
                 while results.len() > ef {
                     results.pop();
                 }
@@ -215,14 +269,12 @@ pub fn search_layer(
         }
     }
 
-    // Convert results to sorted vector
-    let mut final_results: Vec<(i64, f32)> = results
-        .into_sorted_vec()
-        .into_iter()
-        .map(|c| (c.rowid, c.distance))
-        .collect();
+    // Convert results heap to sorted vector (closest first)
+    let mut final_results: Vec<(i64, f32)> =
+        results.into_iter().map(|c| (c.rowid, c.distance)).collect();
 
-    final_results.reverse(); // Sort ascending by distance
+    // Sort by distance ascending (closest first)
+    final_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     Ok(final_results)
 }
@@ -242,8 +294,17 @@ mod tests {
         let metadata = HnswMetadata::new(3, VectorType::Float32, DistanceMetric::L2);
 
         let query = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // [1.0, 2.0, 3.0]
-        let results =
-            search_hnsw(&db, &metadata, "test_table", "embedding", &query, 5, None).unwrap();
+        let results = search_hnsw(
+            &db,
+            &metadata,
+            "test_table",
+            "embedding",
+            &query,
+            5,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 0, "Empty index should return no results");
     }
@@ -265,8 +326,17 @@ mod tests {
 
         // Search for it
         let query = vec![1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]; // Same vector
-        let results =
-            search_hnsw(&db, &metadata, "test_table", "embedding", &query, 1, None).unwrap();
+        let results = search_hnsw(
+            &db,
+            &metadata,
+            "test_table",
+            "embedding",
+            &query,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
@@ -278,27 +348,53 @@ mod tests {
 
     #[test]
     fn test_search_candidate_ordering() {
-        let mut heap = BinaryHeap::new();
+        // Test MinCandidate (min-heap - closest first)
+        let mut min_heap: BinaryHeap<MinCandidate> = BinaryHeap::new();
 
-        heap.push(SearchCandidate {
+        min_heap.push(MinCandidate {
             rowid: 1,
             distance: 0.5,
         });
-        heap.push(SearchCandidate {
+        min_heap.push(MinCandidate {
             rowid: 2,
             distance: 0.3,
         });
-        heap.push(SearchCandidate {
+        min_heap.push(MinCandidate {
             rowid: 3,
             distance: 0.7,
         });
 
         // Should pop in order: 0.3, 0.5, 0.7 (min-heap)
-        let first = heap.pop().unwrap();
+        let first = min_heap.pop().unwrap();
         assert_eq!(first.rowid, 2);
         assert!((first.distance - 0.3).abs() < 0.001);
 
-        let second = heap.pop().unwrap();
+        let second = min_heap.pop().unwrap();
+        assert_eq!(second.rowid, 1);
+        assert!((second.distance - 0.5).abs() < 0.001);
+
+        // Test MaxCandidate (max-heap - farthest first)
+        let mut max_heap: BinaryHeap<MaxCandidate> = BinaryHeap::new();
+
+        max_heap.push(MaxCandidate {
+            rowid: 1,
+            distance: 0.5,
+        });
+        max_heap.push(MaxCandidate {
+            rowid: 2,
+            distance: 0.3,
+        });
+        max_heap.push(MaxCandidate {
+            rowid: 3,
+            distance: 0.7,
+        });
+
+        // Should pop in order: 0.7, 0.5, 0.3 (max-heap)
+        let first = max_heap.pop().unwrap();
+        assert_eq!(first.rowid, 3);
+        assert!((first.distance - 0.7).abs() < 0.001);
+
+        let second = max_heap.pop().unwrap();
         assert_eq!(second.rowid, 1);
         assert!((second.distance - 0.5).abs() < 0.001);
     }

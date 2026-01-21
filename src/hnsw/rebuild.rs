@@ -73,26 +73,43 @@ pub fn rebuild_hnsw_index(
 
         if let Some(vector) = vector_data {
             // Re-insert into HNSW index
-            insert::insert_hnsw(db, &mut metadata, table_name, column_name, rowid, &vector, None)?;
+            insert::insert_hnsw(
+                db,
+                &mut metadata,
+                table_name,
+                column_name,
+                rowid,
+                &vector,
+                None,
+            )?;
         }
     }
 
     Ok(vector_count as i32)
 }
 
-/// Clear all HNSW shadow tables (DELETE FROM, not DROP)
+/// Clear all HNSW shadow tables (public version for SQL function)
+pub fn clear_hnsw_tables_internal(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<()> {
+    clear_hnsw_tables(db, table_name, column_name)
+}
+
+/// Clear all HNSW shadow tables
 fn clear_hnsw_tables(db: &Connection, table_name: &str, column_name: &str) -> Result<()> {
-    // Clear nodes table
+    // Simply DELETE from each table
+    // Note: The previous approach of finalizing all statements caused segfaults
+    // because Vec0Tab's cached statement pointers became dangling
     let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
     db.execute(&format!("DELETE FROM \"{}\"", nodes_table), [])
         .map_err(Error::Sqlite)?;
 
-    // Clear edges table
     let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
     db.execute(&format!("DELETE FROM \"{}\"", edges_table), [])
         .map_err(Error::Sqlite)?;
 
-    // Clear levels table
     let levels_table = format!("{}_{}_hnsw_levels", table_name, column_name);
     db.execute(&format!("DELETE FROM \"{}\"", levels_table), [])
         .map_err(Error::Sqlite)?;
@@ -116,7 +133,7 @@ mod tests {
         // Insert some test data
         let vector = vec![1u8; 12];
         storage::insert_node(&db, "test_table", "embedding", 1, 1, &vector, None).unwrap();
-        storage::insert_edge(&db, "test_table", "embedding", 1, 2, 0, 0.5, None).unwrap();
+        storage::insert_edge(&db, "test_table", "embedding", 1, 2, 0, None).unwrap();
 
         // Verify data exists
         let node_count = storage::count_nodes(&db, "test_table", "embedding").unwrap();

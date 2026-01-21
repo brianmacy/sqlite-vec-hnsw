@@ -29,6 +29,10 @@ criterion = "0.5"
 name = "vector_operations"
 harness = false
 
+[[bench]]
+name = "recall_benchmark"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true

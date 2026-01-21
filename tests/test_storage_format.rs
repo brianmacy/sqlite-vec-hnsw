@@ -150,7 +150,9 @@ fn test_chunk_inspection() {
     let chunks: Vec<(i64, i64, i64, i64)> = db
         .prepare("SELECT chunk_id, size, length(validity), length(rowids) FROM vectors_chunks")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
