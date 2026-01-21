@@ -135,7 +135,7 @@ impl HnswMetadata {
         }
     }
 
-    /// Load metadata from shadow table
+    /// Load metadata from shadow table (single row schema)
     pub fn load_from_db(
         db: &Connection,
         table_name: &str,
@@ -143,126 +143,98 @@ impl HnswMetadata {
     ) -> Result<Option<Self>> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-        // Try to read metadata values
-        let get_meta = |key: &str| -> Result<Option<String>> {
-            let query = format!("SELECT value FROM \"{}\" WHERE key = ?", meta_table);
-            match db
-                .query_row(&query, [key], |row| row.get::<_, String>(0))
-                .optional()
+        // Single SELECT for all metadata
+        let query = format!(
+            "SELECT m, max_m0, ef_construction, ef_search, max_level, level_factor, \
+             entry_point_rowid, entry_point_level, num_nodes, dimensions, \
+             element_type, distance_metric, rng_seed, hnsw_version \
+             FROM \"{}\" WHERE id = 1",
+            meta_table
+        );
+
+        let result = db
+            .query_row(&query, [], |row| {
+                Ok(HnswMetadata {
+                    params: HnswParams {
+                        m: row.get(0)?,
+                        max_m0: row.get(1)?,
+                        ef_construction: row.get(2)?,
+                        ef_search: row.get(3)?,
+                        max_level: row.get(4)?,
+                        level_factor: row.get(5)?,
+                    },
+                    entry_point_rowid: row.get(6)?,
+                    entry_point_level: row.get(7)?,
+                    num_nodes: row.get(8)?,
+                    dimensions: row.get(9)?,
+                    element_type: match row.get::<_, String>(10)?.as_str() {
+                        "float32" => VectorType::Float32,
+                        "int8" => VectorType::Int8,
+                        "bit" => VectorType::Bit,
+                        _ => VectorType::Float32,
+                    },
+                    distance_metric: match row.get::<_, String>(11)?.as_str() {
+                        "l2" => DistanceMetric::L2,
+                        "cosine" => DistanceMetric::Cosine,
+                        "l1" => DistanceMetric::L1,
+                        _ => DistanceMetric::L2,
+                    },
+                    rng_seed: row.get::<_, i64>(12)? as u32,
+                    hnsw_version: row.get(13)?,
+                })
+            })
+            .optional();
+
+        match result {
+            Ok(opt) => Ok(opt),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::Unknown =>
             {
-                Ok(opt) => Ok(opt),
-                Err(rusqlite::Error::SqliteFailure(err, _))
-                    if err.code == rusqlite::ErrorCode::Unknown =>
-                {
-                    // Table doesn't exist
-                    Ok(None)
-                }
-                Err(e) => Err(Error::Sqlite(e)),
+                // Table doesn't exist
+                Ok(None)
             }
-        };
-
-        // If entry_point_rowid doesn't exist, index is not initialized
-        let entry_point_rowid = match get_meta("entry_point_rowid")? {
-            Some(val) => val.parse::<i64>().unwrap_or(-1),
-            None => return Ok(None),
-        };
-
-        let params = HnswParams {
-            m: get_meta("M")?.and_then(|s| s.parse().ok()).unwrap_or(32),
-            max_m0: get_meta("max_M0")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(64),
-            ef_construction: get_meta("ef_construction")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(400),
-            ef_search: get_meta("ef_search")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(200),
-            max_level: get_meta("max_level")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-            level_factor: get_meta("level_factor")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1.0 / 32.0_f64.ln()),
-        };
-
-        Ok(Some(HnswMetadata {
-            params,
-            entry_point_rowid,
-            entry_point_level: get_meta("entry_point_level")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1),
-            num_nodes: get_meta("num_nodes")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            dimensions: get_meta("dimensions")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            element_type: get_meta("element_type")?
-                .and_then(|s| match s.as_str() {
-                    "float32" => Some(VectorType::Float32),
-                    "int8" => Some(VectorType::Int8),
-                    "bit" => Some(VectorType::Bit),
-                    _ => None,
-                })
-                .unwrap_or(VectorType::Float32),
-            distance_metric: get_meta("distance_metric")?
-                .and_then(|s| match s.as_str() {
-                    "l2" => Some(DistanceMetric::L2),
-                    "cosine" => Some(DistanceMetric::Cosine),
-                    "l1" => Some(DistanceMetric::L1),
-                    _ => None,
-                })
-                .unwrap_or(DistanceMetric::L2),
-            rng_seed: get_meta("rng_seed")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(12345),
-            hnsw_version: get_meta("hnsw_version")?
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1),
-        }))
+            Err(e) => Err(Error::Sqlite(e)),
+        }
     }
 
-    /// Save metadata to shadow table (batched multi-row INSERT)
+    /// Save metadata to shadow table (single row schema)
     pub fn save_to_db(&self, db: &Connection, table_name: &str, column_name: &str) -> Result<()> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-        // Batch all metadata in one multi-row INSERT
-        let update_sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES \
-             ('M', ?), ('max_M0', ?), ('ef_construction', ?), ('ef_search', ?), \
-             ('max_level', ?), ('level_factor', ?), ('entry_point_rowid', ?), \
-             ('entry_point_level', ?), ('num_nodes', ?), ('dimensions', ?), \
-             ('element_type', ?), ('distance_metric', ?), ('rng_seed', ?), \
-             ('hnsw_version', ?)",
+        // Single INSERT OR REPLACE for all metadata
+        let sql = format!(
+            "INSERT OR REPLACE INTO \"{}\" \
+             (id, m, max_m0, ef_construction, ef_search, max_level, level_factor, \
+              entry_point_rowid, entry_point_level, num_nodes, dimensions, \
+              element_type, distance_metric, rng_seed, hnsw_version) \
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             meta_table
         );
 
         db.execute(
-            &update_sql,
+            &sql,
             rusqlite::params![
-                self.params.m.to_string(),
-                self.params.max_m0.to_string(),
-                self.params.ef_construction.to_string(),
-                self.params.ef_search.to_string(),
-                self.params.max_level.to_string(),
-                self.params.level_factor.to_string(),
-                self.entry_point_rowid.to_string(),
-                self.entry_point_level.to_string(),
-                self.num_nodes.to_string(),
-                self.dimensions.to_string(),
+                self.params.m,
+                self.params.max_m0,
+                self.params.ef_construction,
+                self.params.ef_search,
+                self.params.max_level,
+                self.params.level_factor,
+                self.entry_point_rowid,
+                self.entry_point_level,
+                self.num_nodes,
+                self.dimensions,
                 self.element_type.as_str(),
                 self.distance_metric.as_str(),
-                self.rng_seed.to_string(),
-                self.hnsw_version.to_string(),
+                self.rng_seed as i64,
+                self.hnsw_version,
             ],
         )?;
 
         Ok(())
     }
 
-    /// Save only dynamic fields that change during operations
-    /// Uses batched multi-row INSERT for efficiency
+    /// Save only dynamic fields that change during operations (single UPDATE)
     /// Only saves: entry_point, num_nodes, hnsw_version
     pub fn save_dynamic_to_db(
         &self,
@@ -272,23 +244,24 @@ impl HnswMetadata {
     ) -> Result<()> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-        // Batch all dynamic fields in one multi-row INSERT
-        let update_sql = format!(
-            "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES \
-             ('entry_point_rowid', ?), \
-             ('entry_point_level', ?), \
-             ('num_nodes', ?), \
-             ('hnsw_version', ?)",
+        // Single UPDATE for dynamic fields
+        let sql = format!(
+            "UPDATE \"{}\" SET \
+             entry_point_rowid = ?, \
+             entry_point_level = ?, \
+             num_nodes = ?, \
+             hnsw_version = ? \
+             WHERE id = 1",
             meta_table
         );
 
         db.execute(
-            &update_sql,
+            &sql,
             rusqlite::params![
-                self.entry_point_rowid.to_string(),
-                self.entry_point_level.to_string(),
-                self.num_nodes.to_string(),
-                self.hnsw_version.to_string(),
+                self.entry_point_rowid,
+                self.entry_point_level,
+                self.num_nodes,
+                self.hnsw_version,
             ],
         )?;
 
@@ -296,66 +269,36 @@ impl HnswMetadata {
     }
 
     /// Save dynamic metadata using cached prepared statement (FAST PATH)
-    /// Matches C implementation: uses single prepared statement for all updates
+    /// Uses single UPDATE statement for all dynamic fields
     ///
     /// # Safety
     /// cached_stmt must be a valid prepared statement for:
-    /// INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)
+    /// UPDATE meta SET entry_point_rowid=?, entry_point_level=?, num_nodes=?, hnsw_version=? WHERE id=1
     #[allow(unsafe_op_in_unsafe_fn)]
     pub unsafe fn save_dynamic_to_db_cached(
         &self,
         cached_stmt: *mut rusqlite::ffi::sqlite3_stmt,
-        update_entry_point: bool,
+        _update_entry_point: bool, // ignored - always update all dynamic fields
     ) -> Result<()> {
         use rusqlite::ffi;
-        use std::ffi::CString;
 
-        // Helper to update one metadata field
-        let update_field = |key: &str, value: &str| -> Result<()> {
-            ffi::sqlite3_reset(cached_stmt);
+        ffi::sqlite3_reset(cached_stmt);
 
-            let key_cstr = CString::new(key)
-                .map_err(|e| Error::InvalidParameter(format!("Invalid key: {}", e)))?;
-            let val_cstr = CString::new(value)
-                .map_err(|e| Error::InvalidParameter(format!("Invalid value: {}", e)))?;
+        // Bind parameters: entry_point_rowid, entry_point_level, num_nodes, hnsw_version
+        ffi::sqlite3_bind_int64(cached_stmt, 1, self.entry_point_rowid);
+        ffi::sqlite3_bind_int(cached_stmt, 2, self.entry_point_level);
+        ffi::sqlite3_bind_int(cached_stmt, 3, self.num_nodes);
+        ffi::sqlite3_bind_int64(cached_stmt, 4, self.hnsw_version);
 
-            ffi::sqlite3_bind_text(
-                cached_stmt,
-                1,
-                key_cstr.as_ptr(),
-                -1,
-                ffi::SQLITE_TRANSIENT(),
-            );
-            ffi::sqlite3_bind_text(
-                cached_stmt,
-                2,
-                val_cstr.as_ptr(),
-                -1,
-                ffi::SQLITE_TRANSIENT(),
-            );
+        let rc = ffi::sqlite3_step(cached_stmt);
+        ffi::sqlite3_reset(cached_stmt);
 
-            let rc = ffi::sqlite3_step(cached_stmt);
-            ffi::sqlite3_reset(cached_stmt);
-
-            if rc != ffi::SQLITE_DONE {
-                return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rc),
-                    None,
-                )));
-            }
-            Ok(())
-        };
-
-        // Always update num_nodes and hnsw_version
-        update_field("num_nodes", &self.num_nodes.to_string())?;
-        update_field("hnsw_version", &self.hnsw_version.to_string())?;
-
-        // Only update entry_point if it changed
-        if update_entry_point {
-            update_field("entry_point_rowid", &self.entry_point_rowid.to_string())?;
-            update_field("entry_point_level", &self.entry_point_level.to_string())?;
+        if rc != ffi::SQLITE_DONE {
+            return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
         }
-
         Ok(())
     }
 
@@ -371,23 +314,19 @@ impl HnswMetadata {
     ) -> Result<bool> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-        // Just check version first (1 query instead of 14)
+        // Single query to check version
         let current_version: Option<i64> = db
             .query_row(
-                &format!(
-                    "SELECT value FROM \"{}\" WHERE key = 'hnsw_version'",
-                    meta_table
-                ),
+                &format!("SELECT hnsw_version FROM \"{}\" WHERE id = 1", meta_table),
                 [],
-                |row| row.get::<_, String>(0),
+                |row| row.get(0),
             )
-            .optional()?
-            .and_then(|s| s.parse().ok());
+            .optional()?;
 
         if let Some(curr_ver) = current_version
             && curr_ver != self.hnsw_version
         {
-            // Version changed - reload full metadata
+            // Version changed - reload full metadata (single SELECT)
             if let Some(current) = HnswMetadata::load_from_db(db, table_name, column_name)? {
                 *self = current;
                 return Ok(false); // Metadata was stale, reloaded

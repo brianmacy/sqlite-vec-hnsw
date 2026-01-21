@@ -273,15 +273,35 @@ pub fn create_hnsw_shadow_tables(
     table_name: &str,
     column_name: &str,
 ) -> Result<()> {
-    // Create metadata table
+    // Create metadata table (single row schema - much simpler than key-value)
     let meta_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_meta\" (\
-         key TEXT PRIMARY KEY, \
-         value TEXT\
+         id INTEGER PRIMARY KEY CHECK (id = 1), \
+         m INTEGER NOT NULL DEFAULT 32, \
+         max_m0 INTEGER NOT NULL DEFAULT 64, \
+         ef_construction INTEGER NOT NULL DEFAULT 400, \
+         ef_search INTEGER NOT NULL DEFAULT 200, \
+         max_level INTEGER NOT NULL DEFAULT 16, \
+         level_factor REAL NOT NULL DEFAULT 0.28768207245178085, \
+         entry_point_rowid INTEGER NOT NULL DEFAULT -1, \
+         entry_point_level INTEGER NOT NULL DEFAULT -1, \
+         num_nodes INTEGER NOT NULL DEFAULT 0, \
+         dimensions INTEGER NOT NULL DEFAULT 0, \
+         element_type TEXT NOT NULL DEFAULT 'float32', \
+         distance_metric TEXT NOT NULL DEFAULT 'l2', \
+         rng_seed INTEGER NOT NULL DEFAULT 12345, \
+         hnsw_version INTEGER NOT NULL DEFAULT 1\
          )",
         table_name, column_name
     );
     db.execute(&meta_sql, []).map_err(Error::Sqlite)?;
+
+    // Insert default metadata row (uses all defaults)
+    let insert_meta_sql = format!(
+        "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" (id) VALUES (1)",
+        table_name, column_name
+    );
+    db.execute(&insert_meta_sql, []).map_err(Error::Sqlite)?;
 
     // Create nodes table
     let nodes_sql = format!(
@@ -524,16 +544,37 @@ pub unsafe fn create_hnsw_shadow_tables_ffi(
     table_name: &str,
     column_name: &str,
 ) -> Result<()> {
-    // Create metadata table
+    // Create metadata table (single row schema - much simpler than key-value)
     let meta_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_meta\" (\
-         key TEXT PRIMARY KEY, \
-         value TEXT\
+         id INTEGER PRIMARY KEY CHECK (id = 1), \
+         m INTEGER NOT NULL DEFAULT 32, \
+         max_m0 INTEGER NOT NULL DEFAULT 64, \
+         ef_construction INTEGER NOT NULL DEFAULT 400, \
+         ef_search INTEGER NOT NULL DEFAULT 200, \
+         max_level INTEGER NOT NULL DEFAULT 16, \
+         level_factor REAL NOT NULL DEFAULT 0.28768207245178085, \
+         entry_point_rowid INTEGER NOT NULL DEFAULT -1, \
+         entry_point_level INTEGER NOT NULL DEFAULT -1, \
+         num_nodes INTEGER NOT NULL DEFAULT 0, \
+         dimensions INTEGER NOT NULL DEFAULT 0, \
+         element_type TEXT NOT NULL DEFAULT 'float32', \
+         distance_metric TEXT NOT NULL DEFAULT 'l2', \
+         rng_seed INTEGER NOT NULL DEFAULT 12345, \
+         hnsw_version INTEGER NOT NULL DEFAULT 1\
          )",
         table_name, column_name
     );
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &meta_sql)? };
+
+    // Insert default metadata row (uses all defaults)
+    let insert_meta_sql = format!(
+        "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" (id) VALUES (1)",
+        table_name, column_name
+    );
+    // SAFETY: execute_sql_ffi is called with a valid database handle
+    unsafe { execute_sql_ffi(db, &insert_meta_sql)? };
 
     // Create nodes table
     let nodes_sql = format!(

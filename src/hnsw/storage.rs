@@ -409,6 +409,77 @@ pub fn fetch_nodes_batch(
     Ok(all_nodes)
 }
 
+/// Fetch multiple nodes using cached prepared statements (FAST PATH)
+///
+/// Uses pre-compiled statements for power-of-2 batch sizes (1, 2, 4, 8, 16, 32, 64).
+/// For larger batches, processes in chunks of 64.
+///
+/// # Arguments
+/// * `stmt` - Pre-compiled statement for the batch size
+/// * `padded_size` - Number of parameters to bind (power of 2)
+/// * `rowids` - Actual rowids to fetch (may be fewer than padded_size)
+///
+/// # Safety
+/// Caller must ensure stmt is valid and has the correct number of parameters.
+#[inline]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn fetch_nodes_batch_cached(
+    stmt: *mut ffi::sqlite3_stmt,
+    padded_size: usize,
+    rowids: &[i64],
+) -> Result<Vec<HnswNode>> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    ffi::sqlite3_reset(stmt);
+
+    // Bind actual rowids
+    for (i, &rowid) in rowids.iter().enumerate() {
+        ffi::sqlite3_bind_int64(stmt, (i + 1) as i32, rowid);
+    }
+    // Pad with -1 for unused slots (won't match any rowid)
+    for i in rowids.len()..padded_size {
+        ffi::sqlite3_bind_int64(stmt, (i + 1) as i32, -1);
+    }
+
+    // Collect results
+    let mut nodes = Vec::with_capacity(rowids.len());
+    loop {
+        let rc = ffi::sqlite3_step(stmt);
+        if rc == ffi::SQLITE_ROW {
+            let rowid = ffi::sqlite3_column_int64(stmt, 0);
+            let level = ffi::sqlite3_column_int(stmt, 1);
+
+            let blob_ptr = ffi::sqlite3_column_blob(stmt, 2);
+            let blob_len = ffi::sqlite3_column_bytes(stmt, 2);
+            // Copy blob data before reset
+            let vector = if blob_len > 0 && !blob_ptr.is_null() {
+                std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+
+            nodes.push(HnswNode {
+                rowid,
+                level,
+                vector,
+            });
+        } else if rc == ffi::SQLITE_DONE {
+            break;
+        } else {
+            ffi::sqlite3_reset(stmt);
+            return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+    }
+
+    ffi::sqlite3_reset(stmt);
+    Ok(nodes)
+}
+
 /// Delete specific edges from a node at a specific level (delta update)
 /// Uses DELETE ... WHERE to_rowid IN (?, ?, ...) for efficiency
 pub fn delete_edges_batch(

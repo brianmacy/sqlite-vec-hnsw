@@ -266,30 +266,52 @@ fn test_write_for_c_compatibility() {
             |row| row.get(0),
         )
         .unwrap();
-    println!("\n📊 HNSW metadata entries: {}", meta_count);
-    assert!(meta_count > 0, "Should have metadata");
+    println!("\n📊 HNSW metadata rows: {}", meta_count);
+    assert_eq!(meta_count, 1, "Should have exactly one metadata row");
 
-    // List metadata keys
-    let mut stmt = db
-        .prepare(&format!(
-            "SELECT key, value FROM \"{}\" ORDER BY key",
-            meta_table
-        ))
-        .unwrap();
-    let metadata: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+    // Verify metadata values (single-row schema)
+    let (m, max_m0, ef_construction, ef_search, entry_point_rowid, num_nodes): (
+        i32,
+        i32,
+        i32,
+        i32,
+        i64,
+        i32,
+    ) = db
+        .query_row(
+            &format!(
+                "SELECT m, max_m0, ef_construction, ef_search, entry_point_rowid, num_nodes \
+                 FROM \"{}\" WHERE id = 1",
+                meta_table
+            ),
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
         .unwrap();
 
     println!("   Metadata:");
-    for (key, value) in metadata {
-        println!("     {} = {}", key, value);
-    }
+    println!("     m = {}", m);
+    println!("     max_m0 = {}", max_m0);
+    println!("     ef_construction = {}", ef_construction);
+    println!("     ef_search = {}", ef_search);
+    println!("     entry_point_rowid = {}", entry_point_rowid);
+    println!("     num_nodes = {}", num_nodes);
+
+    assert_eq!(m, 32, "M should be 32");
+    assert_eq!(max_m0, 64, "max_M0 should be 64");
+    assert!(num_nodes > 0, "Should have nodes indexed");
 
     println!("\n✅ Schema compatibility test passed!");
     println!("   - All expected shadow tables created");
-    println!("   - Shadow table schemas match C version");
+    println!("   - Shadow table schemas match expected");
     println!("   - HNSW metadata is populated");
-    println!("   - Database should be readable by C version");
 }

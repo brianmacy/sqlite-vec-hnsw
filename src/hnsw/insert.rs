@@ -255,6 +255,8 @@ pub struct HnswStmtCache {
     pub insert_edge: *mut rusqlite::ffi::sqlite3_stmt,
     pub delete_edges_from: *mut rusqlite::ffi::sqlite3_stmt,
     pub update_meta: *mut rusqlite::ffi::sqlite3_stmt,
+    /// Single batch fetch statement with 64 placeholders (pad unused with -1)
+    pub batch_fetch_nodes: *mut rusqlite::ffi::sqlite3_stmt,
 }
 
 /// Insert a vector into the HNSW index
@@ -334,6 +336,11 @@ pub fn insert_hnsw(
     let search_stmt_cache = stmt_cache.map(|c| search::SearchStmtCache {
         get_node_data: Some(c.get_node_data),
         get_edges: Some(c.get_edges),
+        batch_fetch_nodes: if c.batch_fetch_nodes.is_null() {
+            None
+        } else {
+            Some(c.batch_fetch_nodes)
+        },
     });
     let search_stmt_cache_ref = search_stmt_cache.as_ref();
 

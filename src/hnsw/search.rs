@@ -10,11 +10,108 @@ use crate::hnsw::storage;
 use crate::vector::Vector;
 use rusqlite::{Connection, ffi};
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Timing counters for search_layer breakdown
+static SEARCH_FETCH_EDGES_TIME: AtomicU64 = AtomicU64::new(0);
+static SEARCH_FETCH_NODES_TIME: AtomicU64 = AtomicU64::new(0);
+static SEARCH_DISTANCE_TIME: AtomicU64 = AtomicU64::new(0);
+static SEARCH_HEAP_TIME: AtomicU64 = AtomicU64::new(0);
+static SEARCH_VISITED_TIME: AtomicU64 = AtomicU64::new(0);
+static SEARCH_FROM_BLOB_TIME: AtomicU64 = AtomicU64::new(0);
+static SEARCH_LOOP_ITERATIONS: AtomicU64 = AtomicU64::new(0);
+static SEARCH_NEIGHBORS_FETCHED: AtomicU64 = AtomicU64::new(0);
+static SEARCH_DISTANCES_COMPUTED: AtomicU64 = AtomicU64::new(0);
+// Batch size distribution buckets: 1-4, 5-16, 17-32, 33-64, 65+
+static BATCH_SIZE_1_4: AtomicU64 = AtomicU64::new(0);
+static BATCH_SIZE_5_16: AtomicU64 = AtomicU64::new(0);
+static BATCH_SIZE_17_32: AtomicU64 = AtomicU64::new(0);
+static BATCH_SIZE_33_64: AtomicU64 = AtomicU64::new(0);
+static BATCH_SIZE_65_PLUS: AtomicU64 = AtomicU64::new(0);
+static BATCH_FETCH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn print_search_timing_stats() {
+    eprintln!("\n=== SEARCH_LAYER BREAKDOWN ===");
+    eprintln!(
+        "  fetch_edges:    {}ms",
+        SEARCH_FETCH_EDGES_TIME.load(Ordering::Relaxed) / 1000
+    );
+    eprintln!(
+        "  fetch_nodes:    {}ms",
+        SEARCH_FETCH_NODES_TIME.load(Ordering::Relaxed) / 1000
+    );
+    eprintln!(
+        "  visited_check:  {}ms",
+        SEARCH_VISITED_TIME.load(Ordering::Relaxed) / 1000
+    );
+    eprintln!(
+        "  loop_iters:     {}",
+        SEARCH_LOOP_ITERATIONS.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  neighbors:      {}",
+        SEARCH_NEIGHBORS_FETCHED.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  distances:      {}",
+        SEARCH_DISTANCES_COMPUTED.load(Ordering::Relaxed)
+    );
+
+    let total_batches = BATCH_FETCH_CALLS.load(Ordering::Relaxed);
+    if total_batches > 0 {
+        eprintln!("\n  Batch size distribution ({} fetches):", total_batches);
+        eprintln!(
+            "    1-4:    {} ({:.1}%)",
+            BATCH_SIZE_1_4.load(Ordering::Relaxed),
+            BATCH_SIZE_1_4.load(Ordering::Relaxed) as f64 / total_batches as f64 * 100.0
+        );
+        eprintln!(
+            "    5-16:   {} ({:.1}%)",
+            BATCH_SIZE_5_16.load(Ordering::Relaxed),
+            BATCH_SIZE_5_16.load(Ordering::Relaxed) as f64 / total_batches as f64 * 100.0
+        );
+        eprintln!(
+            "    17-32:  {} ({:.1}%)",
+            BATCH_SIZE_17_32.load(Ordering::Relaxed),
+            BATCH_SIZE_17_32.load(Ordering::Relaxed) as f64 / total_batches as f64 * 100.0
+        );
+        eprintln!(
+            "    33-64:  {} ({:.1}%)",
+            BATCH_SIZE_33_64.load(Ordering::Relaxed),
+            BATCH_SIZE_33_64.load(Ordering::Relaxed) as f64 / total_batches as f64 * 100.0
+        );
+        eprintln!(
+            "    65+:    {} ({:.1}%)",
+            BATCH_SIZE_65_PLUS.load(Ordering::Relaxed),
+            BATCH_SIZE_65_PLUS.load(Ordering::Relaxed) as f64 / total_batches as f64 * 100.0
+        );
+    }
+}
+
+pub fn reset_search_timing_stats() {
+    SEARCH_FETCH_EDGES_TIME.store(0, Ordering::Relaxed);
+    SEARCH_FETCH_NODES_TIME.store(0, Ordering::Relaxed);
+    SEARCH_DISTANCE_TIME.store(0, Ordering::Relaxed);
+    SEARCH_HEAP_TIME.store(0, Ordering::Relaxed);
+    SEARCH_VISITED_TIME.store(0, Ordering::Relaxed);
+    SEARCH_FROM_BLOB_TIME.store(0, Ordering::Relaxed);
+    SEARCH_LOOP_ITERATIONS.store(0, Ordering::Relaxed);
+    SEARCH_NEIGHBORS_FETCHED.store(0, Ordering::Relaxed);
+    SEARCH_DISTANCES_COMPUTED.store(0, Ordering::Relaxed);
+    BATCH_SIZE_1_4.store(0, Ordering::Relaxed);
+    BATCH_SIZE_5_16.store(0, Ordering::Relaxed);
+    BATCH_SIZE_17_32.store(0, Ordering::Relaxed);
+    BATCH_SIZE_33_64.store(0, Ordering::Relaxed);
+    BATCH_SIZE_65_PLUS.store(0, Ordering::Relaxed);
+    BATCH_FETCH_CALLS.store(0, Ordering::Relaxed);
+}
 
 /// Cached statement pointers for search operations
 pub struct SearchStmtCache {
     pub get_node_data: Option<*mut ffi::sqlite3_stmt>,
     pub get_edges: Option<*mut ffi::sqlite3_stmt>,
+    /// Single batch fetch statement with 64 placeholders (pad unused with -1)
+    pub batch_fetch_nodes: Option<*mut ffi::sqlite3_stmt>,
 }
 
 /// Search context to reduce parameter count
@@ -188,6 +285,7 @@ pub fn search_layer(
         ctx.metadata.element_type,
         ctx.metadata.dimensions as usize,
     )?;
+
     let entry_dist = distance::distance(ctx.query_vec, &entry_vec, ctx.metadata.distance_metric)?;
 
     candidates.push(MinCandidate {
@@ -204,6 +302,7 @@ pub fn search_layer(
 
     // Main search loop
     while let Some(candidate) = candidates.pop() {
+
         // If closest unexplored candidate is farther than our worst result, we're done
         if let Some(worst) = results.peek()
             && candidate.distance > worst.distance
@@ -239,13 +338,37 @@ pub fn search_layer(
             continue;
         }
 
-        // BATCH FETCH: Get ONLY unvisited neighbor nodes (expensive, but minimized set)
-        let neighbor_nodes = storage::fetch_nodes_batch(
-            ctx.db,
-            ctx.table_name,
-            ctx.column_name,
-            &unvisited_neighbors,
-        )?;
+        SEARCH_NEIGHBORS_FETCHED.fetch_add(unvisited_neighbors.len() as u64, Ordering::Relaxed);
+
+        // Track batch size distribution
+        BATCH_FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        let batch_size = unvisited_neighbors.len();
+        match batch_size {
+            1..=4 => BATCH_SIZE_1_4.fetch_add(1, Ordering::Relaxed),
+            5..=16 => BATCH_SIZE_5_16.fetch_add(1, Ordering::Relaxed),
+            17..=32 => BATCH_SIZE_17_32.fetch_add(1, Ordering::Relaxed),
+            33..=64 => BATCH_SIZE_33_64.fetch_add(1, Ordering::Relaxed),
+            _ => BATCH_SIZE_65_PLUS.fetch_add(1, Ordering::Relaxed),
+        };
+
+        // BATCH FETCH: Get ONLY unvisited neighbor nodes
+        // Use cached statement (16 placeholders) for fast path, fallback to dynamic SQL
+        let neighbor_nodes =
+            if let Some(stmt) = ctx.stmt_cache.and_then(|c| c.batch_fetch_nodes).filter(|s| !s.is_null())
+            {
+                // Fast path: use cached prepared statement with 16 placeholders
+                let mut all_nodes = Vec::with_capacity(unvisited_neighbors.len());
+                for chunk in unvisited_neighbors.chunks(16) {
+                    unsafe {
+                        let nodes = storage::fetch_nodes_batch_cached(stmt, 16, chunk)?;
+                        all_nodes.extend(nodes);
+                    }
+                }
+                all_nodes
+            } else {
+                // Slow path: dynamic SQL (fallback for tests without cache)
+                storage::fetch_nodes_batch(ctx.db, ctx.table_name, ctx.column_name, &unvisited_neighbors)?
+            };
 
         for neighbor_node in neighbor_nodes {
             let neighbor_vec = Vector::from_blob(
@@ -253,6 +376,7 @@ pub fn search_layer(
                 ctx.metadata.element_type,
                 ctx.metadata.dimensions as usize,
             )?;
+
             let neighbor_dist =
                 distance::distance(ctx.query_vec, &neighbor_vec, ctx.metadata.distance_metric)?;
 

@@ -79,24 +79,24 @@ fn test_vec_rebuild_hnsw_with_params() {
     assert!(result.contains("Rebuilt HNSW index"));
     assert!(result.contains("5 vectors"));
 
-    // Verify the new parameters were set in metadata
-    let m_value: String = db
+    // Verify the new parameters were set in metadata (single-row schema)
+    let m_value: i32 = db
         .query_row(
-            "SELECT value FROM docs_embedding_hnsw_meta WHERE key='M'",
+            "SELECT m FROM docs_embedding_hnsw_meta WHERE id = 1",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(m_value, "16");
+    assert_eq!(m_value, 16);
 
-    let ef_value: String = db
+    let ef_value: i32 = db
         .query_row(
-            "SELECT value FROM docs_embedding_hnsw_meta WHERE key='ef_construction'",
+            "SELECT ef_construction FROM docs_embedding_hnsw_meta WHERE id = 1",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(ef_value, "200");
+    assert_eq!(ef_value, 200);
 }
 
 #[test]

@@ -8,20 +8,24 @@ use crate::vector::Vector;
 use simsimd::{BinarySimilarity, SpatialSimilarity};
 
 /// L2 distance for Float32 vectors
+#[inline]
 pub fn distance_l2_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
-    let a_vals = a.as_f32()?;
-    let b_vals = b.as_f32()?;
+    // Zero-copy: reinterpret bytes as f32 slice without allocation
+    let a_vals = a.as_f32_slice();
+    let b_vals = b.as_f32_slice();
 
-    let distance = f32::sqeuclidean(&a_vals, &b_vals)
+    let distance = f32::sqeuclidean(a_vals, b_vals)
         .ok_or_else(|| Error::InvalidParameter("L2 distance calculation failed".to_string()))?;
 
-    Ok(distance.sqrt() as f32)
+    Ok((distance as f32).sqrt())
 }
 
 /// L1 distance for Float32 vectors
+#[inline]
 pub fn distance_l1_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
-    let a_vals = a.as_f32()?;
-    let b_vals = b.as_f32()?;
+    // Zero-copy: reinterpret bytes as f32 slice without allocation
+    let a_vals = a.as_f32_slice();
+    let b_vals = b.as_f32_slice();
 
     // simsimd doesn't have L1, so implement manually
     let distance: f32 = a_vals
@@ -34,23 +38,27 @@ pub fn distance_l1_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 }
 
 /// Cosine distance for Float32 vectors
+#[inline]
 pub fn distance_cosine_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
-    let a_vals = a.as_f32()?;
-    let b_vals = b.as_f32()?;
+    // Zero-copy: reinterpret bytes as f32 slice without allocation
+    let a_vals = a.as_f32_slice();
+    let b_vals = b.as_f32_slice();
 
     // simsimd::cosine() returns cosine distance (1 - similarity) directly
-    let distance = f32::cosine(&a_vals, &b_vals)
+    let distance = f32::cosine(a_vals, b_vals)
         .ok_or_else(|| Error::InvalidParameter("Cosine distance calculation failed".to_string()))?;
 
     Ok(distance as f32)
 }
 
 /// L2 distance for Int8 vectors
+#[inline]
 pub fn distance_l2_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
-    let a_vals = a.as_i8()?;
-    let b_vals = b.as_i8()?;
+    // Zero-copy: reinterpret bytes as i8 slice without allocation
+    let a_vals = a.as_i8_slice();
+    let b_vals = b.as_i8_slice();
 
-    let distance = i8::sqeuclidean(&a_vals, &b_vals).ok_or_else(|| {
+    let distance = i8::sqeuclidean(a_vals, b_vals).ok_or_else(|| {
         Error::InvalidParameter("L2 distance (Int8) calculation failed".to_string())
     })?;
 
@@ -58,9 +66,11 @@ pub fn distance_l2_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 }
 
 /// L1 distance for Int8 vectors
+#[inline]
 pub fn distance_l1_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
-    let a_vals = a.as_i8()?;
-    let b_vals = b.as_i8()?;
+    // Zero-copy: reinterpret bytes as i8 slice without allocation
+    let a_vals = a.as_i8_slice();
+    let b_vals = b.as_i8_slice();
 
     // simsimd doesn't have L1 for i8, so implement manually
     let distance: i32 = a_vals
@@ -73,7 +83,9 @@ pub fn distance_l1_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 }
 
 /// Hamming distance for binary vectors
+#[inline]
 pub fn distance_hamming_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+    // as_bytes() is already zero-copy
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
 

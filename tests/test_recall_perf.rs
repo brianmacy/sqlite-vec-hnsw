@@ -17,19 +17,11 @@ fn test_with_params(ef_construction: i32, ef_search: i32) -> (f64, f64, f64, f64
     )
     .unwrap();
 
-    // Update HNSW parameters
+    // Update HNSW parameters (single-row schema)
     db.execute(
         &format!(
-            "UPDATE test_hnsw_embedding_hnsw_meta SET value = '{}' WHERE key = 'ef_construction'",
-            ef_construction
-        ),
-        [],
-    )
-    .unwrap();
-    db.execute(
-        &format!(
-            "UPDATE test_hnsw_embedding_hnsw_meta SET value = '{}' WHERE key = 'ef_search'",
-            ef_search
+            "UPDATE test_hnsw_embedding_hnsw_meta SET ef_construction = {}, ef_search = {} WHERE id = 1",
+            ef_construction, ef_search
         ),
         [],
     )

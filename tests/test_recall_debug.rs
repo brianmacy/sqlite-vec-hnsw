@@ -26,18 +26,21 @@ fn test_simple_hnsw_recall_4d() {
         println!("Inserted rowid {} with vec {:?}", i, vec);
     }
 
-    // Check HNSW metadata
+    // Check HNSW metadata (single-row schema)
     println!("\n=== HNSW Metadata ===");
-    let meta: Vec<(String, String)> = db
-        .prepare("SELECT key, value FROM vectors_embedding_hnsw_meta")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
+    let (m, ef_construction, ef_search, entry_point_rowid, num_nodes): (i32, i32, i32, i64, i32) = db
+        .query_row(
+            "SELECT m, ef_construction, ef_search, entry_point_rowid, num_nodes \
+             FROM vectors_embedding_hnsw_meta WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
         .unwrap();
-    for (k, v) in &meta {
-        println!("  {}: {}", k, v);
-    }
+    println!("  m: {}", m);
+    println!("  ef_construction: {}", ef_construction);
+    println!("  ef_search: {}", ef_search);
+    println!("  entry_point_rowid: {}", entry_point_rowid);
+    println!("  num_nodes: {}", num_nodes);
 
     // Check HNSW nodes
     println!("\n=== HNSW Nodes ===");
@@ -184,8 +187,8 @@ fn test_hnsw_recall_128d_100v() {
 
         // Check metadata after first insert
         if idx == 0 {
-            let num_nodes: Result<i64, _> = db.query_row(
-                "SELECT value FROM vectors_embedding_hnsw_meta WHERE key = 'num_nodes'",
+            let num_nodes: Result<i32, _> = db.query_row(
+                "SELECT num_nodes FROM vectors_embedding_hnsw_meta WHERE id = 1",
                 [],
                 |row| row.get(0),
             );
@@ -229,28 +232,15 @@ fn test_hnsw_recall_128d_100v() {
         32 * 2
     );
 
-    // Check metadata (values are stored as TEXT)
-    let entry_point: String = db
+    // Check metadata (single-row schema)
+    let (entry_point, entry_level, num_nodes): (i64, i32, i32) = db
         .query_row(
-            "SELECT value FROM vectors_embedding_hnsw_meta WHERE key = 'entry_point_rowid'",
+            "SELECT entry_point_rowid, entry_point_level, num_nodes \
+             FROM vectors_embedding_hnsw_meta WHERE id = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .unwrap_or_else(|_| "-1".to_string());
-    let num_nodes: String = db
-        .query_row(
-            "SELECT value FROM vectors_embedding_hnsw_meta WHERE key = 'num_nodes'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| "0".to_string());
-    let entry_level: String = db
-        .query_row(
-            "SELECT value FROM vectors_embedding_hnsw_meta WHERE key = 'entry_point_level'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| "0".to_string());
+        .unwrap_or((-1, 0, 0));
     println!(
         "HNSW entry_point: {}, entry_level: {}, num_nodes: {}",
         entry_point, entry_level, num_nodes
@@ -262,7 +252,7 @@ fn test_hnsw_recall_128d_100v() {
 
     // HNSW search (use ef_search = 400 for better recall)
     db.execute(
-        "UPDATE vectors_embedding_hnsw_meta SET value = '400' WHERE key = 'ef_search'",
+        "UPDATE vectors_embedding_hnsw_meta SET ef_search = 400 WHERE id = 1",
         [],
     )
     .ok();
