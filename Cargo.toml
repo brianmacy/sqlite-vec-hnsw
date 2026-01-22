@@ -22,6 +22,7 @@ thiserror = "1.0"
 simsimd = "6.3"
 bytemuck = { version = "1.14", features = ["derive"] }
 regex = "1"
+fixedbitset = "0.5"
 
 [features]
 default = []

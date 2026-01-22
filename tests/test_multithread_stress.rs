@@ -7,12 +7,48 @@
 // - busy_timeout prevents SQLITE_BUSY errors during contention
 
 use rusqlite::Connection;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// Path to real-world embeddings extracted from opensanctions database
+const EMBEDDINGS_FILE: &str = "test_data/opensanctions_embeddings.jsonl";
+
+/// Load vectors from JSONL file (one JSON array per line)
+fn load_embeddings(max_vectors: usize) -> Vec<Vec<f32>> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let path = format!("{}/{}", manifest_dir, EMBEDDINGS_FILE);
+
+    let file = File::open(&path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to open embeddings file {}: {}\nRun 'cargo run --bin extract_embeddings' first",
+            path, e
+        )
+    });
+
+    let reader = BufReader::new(file);
+    let mut vectors = Vec::with_capacity(max_vectors);
+
+    for line in reader.lines().take(max_vectors) {
+        let line = line.expect("Failed to read line");
+        let vec: Vec<f32> = serde_json::from_str(&line).expect("Failed to parse JSON array");
+        vectors.push(vec);
+    }
+
+    println!(
+        "Loaded {} vectors of {} dimensions from {}",
+        vectors.len(),
+        vectors.first().map(|v| v.len()).unwrap_or(0),
+        EMBEDDINGS_FILE
+    );
+
+    vectors
+}
 
 /// Configuration for the stress test
 struct StressConfig {
@@ -32,7 +68,7 @@ impl Default for StressConfig {
             num_search_threads: 8,
             vectors_per_insert_thread: 2000,
             searches_per_search_thread: 5000,
-            vector_dimensions: 128,
+            vector_dimensions: 384, // Real embeddings are 384D
             k_neighbors: 20,
             busy_timeout_ms: 300000, // 5 minutes to handle extreme contention
         }
@@ -69,7 +105,8 @@ fn open_connection(db_path: &PathBuf, busy_timeout_ms: u32) -> Result<Connection
     Ok(db)
 }
 
-/// Generate a deterministic test vector based on index
+/// Generate a deterministic test vector based on index (fallback only)
+#[allow(dead_code)]
 fn generate_vector(index: usize, dimensions: usize) -> Vec<f32> {
     (0..dimensions)
         .map(|j| ((index * dimensions + j) % 10000) as f32 / 10000.0)
@@ -95,6 +132,7 @@ fn insert_worker(
     config: Arc<StressConfig>,
     stats: Arc<StressStats>,
     stop_flag: Arc<AtomicBool>,
+    vectors: Arc<Vec<Vec<f32>>>,
 ) {
     let db = match open_connection(&db_path, config.busy_timeout_ms) {
         Ok(db) => db,
@@ -115,8 +153,8 @@ fn insert_worker(
         }
 
         let rowid = base_rowid + i;
-        let vector = generate_vector(rowid, config.vector_dimensions);
-        let vector_json = vector_to_json(&vector);
+        let vector_idx = (rowid - 1) % vectors.len();
+        let vector_json = vector_to_json(&vectors[vector_idx]);
 
         let sql = format!(
             "INSERT INTO vectors(rowid, embedding) VALUES ({}, vec_f32('{}'))",
@@ -145,6 +183,7 @@ fn search_worker(
     config: Arc<StressConfig>,
     stats: Arc<StressStats>,
     stop_flag: Arc<AtomicBool>,
+    vectors: Arc<Vec<Vec<f32>>>,
 ) {
     let db = match open_connection(&db_path, config.busy_timeout_ms) {
         Ok(db) => db,
@@ -163,9 +202,9 @@ fn search_worker(
             break;
         }
 
-        // Generate query vector based on iteration
-        let query_vector = generate_vector(i * 7 + thread_id, config.vector_dimensions);
-        let vector_json = vector_to_json(&query_vector);
+        // Use real vectors for queries
+        let vector_idx = (i * 7 + thread_id) % vectors.len();
+        let vector_json = vector_to_json(&vectors[vector_idx]);
 
         let sql = format!(
             "SELECT rowid, distance FROM vectors WHERE embedding MATCH vec_f32('{}') AND k = {} ORDER BY distance",
@@ -214,7 +253,13 @@ fn test_multithread_insert_search_stress() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("stress_test.db");
 
-    println!("\n=== Multi-threaded Insert/Search Stress Test ===\n");
+    println!("\n=== Multi-threaded Insert/Search Stress Test (Real Embeddings) ===\n");
+
+    let config = Arc::new(StressConfig::default());
+
+    // Load real embeddings
+    let total_vectors_needed = config.num_insert_threads * config.vectors_per_insert_thread;
+    let vectors = Arc::new(load_embeddings(total_vectors_needed.min(50214)));
 
     // Setup: 16k pages + WAL for concurrent access
     {
@@ -240,27 +285,33 @@ fn test_multithread_insert_search_stress() {
             "WAL mode required for concurrent access"
         );
 
-        // Create table with HNSW enabled
+        // Create table with HNSW enabled - 384D for real embeddings
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw())",
+            &format!(
+                "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[{}] hnsw(distance=cosine))",
+                config.vector_dimensions
+            ),
             [],
         )
         .unwrap();
 
-        println!("Created vectors table with 128D embeddings");
+        println!(
+            "Created vectors table with {}D embeddings",
+            config.vector_dimensions
+        );
     }
 
-    let config = Arc::new(StressConfig::default());
     let stats = Arc::new(StressStats::default());
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     println!(
-        "\nConfiguration:\n  Insert threads: {}\n  Search threads: {}\n  Vectors per insert thread: {}\n  Searches per search thread: {}\n  Total vectors to insert: {}\n",
+        "\nConfiguration:\n  Insert threads: {}\n  Search threads: {}\n  Vectors per insert thread: {}\n  Searches per search thread: {}\n  Total vectors to insert: {}\n  Vector dimensions: {}\n",
         config.num_insert_threads,
         config.num_search_threads,
         config.vectors_per_insert_thread,
         config.searches_per_search_thread,
-        config.num_insert_threads * config.vectors_per_insert_thread
+        config.num_insert_threads * config.vectors_per_insert_thread,
+        config.vector_dimensions
     );
 
     let start = Instant::now();
@@ -273,9 +324,10 @@ fn test_multithread_insert_search_stress() {
         let config = Arc::clone(&config);
         let stats = Arc::clone(&stats);
         let stop_flag = Arc::clone(&stop_flag);
+        let vectors = Arc::clone(&vectors);
 
         handles.push(thread::spawn(move || {
-            insert_worker(db_path, thread_id, config, stats, stop_flag);
+            insert_worker(db_path, thread_id, config, stats, stop_flag, vectors);
         }));
     }
 
@@ -285,9 +337,10 @@ fn test_multithread_insert_search_stress() {
         let config = Arc::clone(&config);
         let stats = Arc::clone(&stats);
         let stop_flag = Arc::clone(&stop_flag);
+        let vectors = Arc::clone(&vectors);
 
         handles.push(thread::spawn(move || {
-            search_worker(db_path, thread_id, config, stats, stop_flag);
+            search_worker(db_path, thread_id, config, stats, stop_flag, vectors);
         }));
     }
 
@@ -353,8 +406,8 @@ fn test_multithread_insert_search_stress() {
     println!("HNSW edges: {}", edge_count);
 
     // Verify a KNN query works correctly after all the stress
-    let query_vector = generate_vector(500, config.vector_dimensions);
-    let vector_json = vector_to_json(&query_vector);
+    let query_vector = &vectors[500 % vectors.len()];
+    let vector_json = vector_to_json(query_vector);
 
     let sql = format!(
         "SELECT rowid, distance FROM vectors WHERE embedding MATCH vec_f32('{}') AND k = 10 ORDER BY distance",
@@ -398,7 +451,21 @@ fn test_multithread_heavy_contention() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("contention_test.db");
 
-    println!("\n=== BRUTAL Heavy Contention Test ===\n");
+    println!("\n=== BRUTAL Heavy Contention Test (Real Embeddings) ===\n");
+
+    let config = Arc::new(StressConfig {
+        num_insert_threads: 20,
+        num_search_threads: 12,
+        vectors_per_insert_thread: 1500,
+        searches_per_search_thread: 5000,
+        vector_dimensions: 384, // Real embeddings are 384D
+        k_neighbors: 20,
+        busy_timeout_ms: 300000,
+    });
+
+    // Load real embeddings
+    let total_vectors_needed = config.num_insert_threads * config.vectors_per_insert_thread;
+    let vectors = Arc::new(load_embeddings(total_vectors_needed.min(50214)));
 
     // Setup with WAL mode for concurrent access
     {
@@ -416,28 +483,21 @@ fn test_multithread_heavy_contention() {
         sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[64] hnsw())",
+            &format!(
+                "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[{}] hnsw(distance=cosine))",
+                config.vector_dimensions
+            ),
             [],
         )
         .unwrap();
     }
 
-    let config = Arc::new(StressConfig {
-        num_insert_threads: 20,
-        num_search_threads: 12,
-        vectors_per_insert_thread: 1500,
-        searches_per_search_thread: 5000,
-        vector_dimensions: 64,
-        k_neighbors: 20,
-        busy_timeout_ms: 300000,
-    });
-
     let stats = Arc::new(StressStats::default());
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     println!(
-        "Running {} insert threads + {} search threads concurrently",
-        config.num_insert_threads, config.num_search_threads
+        "Running {} insert threads + {} search threads concurrently ({}D vectors)",
+        config.num_insert_threads, config.num_search_threads, config.vector_dimensions
     );
 
     let start = Instant::now();
@@ -450,8 +510,9 @@ fn test_multithread_heavy_contention() {
             let config = Arc::clone(&config);
             let stats = Arc::clone(&stats);
             let stop_flag = Arc::clone(&stop_flag);
+            let vectors = Arc::clone(&vectors);
             handles.push(thread::spawn(move || {
-                insert_worker(db_path, thread_id, config, stats, stop_flag);
+                insert_worker(db_path, thread_id, config, stats, stop_flag, vectors);
             }));
         }
 
@@ -460,8 +521,9 @@ fn test_multithread_heavy_contention() {
             let config = Arc::clone(&config);
             let stats = Arc::clone(&stats);
             let stop_flag = Arc::clone(&stop_flag);
+            let vectors = Arc::clone(&vectors);
             handles.push(thread::spawn(move || {
-                search_worker(db_path, thread_id, config, stats, stop_flag);
+                search_worker(db_path, thread_id, config, stats, stop_flag, vectors);
             }));
         }
     }
@@ -504,8 +566,21 @@ fn test_multithread_long_running() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("longrun_test.db");
 
-    println!("\n=== 60-Second Stress Test Baseline ===\n");
-    println!("Config: 16 insert threads, 4 search threads, 128D vectors, k=50\n");
+    println!("\n=== 60-Second Stress Test (Real Embeddings) ===\n");
+    println!("Config: 16 insert threads, 4 search threads, 384D vectors, k=50\n");
+
+    let config = Arc::new(StressConfig {
+        num_insert_threads: 16,
+        num_search_threads: 4,
+        vectors_per_insert_thread: 100000, // High limit - time will stop us
+        searches_per_search_thread: 100000, // High limit - time will stop us
+        vector_dimensions: 384,            // Real embeddings are 384D
+        k_neighbors: 50,
+        busy_timeout_ms: 120000,
+    });
+
+    // Load all available embeddings (50k) - will cycle through for longer tests
+    let vectors = Arc::new(load_embeddings(50214));
 
     // Setup - WAL mode for concurrent access
     // 16k pages may help with WITHOUT ROWID clustered edges (M=64 = ~1KB per node)
@@ -524,21 +599,14 @@ fn test_multithread_long_running() {
         sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw())",
+            &format!(
+                "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[{}] hnsw(distance=cosine))",
+                config.vector_dimensions
+            ),
             [],
         )
         .unwrap();
     }
-
-    let config = Arc::new(StressConfig {
-        num_insert_threads: 16,
-        num_search_threads: 4,
-        vectors_per_insert_thread: 100000, // High limit - time will stop us
-        searches_per_search_thread: 100000, // High limit - time will stop us
-        vector_dimensions: 128,
-        k_neighbors: 50,
-        busy_timeout_ms: 120000,
-    });
 
     let stats = Arc::new(StressStats::default());
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -552,8 +620,9 @@ fn test_multithread_long_running() {
         let config = Arc::clone(&config);
         let stats = Arc::clone(&stats);
         let stop_flag = Arc::clone(&stop_flag);
+        let vectors = Arc::clone(&vectors);
         handles.push(thread::spawn(move || {
-            insert_worker(db_path, thread_id, config, stats, stop_flag);
+            insert_worker(db_path, thread_id, config, stats, stop_flag, vectors);
         }));
     }
 
@@ -563,8 +632,9 @@ fn test_multithread_long_running() {
         let config = Arc::clone(&config);
         let stats = Arc::clone(&stats);
         let stop_flag = Arc::clone(&stop_flag);
+        let vectors = Arc::clone(&vectors);
         handles.push(thread::spawn(move || {
-            search_worker(db_path, thread_id, config, stats, stop_flag);
+            search_worker(db_path, thread_id, config, stats, stop_flag, vectors);
         }));
     }
 

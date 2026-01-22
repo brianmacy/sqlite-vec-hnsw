@@ -323,12 +323,13 @@ pub fn insert_edge(
 }
 
 /// Insert multiple edges in a single batch operation
-/// Uses multi-row INSERT for efficiency: INSERT INTO edges VALUES (?,?,?),(?,?,?),...
+/// Uses multi-row INSERT for efficiency: INSERT INTO edges VALUES (?,?,?,?),(?,?,?,?),...
+/// Now includes distance for O(1) prune operations
 pub fn insert_edges_batch(
     db: &Connection,
     table_name: &str,
     column_name: &str,
-    edges: &[(i64, i64, i32)], // (from_rowid, to_rowid, level)
+    edges: &[(i64, i64, i32, f32)], // (from_rowid, to_rowid, level, distance)
 ) -> Result<()> {
     if edges.is_empty() {
         return Ok(());
@@ -336,23 +337,24 @@ pub fn insert_edges_batch(
 
     let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
 
-    // Build multi-row INSERT: INSERT OR IGNORE INTO edges (from_rowid, to_rowid, level) VALUES (?,?,?),(?,?,?),...
-    // SQLite supports up to 999 parameters, so batch in chunks of 333 edges (3 params each)
-    const MAX_EDGES_PER_BATCH: usize = 333;
+    // Build multi-row INSERT: INSERT OR IGNORE INTO edges (from_rowid, to_rowid, level, distance) VALUES (?,?,?,?),(?,?,?,?),...
+    // SQLite supports up to 999 parameters, so batch in chunks of 249 edges (4 params each)
+    const MAX_EDGES_PER_BATCH: usize = 249;
 
     for chunk in edges.chunks(MAX_EDGES_PER_BATCH) {
-        let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "(?,?,?)").collect();
+        let placeholders: Vec<&str> = (0..chunk.len()).map(|_| "(?,?,?,?)").collect();
         let sql = format!(
-            "INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES {}",
+            "INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level, distance) VALUES {}",
             edges_table,
             placeholders.join(",")
         );
 
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
-        for (from_rowid, to_rowid, level) in chunk {
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 4);
+        for (from_rowid, to_rowid, level, distance) in chunk {
             params.push((*from_rowid).into());
             params.push((*to_rowid).into());
             params.push((*level as i64).into());
+            params.push((*distance as f64).into());
         }
 
         db.execute(&sql, rusqlite::params_from_iter(params))

@@ -80,11 +80,7 @@ fn test_disk_persistence_across_connections() {
             .split(',')
             .map(|s| s.trim().parse::<f32>().unwrap())
             .collect();
-        assert_eq!(
-            floats.len(),
-            128,
-            "Vector should have 128 float32 values"
-        );
+        assert_eq!(floats.len(), 128, "Vector should have 128 float32 values");
         println!("✓ Can read vectors from disk");
 
         // Verify HNSW index persists

@@ -378,7 +378,8 @@ pub fn create_hnsw_shadow_tables(
          distance_metric TEXT NOT NULL DEFAULT 'l2', \
          rng_seed INTEGER NOT NULL DEFAULT 12345, \
          hnsw_version INTEGER NOT NULL DEFAULT 1, \
-         index_quantization TEXT NOT NULL DEFAULT 'none'\
+         index_quantization TEXT NOT NULL DEFAULT 'none', \
+         normalize_vectors INTEGER NOT NULL DEFAULT 1\
          )",
         table_name, column_name
     );
@@ -405,11 +406,13 @@ pub fn create_hnsw_shadow_tables(
 
     // Create edges table - WITHOUT ROWID clusters edges by (from_rowid, level)
     // for efficient neighbor lookups. No separate index needed.
+    // Distance column enables O(1) prune without vector fetching.
     let edges_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
          from_rowid INTEGER NOT NULL, \
          to_rowid INTEGER NOT NULL, \
          level INTEGER NOT NULL, \
+         distance REAL NOT NULL DEFAULT 0.0, \
          PRIMARY KEY (from_rowid, level, to_rowid)\
          ) WITHOUT ROWID",
         table_name, column_name
@@ -702,7 +705,8 @@ pub unsafe fn create_hnsw_shadow_tables_with_metadata_ffi(
          distance_metric TEXT NOT NULL DEFAULT 'l2', \
          rng_seed INTEGER NOT NULL DEFAULT 12345, \
          hnsw_version INTEGER NOT NULL DEFAULT 1, \
-         index_quantization TEXT NOT NULL DEFAULT 'none'\
+         index_quantization TEXT NOT NULL DEFAULT 'none', \
+         normalize_vectors INTEGER NOT NULL DEFAULT 1\
          )",
         table_name, column_name
     );
@@ -716,17 +720,24 @@ pub unsafe fn create_hnsw_shadow_tables_with_metadata_ffi(
     let rng_seed = random_state.hash_one(std::time::SystemTime::now()) as i64;
 
     // Insert metadata row with actual column values
+    // normalize_vectors is 1 (true) for cosine distance to enable L2 internal optimization
+    let normalize_vectors = if distance_metric == crate::distance::DistanceMetric::Cosine {
+        1
+    } else {
+        0
+    };
     let insert_meta_sql = format!(
         "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" \
-         (id, dimensions, element_type, distance_metric, index_quantization, rng_seed) \
-         VALUES (1, {}, '{}', '{}', '{}', {})",
+         (id, dimensions, element_type, distance_metric, index_quantization, rng_seed, normalize_vectors) \
+         VALUES (1, {}, '{}', '{}', '{}', {}, {})",
         table_name,
         column_name,
         dimensions,
         element_type.as_str(),
         distance_metric.as_str(),
         index_quantization.as_str(),
-        rng_seed
+        rng_seed,
+        normalize_vectors
     );
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &insert_meta_sql)? };
@@ -746,11 +757,13 @@ pub unsafe fn create_hnsw_shadow_tables_with_metadata_ffi(
 
     // Create edges table - WITHOUT ROWID clusters edges by (from_rowid, level)
     // for efficient neighbor lookups. No separate index needed.
+    // Distance column enables O(1) prune without vector fetching.
     let edges_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
          from_rowid INTEGER NOT NULL, \
          to_rowid INTEGER NOT NULL, \
          level INTEGER NOT NULL, \
+         distance REAL NOT NULL DEFAULT 0.0, \
          PRIMARY KEY (from_rowid, level, to_rowid)\
          ) WITHOUT ROWID",
         table_name, column_name
@@ -821,7 +834,8 @@ pub unsafe fn create_hnsw_shadow_tables_with_params_ffi(
          distance_metric TEXT NOT NULL DEFAULT 'l2', \
          rng_seed INTEGER NOT NULL DEFAULT 12345, \
          hnsw_version INTEGER NOT NULL DEFAULT 1, \
-         index_quantization TEXT NOT NULL DEFAULT 'none'\
+         index_quantization TEXT NOT NULL DEFAULT 'none', \
+         normalize_vectors INTEGER NOT NULL DEFAULT 1\
          )",
         table_name, column_name
     );
@@ -835,10 +849,16 @@ pub unsafe fn create_hnsw_shadow_tables_with_params_ffi(
     let rng_seed = random_state.hash_one(std::time::SystemTime::now()) as i64;
 
     // Insert metadata row with custom M and ef_construction values
+    // Enable normalization for Cosine distance to use L2 internally for better performance
+    let normalize_vectors = if distance_metric == crate::distance::DistanceMetric::Cosine {
+        1
+    } else {
+        0
+    };
     let insert_meta_sql = format!(
         "INSERT OR IGNORE INTO \"{}_{}_hnsw_meta\" \
-         (id, m, max_m0, ef_construction, dimensions, element_type, distance_metric, index_quantization, rng_seed) \
-         VALUES (1, {}, {}, {}, {}, '{}', '{}', '{}', {})",
+         (id, m, max_m0, ef_construction, dimensions, element_type, distance_metric, index_quantization, rng_seed, normalize_vectors) \
+         VALUES (1, {}, {}, {}, {}, '{}', '{}', '{}', {}, {})",
         table_name,
         column_name,
         m,
@@ -848,7 +868,8 @@ pub unsafe fn create_hnsw_shadow_tables_with_params_ffi(
         element_type.as_str(),
         distance_metric.as_str(),
         index_quantization.as_str(),
-        rng_seed
+        rng_seed,
+        normalize_vectors
     );
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &insert_meta_sql)? };
@@ -866,12 +887,13 @@ pub unsafe fn create_hnsw_shadow_tables_with_params_ffi(
     // SAFETY: execute_sql_ffi is called with a valid database handle
     unsafe { execute_sql_ffi(db, &nodes_sql)? };
 
-    // Create edges table
+    // Create edges table with distance column for O(1) prune
     let edges_sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}_{}_hnsw_edges\" (\
          from_rowid INTEGER NOT NULL, \
          to_rowid INTEGER NOT NULL, \
          level INTEGER NOT NULL, \
+         distance REAL NOT NULL DEFAULT 0.0, \
          PRIMARY KEY (from_rowid, level, to_rowid)\
          ) WITHOUT ROWID",
         table_name, column_name

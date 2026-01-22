@@ -151,7 +151,10 @@ fn test_drop_table_cleans_up_shadow_tables() {
     for table in &tables_before {
         println!("  {}", table);
     }
-    assert!(!tables_before.is_empty(), "Should have shadow tables before drop");
+    assert!(
+        !tables_before.is_empty(),
+        "Should have shadow tables before drop"
+    );
 
     // Drop the virtual table
     db.execute("DROP TABLE cleanup_test", []).unwrap();

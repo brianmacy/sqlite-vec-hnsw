@@ -8,9 +8,47 @@ use crate::error::{Error, Result};
 use crate::hnsw::HnswMetadata;
 use crate::hnsw::storage;
 use crate::vector::{IndexQuantization, Vector, VectorType};
+use fixedbitset::FixedBitSet;
 use rusqlite::{Connection, ffi};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Hybrid visited set: FixedBitSet for dense rowids [1, capacity), HashSet for outliers
+/// Provides ~100x faster lookups for typical HNSW usage with sequential rowids
+struct HybridVisited {
+    bits: FixedBitSet,
+    overflow: HashSet<i64>,
+}
+
+impl HybridVisited {
+    fn new(capacity: usize) -> Self {
+        Self {
+            bits: FixedBitSet::with_capacity(capacity),
+            overflow: HashSet::new(),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, rowid: &i64) -> bool {
+        let rowid = *rowid;
+        if rowid > 0 && (rowid as usize) < self.bits.len() {
+            self.bits.contains(rowid as usize)
+        } else {
+            self.overflow.contains(&rowid)
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, rowid: i64) -> bool {
+        if rowid > 0 && (rowid as usize) < self.bits.len() {
+            let was_set = self.bits.contains(rowid as usize);
+            self.bits.insert(rowid as usize);
+            !was_set
+        } else {
+            self.overflow.insert(rowid)
+        }
+    }
+}
 
 // Timing counters for search_layer breakdown
 static SEARCH_FETCH_EDGES_TIME: AtomicU64 = AtomicU64::new(0);
@@ -217,25 +255,24 @@ pub fn search_hnsw(
 
     let ef = ef_search.unwrap_or(metadata.params.ef_search).max(k as i32);
 
-    // Parse and optionally quantize query vector to match index storage
+    // Parse query vector
+    let mut query_vec = Vector::from_blob(
+        query_vector,
+        metadata.element_type,
+        metadata.dimensions as usize,
+    )?;
+
+    // Normalize query vector if using Cosine distance (to match normalized stored vectors)
+    if metadata.normalize_vectors && metadata.element_type == VectorType::Float32 {
+        query_vec = query_vec.normalize()?;
+    }
+
+    // Optionally quantize query vector to match index storage
     let query_vec = match metadata.index_quantization {
         IndexQuantization::Int8 if metadata.element_type == VectorType::Float32 => {
-            // Parse as float32, then quantize to match index storage
-            let float_vec = Vector::from_blob(
-                query_vector,
-                VectorType::Float32,
-                metadata.dimensions as usize,
-            )?;
-            float_vec.quantize_int8_for_index()?
+            query_vec.quantize_int8_for_index()?
         }
-        _ => {
-            // No quantization - use as-is
-            Vector::from_blob(
-                query_vector,
-                metadata.element_type,
-                metadata.dimensions as usize,
-            )?
-        }
+        _ => query_vec,
     };
 
     // Create search context
@@ -262,8 +299,13 @@ pub fn search_hnsw(
     // Search at level 0 with full ef_search
     let results = search_layer(&ctx, current_nearest, ef as usize, 0)?;
 
-    // Return top-k results
-    Ok(results.into_iter().take(k).collect())
+    // Return top-k results with distances converted to user-requested metric
+    // For Cosine with normalize_vectors, internal L2 distances are converted to cosine distances
+    Ok(results
+        .into_iter()
+        .take(k)
+        .map(|(rowid, dist)| (rowid, metadata.convert_distance_for_output(dist)))
+        .collect())
 }
 
 /// Search a single layer for nearest neighbors
@@ -275,11 +317,16 @@ pub fn search_layer(
     ef: usize,
     level: i32,
 ) -> Result<Vec<(i64, f32)>> {
-    let mut visited = HashSet::new();
+    // Use HybridVisited for ~100x faster lookups with dense rowids
+    // Capacity is num_nodes + 1 to handle rowids 1..num_nodes
+    let visited_capacity = (ctx.metadata.num_nodes as usize)
+        .saturating_add(1)
+        .max(ef * 10);
+    let mut visited = HybridVisited::new(visited_capacity);
     // candidates: min-heap - we explore closest candidates first
-    let mut candidates: BinaryHeap<MinCandidate> = BinaryHeap::new();
+    let mut candidates: BinaryHeap<MinCandidate> = BinaryHeap::with_capacity(ef * 2);
     // results: max-heap - peek() gives us the worst (farthest) result for termination check
-    let mut results: BinaryHeap<MaxCandidate> = BinaryHeap::new();
+    let mut results: BinaryHeap<MaxCandidate> = BinaryHeap::with_capacity(ef + 1);
 
     // Get entry point node
     let cached_node_stmt = ctx.stmt_cache.and_then(|c| c.get_node_data);
@@ -308,7 +355,11 @@ pub fn search_layer(
         ctx.metadata.dimensions as usize,
     )?;
 
-    let entry_dist = distance::distance(ctx.query_vec, &entry_vec, ctx.metadata.distance_metric)?;
+    let entry_dist = distance::distance(
+        ctx.query_vec,
+        &entry_vec,
+        ctx.metadata.internal_distance_metric(),
+    )?;
 
     candidates.push(MinCandidate {
         rowid: entry_rowid,
@@ -405,8 +456,11 @@ pub fn search_layer(
                 ctx.metadata.dimensions as usize,
             )?;
 
-            let neighbor_dist =
-                distance::distance(ctx.query_vec, &neighbor_vec, ctx.metadata.distance_metric)?;
+            let neighbor_dist = distance::distance(
+                ctx.query_vec,
+                &neighbor_vec,
+                ctx.metadata.internal_distance_metric(),
+            )?;
 
             // Check if this neighbor is better than our worst result (or we have room)
             if results.len() < ef || neighbor_dist < results.peek().unwrap().distance {

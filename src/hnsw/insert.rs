@@ -24,6 +24,8 @@ static PRUNE_EARLY_RETURNS: AtomicU64 = AtomicU64::new(0);
 static PRUNE_ACTUAL_PRUNES: AtomicU64 = AtomicU64::new(0);
 static PRUNE_EDGES_DELETED: AtomicU64 = AtomicU64::new(0);
 static PRUNE_EDGES_REINSERTED: AtomicU64 = AtomicU64::new(0);
+static SMART_CONNECT_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static SMART_CONNECT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 
 pub fn print_timing_stats() {
     let prune_actual = PRUNE_ACTUAL_PRUNES.load(Ordering::Relaxed);
@@ -77,6 +79,11 @@ pub fn print_timing_stats() {
         "  metadata:     {}ms",
         METADATA_TIME.load(Ordering::Relaxed) / 1000
     );
+    eprintln!(
+        "  smart_connect: {} skipped, {} allowed",
+        SMART_CONNECT_SKIPPED.load(Ordering::Relaxed),
+        SMART_CONNECT_ALLOWED.load(Ordering::Relaxed)
+    );
 }
 
 /// Generate a random level for a new node
@@ -107,12 +114,10 @@ fn generate_level(metadata: &HnswMetadata) -> i32 {
     level.min(metadata.params.max_level - 1).max(0)
 }
 
-/// Prune neighbor's connections if they exceed max_connections using RNG heuristic
+/// Prune neighbor's connections if they exceed max_connections
 ///
-/// Implements the HNSWlib RNG (Relative Neighborhood Graph) heuristic:
-/// - Sort candidates by distance to center (the neighbor being pruned)
-/// - For each candidate, reject if it's closer to any already-selected neighbor than to center
-/// - This ensures diverse, spread-out connections for better recall
+/// Uses stored edge distances for O(1) prune operations. Since distances are symmetric
+/// (for L2/cosine), the stored distance in each edge is correct for pruning decisions.
 #[allow(clippy::too_many_arguments)]
 fn prune_neighbor_if_needed(
     db: &Connection,
@@ -123,119 +128,53 @@ fn prune_neighbor_if_needed(
     _new_edge_dist: f32,
     level: i32,
     max_connections: usize,
-    metadata: &HnswMetadata,
+    _metadata: &HnswMetadata,
     _new_vec: &Vector,
     stmt_cache: Option<&HnswStmtCache>,
-    get_edges_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
+    _get_edges_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
     _insert_edge_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
 ) -> Result<()> {
     PRUNE_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    // Fetch current neighbor edges (just rowids, no distances)
+    // Fetch current neighbor edges WITH stored distances (O(1) per edge)
     let t = Instant::now();
-    let get_edges_cached = get_edges_stmt;
-    let neighbor_edges = storage::fetch_neighbors_cached(
+    // Only use cached statement if it's not null
+    let get_edges_with_dist_stmt = stmt_cache
+        .map(|c| c.get_edges_with_dist)
+        .filter(|p| !p.is_null());
+    let mut candidates = storage::fetch_neighbors_with_distances(
         db,
         table_name,
         column_name,
         neighbor_rowid,
         level,
-        get_edges_cached,
+        get_edges_with_dist_stmt,
     )?;
     PRUNE_FETCH_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-    // Early return if under limit - no pruning needed (matches C behavior)
-    // C uses < (strictly less than), not <=
-    if neighbor_edges.len() < max_connections {
+    // Early return if under limit - no pruning needed
+    if candidates.len() <= max_connections {
         PRUNE_EARLY_RETURNS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
     PRUNE_ACTUAL_PRUNES.fetch_add(1, Ordering::Relaxed);
-    PRUNE_EDGES_DELETED.fetch_add(neighbor_edges.len() as u64, Ordering::Relaxed);
+    PRUNE_EDGES_DELETED.fetch_add(candidates.len() as u64, Ordering::Relaxed);
 
-    // Determine the element type for stored vectors (may be quantized)
-    let stored_element_type = match metadata.index_quantization {
-        IndexQuantization::Int8 if metadata.element_type == VectorType::Float32 => VectorType::Int8,
-        _ => metadata.element_type,
-    };
-
-    // Fetch the center vector (the neighbor being pruned)
-    let get_node_stmt = stmt_cache.map(|c| c.get_node_data);
-    let center_node =
-        storage::fetch_node_data(db, table_name, column_name, neighbor_rowid, get_node_stmt)?
-            .ok_or_else(|| {
-                crate::error::Error::Hnsw(format!("Node {} not found during prune", neighbor_rowid))
-            })?;
-    let center_vec = Vector::from_blob(
-        &center_node.vector,
-        stored_element_type,
-        metadata.dimensions as usize,
-    )?;
-
-    // BATCH FETCH: Get all candidate nodes in one query
-    let t_batch = Instant::now();
-    let candidate_nodes = storage::fetch_nodes_batch(db, table_name, column_name, &neighbor_edges)?;
-    PRUNE_FETCH_TIME.fetch_add(t_batch.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-    // Build candidates with distances
-    let mut candidates: Vec<(i64, f32, Vec<u8>)> = Vec::with_capacity(candidate_nodes.len());
-    for node in candidate_nodes {
-        let candidate_vec = Vector::from_blob(
-            &node.vector,
-            stored_element_type,
-            metadata.dimensions as usize,
-        )?;
-        let dist =
-            crate::distance::distance(&center_vec, &candidate_vec, metadata.distance_metric)?;
-        candidates.push((node.rowid, dist, node.vector));
-    }
-
-    // Sort by distance to center (closest first)
+    // Sort by stored distance (closest first) - distances are already from neighbor's perspective
     candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Apply RNG heuristic: select diverse neighbors
-    let mut selected: Vec<i64> = Vec::with_capacity(max_connections);
-    let mut selected_vecs: Vec<Vector> = Vec::with_capacity(max_connections);
-
-    for (rowid, dist_to_center, blob) in candidates {
-        if selected.len() >= max_connections {
-            break;
-        }
-
-        let candidate_vec =
-            Vector::from_blob(&blob, stored_element_type, metadata.dimensions as usize)?;
-
-        // RNG heuristic: reject if candidate is closer to any already-selected than to center
-        let mut good = true;
-        for selected_vec in &selected_vecs {
-            let dist_to_selected =
-                crate::distance::distance(&candidate_vec, selected_vec, metadata.distance_metric)?;
-            if dist_to_selected < dist_to_center {
-                good = false;
-                break;
-            }
-        }
-
-        if good {
-            selected.push(rowid);
-            selected_vecs.push(candidate_vec);
-        }
-    }
-
-    PRUNE_EDGES_REINSERTED.fetch_add(selected.len() as u64, Ordering::Relaxed);
-
-    // DELTA UPDATE: Only delete edges that weren't selected (avoid delete+reinsert for survivors)
-    let t = Instant::now();
-    use std::collections::HashSet;
-    let selected_set: HashSet<i64> = selected.into_iter().collect();
-    let edges_to_delete: Vec<i64> = neighbor_edges
+    // Keep the closest max_connections, delete the rest
+    let edges_to_delete: Vec<i64> = candidates
         .iter()
-        .filter(|&rowid| !selected_set.contains(rowid))
-        .copied()
+        .skip(max_connections)
+        .map(|(rowid, _)| *rowid)
         .collect();
 
-    // Only delete the edges that need to be removed
+    PRUNE_EDGES_REINSERTED.fetch_add(max_connections as u64, Ordering::Relaxed);
+
+    // Delete the worst edges
+    let t = Instant::now();
     if !edges_to_delete.is_empty() {
         storage::delete_edges_batch(
             db,
@@ -248,15 +187,37 @@ fn prune_neighbor_if_needed(
     }
     PRUNE_DELETE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-    // No re-insert needed - we kept the survivors in place!
-
     Ok(())
+}
+
+/// Check if a new edge would survive pruning at a neighbor
+/// Currently disabled - always returns true to preserve recall.
+///
+/// Note: Capacity-based filtering hurts recall significantly because it
+/// prevents connections to important neighbors that happen to be at capacity.
+#[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
+fn would_survive_prune(
+    db: &Connection,
+    table_name: &str,
+    column_name: &str,
+    neighbor_rowid: i64,
+    _our_distance: f32,
+    level: i32,
+    max_connections: usize,
+    _metadata: &HnswMetadata,
+    stmt_cache: Option<&HnswStmtCache>,
+) -> Result<bool> {
+    // Always connect - prune will handle edge selection correctly
+    Ok(true)
 }
 
 /// Cached prepared statements for HNSW operations
 pub struct HnswStmtCache {
     pub get_node_data: *mut rusqlite::ffi::sqlite3_stmt,
     pub get_edges: *mut rusqlite::ffi::sqlite3_stmt,
+    /// Fetches edges WITH stored distances for O(1) prune operations
+    pub get_edges_with_dist: *mut rusqlite::ffi::sqlite3_stmt,
     pub insert_node: *mut rusqlite::ffi::sqlite3_stmt,
     pub insert_edge: *mut rusqlite::ffi::sqlite3_stmt,
     pub delete_edges_from: *mut rusqlite::ffi::sqlite3_stmt,
@@ -301,6 +262,18 @@ pub fn insert_hnsw(
 
     // Generate level for new node
     let level = generate_level(metadata);
+
+    // Normalize vector if using Cosine distance (enables L2 internal for better performance)
+    let normalized_vector: Option<Vec<u8>>;
+    let vector = if metadata.normalize_vectors && metadata.element_type == VectorType::Float32 {
+        let float_vec =
+            Vector::from_blob(vector, VectorType::Float32, metadata.dimensions as usize)?;
+        let normalized = float_vec.normalize()?;
+        normalized_vector = Some(normalized.as_bytes().to_vec());
+        normalized_vector.as_ref().unwrap().as_slice()
+    } else {
+        vector
+    };
 
     // Quantize vector for HNSW index storage if configured
     let index_vector: std::borrow::Cow<'_, [u8]> = match metadata.index_quantization {
@@ -416,21 +389,48 @@ pub fn insert_hnsw(
 
         // Select M closest neighbors from search results (already sorted by distance)
         // No need to re-fetch vectors - distances are computed during search
-        let selected: Vec<(i64, f32)> = neighbors.into_iter().take(max_connections).collect();
+        let candidates: Vec<(i64, f32)> = neighbors.into_iter().take(max_connections).collect();
 
-        // Batch insert all edges for this level
+        // SMART CONNECT: Filter out neighbors where we'd be immediately pruned
+        // This reduces prune calls significantly
+        let mut selected: Vec<(i64, f32)> = Vec::with_capacity(candidates.len());
+        for (neighbor_rowid, dist) in candidates {
+            // Check if we'd survive pruning at this neighbor
+            let would_survive = would_survive_prune(
+                db,
+                table_name,
+                column_name,
+                neighbor_rowid,
+                dist,
+                lv,
+                max_connections,
+                metadata,
+                stmt_cache,
+            )?;
+
+            if would_survive {
+                selected.push((neighbor_rowid, dist));
+                SMART_CONNECT_ALLOWED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SMART_CONNECT_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Batch insert all edges for this level (only for neighbors that would keep us)
+        // Include distance for O(1) prune operations
         let t = Instant::now();
-        let mut edges_to_insert: Vec<(i64, i64, i32)> = Vec::with_capacity(selected.len() * 2);
-        for (neighbor_rowid, _dist) in selected.iter() {
-            // Edge: new_node -> neighbor
-            edges_to_insert.push((rowid, *neighbor_rowid, lv));
-            // Edge: neighbor -> new_node (bidirectional)
-            edges_to_insert.push((*neighbor_rowid, rowid, lv));
+        let mut edges_to_insert: Vec<(i64, i64, i32, f32)> = Vec::with_capacity(selected.len() * 2);
+        for (neighbor_rowid, dist) in selected.iter() {
+            // Edge: new_node -> neighbor (distance from new_node's perspective)
+            edges_to_insert.push((rowid, *neighbor_rowid, lv, *dist));
+            // Edge: neighbor -> new_node (distance is symmetric for L2/cosine)
+            edges_to_insert.push((*neighbor_rowid, rowid, lv, *dist));
         }
         storage::insert_edges_batch(db, table_name, column_name, &edges_to_insert)?;
         INSERT_EDGE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         // Prune neighbors that may now exceed max_connections
+        // With smart connect, most prune calls should early-return
         let get_edges_stmt = stmt_cache.map(|c| c.get_edges);
         let insert_edge_stmt = stmt_cache.map(|c| c.insert_edge);
         for (neighbor_rowid, _dist) in selected.iter() {

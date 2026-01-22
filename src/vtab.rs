@@ -108,6 +108,8 @@ struct HnswStmtCache {
     get_node_data: *mut ffi::sqlite3_stmt,
     get_node_level: *mut ffi::sqlite3_stmt,
     get_edges: *mut ffi::sqlite3_stmt,
+    /// Fetches edges WITH stored distances for O(1) prune operations
+    get_edges_with_dist: *mut ffi::sqlite3_stmt,
     insert_node: *mut ffi::sqlite3_stmt,
     insert_edge: *mut ffi::sqlite3_stmt,
     delete_edges_from: *mut ffi::sqlite3_stmt,
@@ -123,6 +125,7 @@ impl HnswStmtCache {
             get_node_data: std::ptr::null_mut(),
             get_node_level: std::ptr::null_mut(),
             get_edges: std::ptr::null_mut(),
+            get_edges_with_dist: std::ptr::null_mut(),
             insert_node: std::ptr::null_mut(),
             insert_edge: std::ptr::null_mut(),
             delete_edges_from: std::ptr::null_mut(),
@@ -177,6 +180,28 @@ impl HnswStmtCache {
             sql.as_ptr(),
             -1,
             &mut self.get_edges,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                None,
+            )));
+        }
+
+        // Prepare get_edges_with_dist: SELECT to_rowid, distance FROM hnsw_edges WHERE from_rowid = ? AND level = ?
+        // Used by prune to avoid re-computing distances (they're stored when edges are created)
+        let sql = CString::new(format!(
+            "SELECT to_rowid, distance FROM \"{}_{}_hnsw_edges\" WHERE from_rowid = ? AND level = ?",
+            table_name, column_name
+        ))
+        .map_err(|e| crate::error::Error::InvalidParameter(format!("Invalid SQL: {}", e)))?;
+
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut self.get_edges_with_dist,
             std::ptr::null_mut(),
         );
         if rc != ffi::SQLITE_OK {
@@ -311,6 +336,10 @@ impl HnswStmtCache {
         if !self.get_edges.is_null() {
             ffi::sqlite3_finalize(self.get_edges);
             self.get_edges = std::ptr::null_mut();
+        }
+        if !self.get_edges_with_dist.is_null() {
+            ffi::sqlite3_finalize(self.get_edges_with_dist);
+            self.get_edges_with_dist = std::ptr::null_mut();
         }
         if !self.insert_node.is_null() {
             ffi::sqlite3_finalize(self.insert_node);
@@ -1331,6 +1360,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             Some(hnsw::insert::HnswStmtCache {
                                 get_node_data: cache.get_node_data,
                                 get_edges: cache.get_edges,
+                                get_edges_with_dist: cache.get_edges_with_dist,
                                 insert_node: cache.insert_node,
                                 insert_edge: cache.insert_edge,
                                 delete_edges_from: cache.delete_edges_from,
@@ -1373,9 +1403,8 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         if !data_columns.is_empty() {
             // SAFETY: self.db is valid for the lifetime of the virtual table
             unsafe {
-                let conn = Connection::from_handle(self.db).map_err(|e| {
-                    rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
-                })?;
+                let conn = Connection::from_handle(self.db)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
 
                 // Build single INSERT statement for _data table
                 // Schema: (rowid, col00, col01, col02, ...)
@@ -1650,6 +1679,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             Some(hnsw::insert::HnswStmtCache {
                                 get_node_data: cache.get_node_data,
                                 get_edges: cache.get_edges,
+                                get_edges_with_dist: cache.get_edges_with_dist,
                                 insert_node: cache.insert_node,
                                 insert_edge: cache.insert_edge,
                                 delete_edges_from: cache.delete_edges_from,
@@ -1691,9 +1721,8 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         if !data_columns.is_empty() {
             // SAFETY: self.db is valid for the lifetime of the virtual table
             unsafe {
-                let conn = Connection::from_handle(self.db).map_err(|e| {
-                    rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
-                })?;
+                let conn = Connection::from_handle(self.db)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
 
                 let data_table = format!("{}_data", self.table_name);
 
@@ -1733,7 +1762,9 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     );
 
                     conn.execute(&update_sql, rusqlite::params_from_iter(values))
-                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+                        .map_err(|e| {
+                            rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                        })?;
                 }
 
                 std::mem::forget(conn);
@@ -2002,7 +2033,11 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
 
         // Check if this is a vector column
         if col_idx < vtab.columns.len()
-            && let ColumnType::Vector { vec_type, dimensions, .. } = &vtab.columns[col_idx].col_type
+            && let ColumnType::Vector {
+                vec_type,
+                dimensions,
+                ..
+            } = &vtab.columns[col_idx].col_type
         {
             // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
             let vec_col_idx = vtab
@@ -2049,7 +2084,10 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
         // Check if this is a non-vector column (Metadata or Auxiliary)
         // Read from unified _data table for efficiency
         if col_idx < vtab.columns.len()
-            && matches!(vtab.columns[col_idx].col_type, ColumnType::Metadata | ColumnType::Auxiliary)
+            && matches!(
+                vtab.columns[col_idx].col_type,
+                ColumnType::Metadata | ColumnType::Auxiliary
+            )
         {
             // Compute data_col_idx: the index among all non-vector columns
             let data_col_idx = vtab
@@ -2080,19 +2118,13 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                             rusqlite::types::ValueRef::Null => {
                                 ctx.set_result(&rusqlite::types::Null)
                             }
-                            rusqlite::types::ValueRef::Integer(i) => {
-                                ctx.set_result(&i)
-                            }
-                            rusqlite::types::ValueRef::Real(f) => {
-                                ctx.set_result(&f)
-                            }
+                            rusqlite::types::ValueRef::Integer(i) => ctx.set_result(&i),
+                            rusqlite::types::ValueRef::Real(f) => ctx.set_result(&f),
                             rusqlite::types::ValueRef::Text(t) => {
                                 let s = std::str::from_utf8(t).unwrap_or("");
                                 ctx.set_result(&s)
                             }
-                            rusqlite::types::ValueRef::Blob(b) => {
-                                ctx.set_result(&b)
-                            }
+                            rusqlite::types::ValueRef::Blob(b) => ctx.set_result(&b),
                         }
                     })
                     .optional()
@@ -2615,20 +2647,25 @@ mod tests {
                 name TEXT,
                 score REAL,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Verify _data table was created with correct schema
         let tables: Vec<String> = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'test_mixed%'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'test_mixed%'",
+            )
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(tables.contains(&"test_mixed_data".to_string()),
-            "_data table should be created for non-vector columns");
+        assert!(
+            tables.contains(&"test_mixed_data".to_string()),
+            "_data table should be created for non-vector columns"
+        );
     }
 
     #[test]
@@ -2643,8 +2680,9 @@ mod tests {
                 id INTEGER,
                 name TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert with non-vector values
         db.execute(
@@ -2653,11 +2691,13 @@ mod tests {
         ).unwrap();
 
         // Verify data exists in _data table
-        let (id, name): (i64, String) = db.query_row(
-            "SELECT col00, col01 FROM test_insert_data WHERE rowid = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
+        let (id, name): (i64, String) = db
+            .query_row(
+                "SELECT col00, col01 FROM test_insert_data WHERE rowid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
 
         assert_eq!(id, 100, "INTEGER value should be stored correctly");
         assert_eq!(name, "test_name", "TEXT value should be stored correctly");
@@ -2675,8 +2715,9 @@ mod tests {
                 lib_feat_id INTEGER,
                 label TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert test data
         db.execute(
@@ -2685,14 +2726,19 @@ mod tests {
         ).unwrap();
 
         // SELECT non-vector columns - THIS WAS THE ORIGINAL BUG (returned NULL)
-        let (lib_feat_id, label): (i64, String) = db.query_row(
-            "SELECT lib_feat_id, label FROM test_select WHERE rowid = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
+        let (lib_feat_id, label): (i64, String) = db
+            .query_row(
+                "SELECT lib_feat_id, label FROM test_select WHERE rowid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
 
         assert_eq!(lib_feat_id, 42, "lib_feat_id should return 42, not NULL");
-        assert_eq!(label, "my_label", "label should return 'my_label', not NULL");
+        assert_eq!(
+            label, "my_label",
+            "label should return 'my_label', not NULL"
+        );
     }
 
     #[test]
@@ -2707,8 +2753,9 @@ mod tests {
                 id INTEGER,
                 name TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert initial data
         db.execute(
@@ -2720,14 +2767,17 @@ mod tests {
         db.execute(
             "UPDATE test_update SET id = 200, name = 'updated' WHERE rowid = 1",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify updated values
-        let (id, name): (i64, String) = db.query_row(
-            "SELECT id, name FROM test_update WHERE rowid = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
+        let (id, name): (i64, String) = db
+            .query_row(
+                "SELECT id, name FROM test_update WHERE rowid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
 
         assert_eq!(id, 200, "id should be updated to 200");
         assert_eq!(name, "updated", "name should be updated to 'updated'");
@@ -2745,8 +2795,9 @@ mod tests {
                 id INTEGER,
                 name TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert data
         db.execute(
@@ -2755,23 +2806,31 @@ mod tests {
         ).unwrap();
 
         // Verify data exists in _data table
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM test_delete_data WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM test_delete_data WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1, "Data should exist before delete");
 
         // Delete the row
-        db.execute("DELETE FROM test_delete WHERE rowid = 1", []).unwrap();
+        db.execute("DELETE FROM test_delete WHERE rowid = 1", [])
+            .unwrap();
 
         // Verify data is removed from _data table
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM test_delete_data WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 0, "Data should be removed from _data table after delete");
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM test_delete_data WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "Data should be removed from _data table after delete"
+        );
     }
 
     #[test]
@@ -2786,8 +2845,9 @@ mod tests {
                 id INTEGER,
                 name TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert with NULL non-vector columns
         db.execute(
@@ -2796,17 +2856,17 @@ mod tests {
         ).unwrap();
 
         // SELECT should return NULL values
-        let id: Option<i64> = db.query_row(
-            "SELECT id FROM test_null WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let id: Option<i64> = db
+            .query_row("SELECT id FROM test_null WHERE rowid = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
 
-        let name: Option<String> = db.query_row(
-            "SELECT name FROM test_null WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let name: Option<String> = db
+            .query_row("SELECT name FROM test_null WHERE rowid = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
 
         assert!(id.is_none(), "NULL INTEGER should be returned as None");
         assert!(name.is_none(), "NULL TEXT should be returned as None");
@@ -2825,8 +2885,9 @@ mod tests {
                 real_col REAL,
                 text_col TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert typed values
         db.execute(
@@ -2835,27 +2896,36 @@ mod tests {
         ).unwrap();
 
         // Verify types are preserved
-        let int_val: i64 = db.query_row(
-            "SELECT int_col FROM test_types WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let int_val: i64 = db
+            .query_row(
+                "SELECT int_col FROM test_types WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(int_val, 42);
 
-        let real_val: f64 = db.query_row(
-            "SELECT real_col FROM test_types WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let real_val: f64 = db
+            .query_row(
+                "SELECT real_col FROM test_types WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         #[allow(clippy::approx_constant)]
         let expected_val = 3.14159;
-        assert!((real_val - expected_val).abs() < 0.00001, "REAL value should be preserved");
+        assert!(
+            (real_val - expected_val).abs() < 0.00001,
+            "REAL value should be preserved"
+        );
 
-        let text_val: String = db.query_row(
-            "SELECT text_col FROM test_types WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let text_val: String = db
+            .query_row(
+                "SELECT text_col FROM test_types WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(text_val, "hello");
     }
 
@@ -2871,8 +2941,9 @@ mod tests {
                 id INTEGER,
                 label TEXT,
                 embedding float[3] hnsw(distance=cosine, M=8, ef_construction=50)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert multiple rows
         db.execute("INSERT INTO test_knn(rowid, id, label, embedding) VALUES (1, 100, 'first', '[1.0, 0.0, 0.0]')", []).unwrap();
@@ -2915,8 +2986,9 @@ mod tests {
                 product_name TEXT,
                 price REAL,
                 embedding float[4]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // INSERT
         db.execute(
@@ -2925,11 +2997,13 @@ mod tests {
         ).unwrap();
 
         // READ - verify all values
-        let (id, name, price): (i64, String, f64) = db.query_row(
-            "SELECT product_id, product_name, price FROM test_crud WHERE rowid = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
+        let (id, name, price): (i64, String, f64) = db
+            .query_row(
+                "SELECT product_id, product_name, price FROM test_crud WHERE rowid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(id, 1001);
         assert_eq!(name, "Widget");
         assert!((price - 19.99).abs() < 0.001);
@@ -2941,24 +3015,25 @@ mod tests {
         ).unwrap();
 
         // READ - verify updated values
-        let (id, name, price): (i64, String, f64) = db.query_row(
-            "SELECT product_id, product_name, price FROM test_crud WHERE rowid = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
+        let (id, name, price): (i64, String, f64) = db
+            .query_row(
+                "SELECT product_id, product_name, price FROM test_crud WHERE rowid = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(id, 2002);
         assert_eq!(name, "Gadget");
         assert!((price - 29.99).abs() < 0.001);
 
         // DELETE
-        db.execute("DELETE FROM test_crud WHERE rowid = 1", []).unwrap();
+        db.execute("DELETE FROM test_crud WHERE rowid = 1", [])
+            .unwrap();
 
         // Verify deleted
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM test_crud",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM test_crud", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0, "Table should be empty after delete");
     }
 
@@ -2974,8 +3049,9 @@ mod tests {
                 seq INTEGER,
                 name TEXT,
                 embedding float[3]
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert multiple rows
         for i in 1..=10 {
@@ -2987,13 +3063,21 @@ mod tests {
 
         // Verify all rows have correct data
         for i in 1..=10 {
-            let (seq, name): (i64, String) = db.query_row(
-                &format!("SELECT seq, name FROM test_multi WHERE rowid = {}", i),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).unwrap();
+            let (seq, name): (i64, String) = db
+                .query_row(
+                    &format!("SELECT seq, name FROM test_multi WHERE rowid = {}", i),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
             assert_eq!(seq, i * 10, "seq should be {} for rowid {}", i * 10, i);
-            assert_eq!(name, format!("item_{}", i), "name should be 'item_{}' for rowid {}", i, i);
+            assert_eq!(
+                name,
+                format!("item_{}", i),
+                "name should be 'item_{}' for rowid {}",
+                i,
+                i
+            );
         }
     }
 }

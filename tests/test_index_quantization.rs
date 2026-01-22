@@ -327,9 +327,15 @@ fn test_select_embedding_with_non_vector_columns_first() {
 
     assert_eq!(floats.len(), 4, "Should have 4 float values");
     assert!((floats[0] - 1.0).abs() < 0.001, "First float should be 1.0");
-    assert!((floats[1] - 2.0).abs() < 0.001, "Second float should be 2.0");
+    assert!(
+        (floats[1] - 2.0).abs() < 0.001,
+        "Second float should be 2.0"
+    );
     assert!((floats[2] - 3.0).abs() < 0.001, "Third float should be 3.0");
-    assert!((floats[3] - 4.0).abs() < 0.001, "Fourth float should be 4.0");
+    assert!(
+        (floats[3] - 4.0).abs() < 0.001,
+        "Fourth float should be 4.0"
+    );
 
     // Verify the JSON contains expected values
     let expected_values = ["1.0", "2.0", "3.0", "4.0"];
@@ -361,9 +367,21 @@ fn test_select_multiple_embeddings() {
     .unwrap();
 
     // Insert multiple rows
-    db.execute("INSERT INTO vectors(rowid, name, vec) VALUES (1, 'a', vec_f32('[1.0, 0.0, 0.0]'))", []).unwrap();
-    db.execute("INSERT INTO vectors(rowid, name, vec) VALUES (2, 'b', vec_f32('[0.0, 1.0, 0.0]'))", []).unwrap();
-    db.execute("INSERT INTO vectors(rowid, name, vec) VALUES (3, 'c', vec_f32('[0.0, 0.0, 1.0]'))", []).unwrap();
+    db.execute(
+        "INSERT INTO vectors(rowid, name, vec) VALUES (1, 'a', vec_f32('[1.0, 0.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO vectors(rowid, name, vec) VALUES (2, 'b', vec_f32('[0.0, 1.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO vectors(rowid, name, vec) VALUES (3, 'c', vec_f32('[0.0, 0.0, 1.0]'))",
+        [],
+    )
+    .unwrap();
 
     // Query all rows and verify embeddings can be converted to JSON
     let mut stmt = db
