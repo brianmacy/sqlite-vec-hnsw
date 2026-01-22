@@ -524,7 +524,7 @@ fn test_multithread_long_running() {
         sqlite_vec_hnsw::init(&db).unwrap();
 
         db.execute(
-            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128])",
+            "CREATE VIRTUAL TABLE vectors USING vec0(embedding float[128] hnsw())",
             [],
         )
         .unwrap();
