@@ -102,13 +102,87 @@ fn test_data_persisted_in_shadow_tables() {
         chunk_id, chunk_offset
     );
 
-    // Verify we can read the vector back
-    let embedding: Vec<u8> = db
+    // Verify we can read the vector back (now returns JSON string)
+    let embedding_json: String = db
         .query_row("SELECT embedding FROM docs WHERE rowid = 1", [], |row| {
             row.get(0)
         })
         .unwrap();
 
-    println!("Vector length: {} bytes", embedding.len());
-    assert_eq!(embedding.len(), 12, "3 float32s = 12 bytes");
+    // Parse JSON and verify we have 3 float values
+    let trimmed = embedding_json.trim_start_matches('[').trim_end_matches(']');
+    let floats: Vec<f32> = trimmed
+        .split(',')
+        .map(|s| s.trim().parse::<f32>().unwrap())
+        .collect();
+    println!("Vector has {} float values", floats.len());
+    assert_eq!(floats.len(), 3, "3 float32 values");
+}
+
+#[test]
+fn test_drop_table_cleans_up_shadow_tables() {
+    let db = Connection::open_in_memory().unwrap();
+    sqlite_vec_hnsw::init(&db).unwrap();
+
+    // Create a virtual table with HNSW enabled and non-vector columns
+    db.execute(
+        "CREATE VIRTUAL TABLE cleanup_test USING vec0(id INTEGER, name TEXT, embedding float[3] hnsw())",
+        [],
+    )
+    .unwrap();
+
+    // Insert some data
+    db.execute(
+        "INSERT INTO cleanup_test(rowid, id, name, embedding) VALUES (1, 100, 'test', vec_f32('[1.0, 0.0, 0.0]'))",
+        [],
+    )
+    .unwrap();
+
+    // Get list of shadow tables before drop
+    let tables_before: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'cleanup_test%' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    println!("\nShadow tables BEFORE DROP:");
+    for table in &tables_before {
+        println!("  {}", table);
+    }
+    assert!(!tables_before.is_empty(), "Should have shadow tables before drop");
+
+    // Drop the virtual table
+    db.execute("DROP TABLE cleanup_test", []).unwrap();
+
+    // Get list of shadow tables after drop
+    let tables_after: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'cleanup_test%' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    println!("\nShadow tables AFTER DROP:");
+    for table in &tables_after {
+        println!("  {}", table);
+    }
+
+    // All shadow tables should be cleaned up
+    assert!(
+        tables_after.is_empty(),
+        "Shadow tables should be cleaned up after DROP TABLE, but found: {:?}",
+        tables_after
+    );
+
+    // Verify we can recreate the table (would fail if shadow tables remain)
+    db.execute(
+        "CREATE VIRTUAL TABLE cleanup_test USING vec0(id INTEGER, name TEXT, embedding float[3] hnsw())",
+        [],
+    )
+    .unwrap();
+
+    println!("\n✅ DROP TABLE properly cleans up all shadow tables");
 }

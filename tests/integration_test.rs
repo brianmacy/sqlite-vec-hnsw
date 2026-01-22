@@ -274,9 +274,9 @@ fn test_delete_vector() {
     });
     assert!(result.is_err(), "Rowid 1 should be deleted");
 
-    // Verify rowid 2 still exists
+    // Verify rowid 2 still exists (now returns JSON string instead of BLOB)
     let result = db.query_row("SELECT embedding FROM vec_del WHERE rowid = 2", [], |row| {
-        row.get::<_, Vec<u8>>(0)
+        row.get::<_, String>(0)
     });
     assert!(result.is_ok(), "Rowid 2 should still exist");
 }
@@ -299,8 +299,8 @@ fn test_update_vector() {
     )
     .unwrap();
 
-    // Read original vector
-    let orig_vector: Vec<u8> = db
+    // Read original vector (now returns JSON string)
+    let orig_vector: String = db
         .query_row("SELECT embedding FROM vec_upd WHERE rowid = 1", [], |row| {
             row.get(0)
         })
@@ -313,8 +313,8 @@ fn test_update_vector() {
     );
     assert!(result.is_ok(), "UPDATE should succeed");
 
-    // Read updated vector
-    let updated_vector: Vec<u8> = db
+    // Read updated vector (now returns JSON string)
+    let updated_vector: String = db
         .query_row("SELECT embedding FROM vec_upd WHERE rowid = 1", [], |row| {
             row.get(0)
         })
@@ -326,10 +326,12 @@ fn test_update_vector() {
         "Vector should have been updated"
     );
 
-    // Decode and verify new values
-    let floats: Vec<f32> = updated_vector
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    // Parse JSON and verify new values
+    // Format: "[4.0, 5.0, 6.0]"
+    let trimmed = updated_vector.trim_start_matches('[').trim_end_matches(']');
+    let floats: Vec<f32> = trimmed
+        .split(',')
+        .map(|s| s.trim().parse::<f32>().unwrap())
         .collect();
 
     assert_eq!(floats.len(), 3);
@@ -592,8 +594,8 @@ fn test_vector_data_integrity() {
     )
     .unwrap();
 
-    // Read it back
-    let vector_data: Vec<u8> = db
+    // Read it back (now returns JSON string)
+    let vector_json: String = db
         .query_row(
             "SELECT embedding FROM vec_integrity WHERE rowid = 1",
             [],
@@ -601,16 +603,12 @@ fn test_vector_data_integrity() {
         )
         .unwrap();
 
-    assert_eq!(
-        vector_data.len(),
-        12,
-        "Should be 12 bytes for 3 float32 values"
-    );
-
-    // Decode and verify values
-    let floats: Vec<f32> = vector_data
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    // Parse JSON and verify values
+    // Format: "[1.5, 2.5, 3.5]"
+    let trimmed = vector_json.trim_start_matches('[').trim_end_matches(']');
+    let floats: Vec<f32> = trimmed
+        .split(',')
+        .map(|s| s.trim().parse::<f32>().unwrap())
         .collect();
 
     assert_eq!(floats.len(), 3);

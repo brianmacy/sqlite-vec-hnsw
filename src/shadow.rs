@@ -88,15 +88,25 @@ impl ValidityBitmap {
     }
 }
 
+/// Definition of a non-vector column for the _data table
+#[derive(Debug, Clone)]
+pub struct DataColumnDef {
+    pub name: String,
+    pub col_type: String, // "INTEGER", "TEXT", "REAL", "BLOB"
+}
+
 /// Configuration for shadow table creation
 pub struct ShadowTablesConfig {
     /// Number of vector columns (shadow tables named _vector_chunks00, 01, 02, etc.)
     pub num_vector_columns: usize,
-    /// Number of metadata columns
+    /// Number of metadata columns (legacy - kept for backward compatibility)
     pub num_metadata_columns: usize,
+    /// Number of auxiliary columns (legacy - kept for backward compatibility)
     pub num_auxiliary_columns: usize,
     pub has_text_pk: bool,
     pub num_partition_columns: usize,
+    /// Non-vector column definitions for the unified _data table
+    pub data_columns: Vec<DataColumnDef>,
 }
 
 /// Drop all shadow tables for a vec0 virtual table (cleanup before creation)
@@ -116,6 +126,7 @@ pub unsafe fn drop_shadow_tables_ffi(
         format!("\"{}\".\"{}_rowids\"", schema, table_name),
         format!("\"{}\".\"{}_info\"", schema, table_name),
         format!("\"{}\".\"{}_auxiliary\"", schema, table_name),
+        format!("\"{}\".\"{}_data\"", schema, table_name), // Unified non-vector column storage
     ];
 
     // Vector chunk tables (sequential indices: 0, 1, 2, etc.)
@@ -303,7 +314,7 @@ pub fn create_shadow_tables(
         db.execute(&metadata_text_sql, []).map_err(Error::Sqlite)?;
     }
 
-    // Create auxiliary columns shadow table
+    // Create auxiliary columns shadow table (legacy)
     if config.num_auxiliary_columns > 0 {
         let mut auxiliary_sql = format!(
             "CREATE TABLE \"{}\".\"{}_auxiliary\" (rowid INTEGER PRIMARY KEY",
@@ -316,6 +327,23 @@ pub fn create_shadow_tables(
         auxiliary_sql.push_str(");");
 
         db.execute(&auxiliary_sql, []).map_err(Error::Sqlite)?;
+    }
+
+    // Create unified _data table for all non-vector columns (efficient single-table design)
+    if !config.data_columns.is_empty() {
+        let mut data_sql = format!(
+            "CREATE TABLE \"{}\".\"{}_data\" (rowid INTEGER PRIMARY KEY",
+            schema, table_name
+        );
+
+        for (i, col) in config.data_columns.iter().enumerate() {
+            // Use indexed column names for consistency (col00, col01, ...)
+            // Store actual column name mapping in _info table if needed
+            data_sql.push_str(&format!(", col{:02} {}", i, col.col_type));
+        }
+        data_sql.push_str(");");
+
+        db.execute(&data_sql, []).map_err(Error::Sqlite)?;
     }
 
     Ok(())
@@ -576,7 +604,7 @@ pub unsafe fn create_shadow_tables_ffi(
         unsafe { execute_sql_ffi(db, &metadata_text_sql)? };
     }
 
-    // Create auxiliary columns shadow table
+    // Create auxiliary columns shadow table (legacy)
     if config.num_auxiliary_columns > 0 {
         let mut auxiliary_sql = format!(
             "CREATE TABLE \"{}\".\"{}_auxiliary\" (rowid INTEGER PRIMARY KEY",
@@ -590,6 +618,22 @@ pub unsafe fn create_shadow_tables_ffi(
 
         // SAFETY: execute_sql_ffi is called with a valid database handle
         unsafe { execute_sql_ffi(db, &auxiliary_sql)? };
+    }
+
+    // Create unified _data table for all non-vector columns (efficient single-table design)
+    if !config.data_columns.is_empty() {
+        let mut data_sql = format!(
+            "CREATE TABLE \"{}\".\"{}_data\" (rowid INTEGER PRIMARY KEY",
+            schema, table_name
+        );
+
+        for (i, col) in config.data_columns.iter().enumerate() {
+            data_sql.push_str(&format!(", col{:02} {}", i, col.col_type));
+        }
+        data_sql.push_str(");");
+
+        // SAFETY: execute_sql_ffi is called with a valid database handle
+        unsafe { execute_sql_ffi(db, &data_sql)? };
     }
 
     Ok(())
@@ -1362,6 +1406,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         let result = create_shadow_tables(&db, "main", "test_table", &config);
         assert!(
@@ -1394,6 +1439,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: true,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         let result = create_shadow_tables(&db, "main", "test_table", &config);
         assert!(result.is_ok());
@@ -1420,6 +1466,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         let result = create_shadow_tables(&db, "main", "test_table", &config);
         assert!(result.is_ok());
@@ -1551,6 +1598,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         create_shadow_tables(&db, "main", "test_table", &config).unwrap();
 
@@ -1578,6 +1626,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         create_shadow_tables(&db, "main", "test_table", &config).unwrap();
 
@@ -1607,6 +1656,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         create_shadow_tables(&db, "main", "test_table", &config).unwrap();
 

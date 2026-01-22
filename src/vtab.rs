@@ -44,6 +44,8 @@ pub fn register_vec0_module(db: &Connection) -> Result<()> {
 struct ColumnDef {
     name: String,
     col_type: ColumnType,
+    /// The SQL type for non-vector columns (INTEGER, TEXT, REAL, BLOB)
+    sql_type: String,
 }
 
 /// Custom HNSW parameters for a vector column
@@ -347,6 +349,35 @@ pub struct Vec0Tab {
     hnsw_stmt_cache: Vec<HnswStmtCache>, // One cache per vector column
 }
 
+/// Normalize SQL type specification to standard SQLite types
+/// Maps various type names to INTEGER, TEXT, REAL, or BLOB
+fn normalize_sql_type(type_spec: &str) -> String {
+    let upper = type_spec.to_uppercase();
+
+    // INTEGER types
+    if upper.contains("INT") || upper == "BOOLEAN" || upper == "BOOL" {
+        return "INTEGER".to_string();
+    }
+
+    // REAL types
+    if upper.contains("REAL")
+        || upper.contains("DOUBLE")
+        || upper.contains("FLOAT")
+        || upper.contains("NUMERIC")
+        || upper.contains("DECIMAL")
+    {
+        return "REAL".to_string();
+    }
+
+    // BLOB types
+    if upper.contains("BLOB") || upper.contains("BINARY") {
+        return "BLOB".to_string();
+    }
+
+    // Default to TEXT for everything else (VARCHAR, CHAR, TEXT, etc.)
+    "TEXT".to_string()
+}
+
 /// Extract the hnsw(...) clause from a column definition string.
 /// Returns (string_without_hnsw, Some(hnsw_clause)) or (original_string, None).
 /// Uses regex to handle spaces inside hnsw() by matching balanced parentheses.
@@ -519,29 +550,37 @@ impl Vec0Tab {
                             index_quantization,
                             hnsw_params,
                         },
+                        sql_type: "BLOB".to_string(),
                     });
                 } else if type_spec.to_uppercase().contains("PARTITION") {
                     columns.push(ColumnDef {
                         name,
                         col_type: ColumnType::PartitionKey,
+                        sql_type: "INTEGER".to_string(),
                     });
                 } else if parts.iter().any(|p| p.to_uppercase().starts_with('+')) {
+                    // Auxiliary column - parse the SQL type
+                    let sql_type = normalize_sql_type(type_spec);
                     columns.push(ColumnDef {
                         name: name.trim_start_matches('+').to_string(),
                         col_type: ColumnType::Auxiliary,
+                        sql_type,
                     });
                 } else {
-                    // Default to metadata column
+                    // Metadata column - parse the SQL type
+                    let sql_type = normalize_sql_type(type_spec);
                     columns.push(ColumnDef {
                         name,
                         col_type: ColumnType::Metadata,
+                        sql_type,
                     });
                 }
             } else {
-                // No type specified, treat as metadata
+                // No type specified, treat as metadata with TEXT type
                 columns.push(ColumnDef {
                     name,
                     col_type: ColumnType::Metadata,
+                    sql_type: "TEXT".to_string(),
                 });
             }
         }
@@ -737,6 +776,18 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         unsafe {
             let db_handle = db.handle();
 
+            // Build data column definitions for non-vector columns
+            // Use the actual SQL type from the column definition for type preservation
+            let data_columns: Vec<shadow::DataColumnDef> = vtab
+                .columns
+                .iter()
+                .filter(|c| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary))
+                .map(|c| shadow::DataColumnDef {
+                    name: c.name.clone(),
+                    col_type: c.sql_type.clone(),
+                })
+                .collect();
+
             // Create base shadow tables
             let config = shadow::ShadowTablesConfig {
                 num_vector_columns,
@@ -744,6 +795,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                 num_auxiliary_columns,
                 has_text_pk: false, // TODO: detect from args
                 num_partition_columns,
+                data_columns,
             };
 
             // Collect vector column names for cleanup
@@ -850,18 +902,30 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             format!("{}_info", self.table_name),
         ];
 
-        // Add vector chunk tables and HNSW tables for each vector column
+        // Add per-column shadow tables for each column
+        // Note: vector_chunks tables use vector-column-specific index (0, 1, 2... for each vector column)
+        // while metadata tables use overall column index
+        let mut vec_col_idx = 0;
         for (col_idx, col) in self.columns.iter().enumerate() {
             if let ColumnType::Vector { .. } = col.col_type {
-                // Vector chunk table
-                shadow_tables.push(format!("{}_vector_chunks{:02}", self.table_name, col_idx));
+                // Vector chunk table (uses vector column index, not overall column index)
+                shadow_tables.push(format!(
+                    "{}_vector_chunks{:02}",
+                    self.table_name, vec_col_idx
+                ));
 
                 // HNSW tables
                 shadow_tables.push(format!("{}_{}_hnsw_nodes", self.table_name, col.name));
                 shadow_tables.push(format!("{}_{}_hnsw_edges", self.table_name, col.name));
                 shadow_tables.push(format!("{}_{}_hnsw_levels", self.table_name, col.name));
                 shadow_tables.push(format!("{}_{}_hnsw_meta", self.table_name, col.name));
+
+                vec_col_idx += 1;
             }
+
+            // Legacy metadata tables (may exist from older versions)
+            shadow_tables.push(format!("{}_metadatachunks{:02}", self.table_name, col_idx));
+            shadow_tables.push(format!("{}_metadatatext{:02}", self.table_name, col_idx));
         }
 
         // Add auxiliary table if there are auxiliary columns
@@ -872,6 +936,9 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         {
             shadow_tables.push(format!("{}_auxiliary", self.table_name));
         }
+
+        // Add _data table for non-vector column storage
+        shadow_tables.push(format!("{}_data", self.table_name));
 
         // Drop each shadow table (ignore errors for tables that don't exist)
         for table in shadow_tables {
@@ -1049,6 +1116,22 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 ),
                 [rowid],
             )?;
+
+            // Delete from _data table (non-vector columns)
+            let has_data_columns = self
+                .columns
+                .iter()
+                .any(|c| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary));
+            if has_data_columns {
+                let data_table = format!("{}_data", self.table_name);
+                conn.execute(
+                    &format!(
+                        "DELETE FROM \"{}\".\"{}\" WHERE rowid = ?",
+                        self.schema_name, data_table
+                    ),
+                    [rowid],
+                )?;
+            }
         }
 
         // Release connection without closing the database
@@ -1275,6 +1358,66 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                 }
 
                 vec_col_idx += 1;
+            }
+        }
+
+        // Process ALL non-vector columns - single efficient INSERT into _data table
+        let data_columns: Vec<usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary))
+            .map(|(col_idx, _)| col_idx)
+            .collect();
+
+        if !data_columns.is_empty() {
+            // SAFETY: self.db is valid for the lifetime of the virtual table
+            unsafe {
+                let conn = Connection::from_handle(self.db).map_err(|e| {
+                    rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                })?;
+
+                // Build single INSERT statement for _data table
+                // Schema: (rowid, col00, col01, col02, ...)
+                let data_table = format!("{}_data", self.table_name);
+                let mut col_names = String::from("rowid");
+                let mut placeholders = String::from("?");
+                for i in 0..data_columns.len() {
+                    col_names.push_str(&format!(", col{:02}", i));
+                    placeholders.push_str(", ?");
+                }
+
+                let insert_sql = format!(
+                    "INSERT OR REPLACE INTO \"{}\".\"{}\" ({}) VALUES ({})",
+                    self.schema_name, data_table, col_names, placeholders
+                );
+
+                // Collect all values in order
+                let mut values: Vec<rusqlite::types::Value> = vec![rowid.into()];
+                for col_idx in &data_columns {
+                    let value_idx = col_idx + 2; // Skip NULL and rowid args
+                    if value_idx < args.len() {
+                        // Preserve original type for efficiency
+                        if let Ok(Some(i)) = args.get::<Option<i64>>(value_idx) {
+                            values.push(i.into());
+                        } else if let Ok(Some(f)) = args.get::<Option<f64>>(value_idx) {
+                            values.push(f.into());
+                        } else if let Ok(Some(s)) = args.get::<Option<String>>(value_idx) {
+                            values.push(s.into());
+                        } else if let Ok(Some(b)) = args.get::<Option<Vec<u8>>>(value_idx) {
+                            values.push(b.into());
+                        } else {
+                            values.push(rusqlite::types::Value::Null);
+                        }
+                    } else {
+                        values.push(rusqlite::types::Value::Null);
+                    }
+                }
+
+                conn.execute(&insert_sql, rusqlite::params_from_iter(values))
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                std::mem::forget(conn);
             }
         }
 
@@ -1533,6 +1676,67 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
 
                 std::mem::forget(conn);
                 vec_col_idx += 1;
+            }
+        }
+
+        // Process ALL non-vector columns on UPDATE - single efficient UPDATE to _data table
+        let data_columns: Vec<usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary))
+            .map(|(col_idx, _)| col_idx)
+            .collect();
+
+        if !data_columns.is_empty() {
+            // SAFETY: self.db is valid for the lifetime of the virtual table
+            unsafe {
+                let conn = Connection::from_handle(self.db).map_err(|e| {
+                    rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
+                })?;
+
+                let data_table = format!("{}_data", self.table_name);
+
+                // Build single UPDATE statement for all non-vector columns
+                let mut set_clauses = Vec::new();
+                let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+                for (data_idx, col_idx) in data_columns.iter().enumerate() {
+                    let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
+                    if value_idx < args.len() {
+                        set_clauses.push(format!("col{:02} = ?", data_idx));
+
+                        // Preserve type information
+                        if let Ok(Some(i)) = args.get::<Option<i64>>(value_idx) {
+                            values.push(i.into());
+                        } else if let Ok(Some(f)) = args.get::<Option<f64>>(value_idx) {
+                            values.push(f.into());
+                        } else if let Ok(Some(s)) = args.get::<Option<String>>(value_idx) {
+                            values.push(s.into());
+                        } else if let Ok(Some(b)) = args.get::<Option<Vec<u8>>>(value_idx) {
+                            values.push(b.into());
+                        } else {
+                            values.push(rusqlite::types::Value::Null);
+                        }
+                    }
+                }
+
+                if !set_clauses.is_empty() {
+                    // Add rowid for WHERE clause
+                    values.push(old_rowid.into());
+
+                    let update_sql = format!(
+                        "UPDATE \"{}\".\"{}\" SET {} WHERE rowid = ?",
+                        self.schema_name,
+                        data_table,
+                        set_clauses.join(", ")
+                    );
+
+                    conn.execute(&update_sql, rusqlite::params_from_iter(values))
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+                }
+
+                std::mem::forget(conn);
             }
         }
 
@@ -1798,7 +2002,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
 
         // Check if this is a vector column
         if col_idx < vtab.columns.len()
-            && let ColumnType::Vector { .. } = &vtab.columns[col_idx].col_type
+            && let ColumnType::Vector { vec_type, dimensions, .. } = &vtab.columns[col_idx].col_type
         {
             // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
             let vec_col_idx = vtab
@@ -1828,13 +2032,84 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
             };
 
             match vector_data {
-                Some(data) => ctx.set_result(&data.as_slice())?,
+                Some(data) => {
+                    // Convert binary blob to Vector and then to JSON for human-readable output
+                    let vector = Vector::from_blob(&data, *vec_type, *dimensions)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    let json = vector
+                        .to_json()
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    ctx.set_result(&json)?
+                }
                 None => ctx.set_result(&rusqlite::types::Null)?,
             }
             return Ok(());
         }
 
-        // For non-vector columns, return NULL for now
+        // Check if this is a non-vector column (Metadata or Auxiliary)
+        // Read from unified _data table for efficiency
+        if col_idx < vtab.columns.len()
+            && matches!(vtab.columns[col_idx].col_type, ColumnType::Metadata | ColumnType::Auxiliary)
+        {
+            // Compute data_col_idx: the index among all non-vector columns
+            let data_col_idx = vtab
+                .columns
+                .iter()
+                .take(col_idx)
+                .filter(|c| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary))
+                .count();
+
+            // Read from unified _data shadow table
+            // SAFETY: vtab.db is valid for the lifetime of the virtual table
+            unsafe {
+                let conn = Connection::from_handle(vtab.db)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                let data_table = format!("{}_data", vtab.table_name);
+                let query = format!(
+                    "SELECT col{:02} FROM \"{}\".\"{}\" WHERE rowid = ?",
+                    data_col_idx, vtab.schema_name, data_table
+                );
+
+                // Try to get the value preserving its original type
+                let result = conn
+                    .query_row(&query, [rowid], |row| {
+                        // Get the raw value and set result based on type
+                        let value_ref = row.get_ref(0)?;
+                        match value_ref {
+                            rusqlite::types::ValueRef::Null => {
+                                ctx.set_result(&rusqlite::types::Null)
+                            }
+                            rusqlite::types::ValueRef::Integer(i) => {
+                                ctx.set_result(&i)
+                            }
+                            rusqlite::types::ValueRef::Real(f) => {
+                                ctx.set_result(&f)
+                            }
+                            rusqlite::types::ValueRef::Text(t) => {
+                                let s = std::str::from_utf8(t).unwrap_or("");
+                                ctx.set_result(&s)
+                            }
+                            rusqlite::types::ValueRef::Blob(b) => {
+                                ctx.set_result(&b)
+                            }
+                        }
+                    })
+                    .optional()
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
+
+                // If no row found, return NULL
+                if result.is_none() {
+                    ctx.set_result(&rusqlite::types::Null)?;
+                }
+
+                std::mem::forget(conn);
+            };
+
+            return Ok(());
+        }
+
+        // For partition key columns, return NULL for now
         ctx.set_result(&rusqlite::types::Null)?;
         Ok(())
     }
@@ -2318,5 +2593,407 @@ mod tests {
 
         println!("Rowids: {:?}", rowids);
         assert_eq!(rowids, vec![1, 2, 3]);
+    }
+
+    // ========================================================================
+    // NON-VECTOR COLUMN TESTS
+    // These tests verify that non-vector columns (INTEGER, TEXT, REAL, BLOB)
+    // are properly stored, retrieved, updated, and deleted.
+    // ========================================================================
+
+    #[test]
+    fn test_create_table_with_nonvector_columns() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        // Create table with mixed columns
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_mixed USING vec0(
+                id INTEGER,
+                name TEXT,
+                score REAL,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Verify _data table was created with correct schema
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'test_mixed%'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(tables.contains(&"test_mixed_data".to_string()),
+            "_data table should be created for non-vector columns");
+    }
+
+    #[test]
+    fn test_insert_nonvector_values() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_insert USING vec0(
+                id INTEGER,
+                name TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert with non-vector values
+        db.execute(
+            "INSERT INTO test_insert(rowid, id, name, embedding) VALUES (1, 100, 'test_name', '[0.1, 0.2, 0.3]')",
+            [],
+        ).unwrap();
+
+        // Verify data exists in _data table
+        let (id, name): (i64, String) = db.query_row(
+            "SELECT col00, col01 FROM test_insert_data WHERE rowid = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(id, 100, "INTEGER value should be stored correctly");
+        assert_eq!(name, "test_name", "TEXT value should be stored correctly");
+    }
+
+    #[test]
+    fn test_select_nonvector_values() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_select USING vec0(
+                lib_feat_id INTEGER,
+                label TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert test data
+        db.execute(
+            "INSERT INTO test_select(rowid, lib_feat_id, label, embedding) VALUES (1, 42, 'my_label', '[1.0, 2.0, 3.0]')",
+            [],
+        ).unwrap();
+
+        // SELECT non-vector columns - THIS WAS THE ORIGINAL BUG (returned NULL)
+        let (lib_feat_id, label): (i64, String) = db.query_row(
+            "SELECT lib_feat_id, label FROM test_select WHERE rowid = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(lib_feat_id, 42, "lib_feat_id should return 42, not NULL");
+        assert_eq!(label, "my_label", "label should return 'my_label', not NULL");
+    }
+
+    #[test]
+    fn test_update_nonvector_values() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_update USING vec0(
+                id INTEGER,
+                name TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert initial data
+        db.execute(
+            "INSERT INTO test_update(rowid, id, name, embedding) VALUES (1, 100, 'original', '[0.1, 0.2, 0.3]')",
+            [],
+        ).unwrap();
+
+        // Update non-vector columns
+        db.execute(
+            "UPDATE test_update SET id = 200, name = 'updated' WHERE rowid = 1",
+            [],
+        ).unwrap();
+
+        // Verify updated values
+        let (id, name): (i64, String) = db.query_row(
+            "SELECT id, name FROM test_update WHERE rowid = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(id, 200, "id should be updated to 200");
+        assert_eq!(name, "updated", "name should be updated to 'updated'");
+    }
+
+    #[test]
+    fn test_delete_removes_nonvector_data() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_delete USING vec0(
+                id INTEGER,
+                name TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert data
+        db.execute(
+            "INSERT INTO test_delete(rowid, id, name, embedding) VALUES (1, 100, 'to_delete', '[0.1, 0.2, 0.3]')",
+            [],
+        ).unwrap();
+
+        // Verify data exists in _data table
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM test_delete_data WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "Data should exist before delete");
+
+        // Delete the row
+        db.execute("DELETE FROM test_delete WHERE rowid = 1", []).unwrap();
+
+        // Verify data is removed from _data table
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM test_delete_data WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "Data should be removed from _data table after delete");
+    }
+
+    #[test]
+    fn test_null_nonvector_values() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_null USING vec0(
+                id INTEGER,
+                name TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert with NULL non-vector columns
+        db.execute(
+            "INSERT INTO test_null(rowid, id, name, embedding) VALUES (1, NULL, NULL, '[0.1, 0.2, 0.3]')",
+            [],
+        ).unwrap();
+
+        // SELECT should return NULL values
+        let id: Option<i64> = db.query_row(
+            "SELECT id FROM test_null WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+
+        let name: Option<String> = db.query_row(
+            "SELECT name FROM test_null WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+
+        assert!(id.is_none(), "NULL INTEGER should be returned as None");
+        assert!(name.is_none(), "NULL TEXT should be returned as None");
+    }
+
+    #[test]
+    fn test_type_preservation() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_types USING vec0(
+                int_col INTEGER,
+                real_col REAL,
+                text_col TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert typed values
+        db.execute(
+            "INSERT INTO test_types(rowid, int_col, real_col, text_col, embedding) VALUES (1, 42, 3.14159, 'hello', '[1.0, 2.0, 3.0]')",
+            [],
+        ).unwrap();
+
+        // Verify types are preserved
+        let int_val: i64 = db.query_row(
+            "SELECT int_col FROM test_types WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(int_val, 42);
+
+        let real_val: f64 = db.query_row(
+            "SELECT real_col FROM test_types WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        #[allow(clippy::approx_constant)]
+        let expected_val = 3.14159;
+        assert!((real_val - expected_val).abs() < 0.00001, "REAL value should be preserved");
+
+        let text_val: String = db.query_row(
+            "SELECT text_col FROM test_types WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(text_val, "hello");
+    }
+
+    #[test]
+    fn test_knn_with_nonvector_columns() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_knn USING vec0(
+                id INTEGER,
+                label TEXT,
+                embedding float[3] hnsw(distance=cosine, M=8, ef_construction=50)
+            )"
+        ).unwrap();
+
+        // Insert multiple rows
+        db.execute("INSERT INTO test_knn(rowid, id, label, embedding) VALUES (1, 100, 'first', '[1.0, 0.0, 0.0]')", []).unwrap();
+        db.execute("INSERT INTO test_knn(rowid, id, label, embedding) VALUES (2, 200, 'second', '[0.9, 0.1, 0.0]')", []).unwrap();
+        db.execute("INSERT INTO test_knn(rowid, id, label, embedding) VALUES (3, 300, 'third', '[0.0, 1.0, 0.0]')", []).unwrap();
+
+        // KNN search should return non-vector columns correctly
+        let results: Vec<(i64, i64, String)> = db
+            .prepare("SELECT rowid, id, label FROM test_knn WHERE embedding MATCH '[1.0, 0.0, 0.0]' AND k = 2 ORDER BY distance")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "KNN should return 2 results");
+
+        // First result should be exact match (rowid=1, id=100, label='first')
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1, 100);
+        assert_eq!(results[0].2, "first");
+
+        // Second result should be close match (rowid=2, id=200, label='second')
+        assert_eq!(results[1].0, 2);
+        assert_eq!(results[1].1, 200);
+        assert_eq!(results[1].2, "second");
+    }
+
+    #[test]
+    fn test_full_crud_cycle() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        // CREATE
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_crud USING vec0(
+                product_id INTEGER,
+                product_name TEXT,
+                price REAL,
+                embedding float[4]
+            )"
+        ).unwrap();
+
+        // INSERT
+        db.execute(
+            "INSERT INTO test_crud(rowid, product_id, product_name, price, embedding) VALUES (1, 1001, 'Widget', 19.99, '[0.1, 0.2, 0.3, 0.4]')",
+            [],
+        ).unwrap();
+
+        // READ - verify all values
+        let (id, name, price): (i64, String, f64) = db.query_row(
+            "SELECT product_id, product_name, price FROM test_crud WHERE rowid = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(id, 1001);
+        assert_eq!(name, "Widget");
+        assert!((price - 19.99).abs() < 0.001);
+
+        // UPDATE
+        db.execute(
+            "UPDATE test_crud SET product_id = 2002, product_name = 'Gadget', price = 29.99 WHERE rowid = 1",
+            [],
+        ).unwrap();
+
+        // READ - verify updated values
+        let (id, name, price): (i64, String, f64) = db.query_row(
+            "SELECT product_id, product_name, price FROM test_crud WHERE rowid = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(id, 2002);
+        assert_eq!(name, "Gadget");
+        assert!((price - 29.99).abs() < 0.001);
+
+        // DELETE
+        db.execute("DELETE FROM test_crud WHERE rowid = 1", []).unwrap();
+
+        // Verify deleted
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM test_crud",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "Table should be empty after delete");
+    }
+
+    #[test]
+    fn test_multiple_rows_nonvector_columns() {
+        use crate::init;
+
+        let db = Connection::open_in_memory().unwrap();
+        init(&db).unwrap();
+
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE test_multi USING vec0(
+                seq INTEGER,
+                name TEXT,
+                embedding float[3]
+            )"
+        ).unwrap();
+
+        // Insert multiple rows
+        for i in 1..=10 {
+            db.execute(
+                &format!("INSERT INTO test_multi(rowid, seq, name, embedding) VALUES ({}, {}, 'item_{}', '[{}.0, 0.0, 0.0]')", i, i * 10, i, i),
+                [],
+            ).unwrap();
+        }
+
+        // Verify all rows have correct data
+        for i in 1..=10 {
+            let (seq, name): (i64, String) = db.query_row(
+                &format!("SELECT seq, name FROM test_multi WHERE rowid = {}", i),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(seq, i * 10, "seq should be {} for rowid {}", i * 10, i);
+            assert_eq!(name, format!("item_{}", i), "name should be 'item_{}' for rowid {}", i, i);
+        }
     }
 }

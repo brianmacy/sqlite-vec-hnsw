@@ -279,8 +279,8 @@ fn test_update_non_vector_columns_before_vector() {
     assert!(results[0].1 < 0.001, "Distance should be near zero");
 }
 
-/// Test SELECT embedding returns proper data with non-vector columns first
-/// Verifies that embedding data can be read back and converted to JSON
+/// Test SELECT embedding returns proper JSON data with non-vector columns first
+/// Verifies that embedding data can be read back and parsed as JSON
 #[test]
 fn test_select_embedding_with_non_vector_columns_first() {
     let db = Connection::open_in_memory().unwrap();
@@ -304,24 +304,25 @@ fn test_select_embedding_with_non_vector_columns_first() {
     )
     .unwrap();
 
-    // SELECT embedding should return correct binary data
-    let embedding_blob: Vec<u8> = db
+    // SELECT embedding now returns JSON string by default
+    let json_str: String = db
         .query_row("SELECT embedding FROM test WHERE rowid = 1", [], |row| {
             row.get(0)
         })
         .unwrap();
 
-    // Verify blob size (4 floats * 4 bytes = 16 bytes)
-    assert_eq!(
-        embedding_blob.len(),
-        16,
-        "Embedding blob should be 16 bytes (4 float32s)"
+    // Parse JSON and verify values
+    assert!(
+        json_str.starts_with('[') && json_str.ends_with(']'),
+        "Embedding should return JSON array, got: {}",
+        json_str
     );
 
-    // Parse blob back to floats
-    let floats: Vec<f32> = embedding_blob
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+    // Parse JSON to verify values
+    let trimmed = json_str.trim_start_matches('[').trim_end_matches(']');
+    let floats: Vec<f32> = trimmed
+        .split(',')
+        .map(|s| s.trim().parse::<f32>().unwrap())
         .collect();
 
     assert_eq!(floats.len(), 4, "Should have 4 float values");
@@ -329,22 +330,6 @@ fn test_select_embedding_with_non_vector_columns_first() {
     assert!((floats[1] - 2.0).abs() < 0.001, "Second float should be 2.0");
     assert!((floats[2] - 3.0).abs() < 0.001, "Third float should be 3.0");
     assert!((floats[3] - 4.0).abs() < 0.001, "Fourth float should be 4.0");
-
-    // Verify vec_to_json works to convert back to JSON array
-    let json_str: String = db
-        .query_row(
-            "SELECT vec_to_json(embedding) FROM test WHERE rowid = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-
-    // Parse JSON and verify values
-    assert!(
-        json_str.starts_with('[') && json_str.ends_with(']'),
-        "vec_to_json should return JSON array, got: {}",
-        json_str
-    );
 
     // Verify the JSON contains expected values
     let expected_values = ["1.0", "2.0", "3.0", "4.0"];

@@ -38,8 +38,8 @@ fn test_int8_basic_insert_and_read() {
     )
     .unwrap();
 
-    // Verify we can read it back
-    let embedding: Vec<u8> = db
+    // Verify we can read it back (now returns JSON string)
+    let embedding_json: String = db
         .query_row(
             "SELECT embedding FROM vectors_int8 WHERE rowid = 1",
             [],
@@ -47,7 +47,13 @@ fn test_int8_basic_insert_and_read() {
         )
         .unwrap();
 
-    assert_eq!(embedding.len(), 128, "Int8 vector should be 128 bytes");
+    // Parse JSON and verify it has 128 integer values
+    let trimmed = embedding_json.trim_start_matches('[').trim_end_matches(']');
+    let values: Vec<i8> = trimmed
+        .split(',')
+        .map(|s| s.trim().parse::<i8>().unwrap())
+        .collect();
+    assert_eq!(values.len(), 128, "Int8 vector should have 128 values");
     println!("✓ Int8 vector insert and read works");
 }
 
@@ -86,8 +92,8 @@ fn test_int8_quantization_from_float32() {
     )
     .unwrap();
 
-    // Verify quantization worked
-    let embedding: Vec<u8> = db
+    // Verify quantization worked (now returns JSON string)
+    let embedding_json: String = db
         .query_row(
             "SELECT embedding FROM vectors_int8 WHERE rowid = 1",
             [],
@@ -95,7 +101,13 @@ fn test_int8_quantization_from_float32() {
         )
         .unwrap();
 
-    assert_eq!(embedding.len(), 128);
+    // Parse JSON and verify it has 128 integer values
+    let trimmed = embedding_json.trim_start_matches('[').trim_end_matches(']');
+    let values: Vec<i8> = trimmed
+        .split(',')
+        .map(|s| s.trim().parse::<i8>().unwrap())
+        .collect();
+    assert_eq!(values.len(), 128);
     println!("✓ Float32 to int8 quantization works");
 }
 

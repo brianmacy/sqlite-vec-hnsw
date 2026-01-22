@@ -65,8 +65,8 @@ fn test_disk_persistence_across_connections() {
         println!("✓ Reopened database has {} rows", count);
         assert_eq!(count, 100, "Should have 100 rows after reopening");
 
-        // Verify we can read vectors
-        let embedding: Vec<u8> = db
+        // Verify we can read vectors (now returns JSON string)
+        let embedding_json: String = db
             .query_row(
                 "SELECT embedding FROM vectors WHERE rowid = 50",
                 [],
@@ -74,10 +74,16 @@ fn test_disk_persistence_across_connections() {
             )
             .unwrap();
 
+        // Verify JSON format is valid and contains expected number of floats
+        let trimmed = embedding_json.trim_start_matches('[').trim_end_matches(']');
+        let floats: Vec<f32> = trimmed
+            .split(',')
+            .map(|s| s.trim().parse::<f32>().unwrap())
+            .collect();
         assert_eq!(
-            embedding.len(),
-            128 * 4,
-            "Vector should be 128 float32s = 512 bytes"
+            floats.len(),
+            128,
+            "Vector should have 128 float32 values"
         );
         println!("✓ Can read vectors from disk");
 

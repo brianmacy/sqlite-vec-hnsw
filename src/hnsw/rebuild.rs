@@ -167,6 +167,7 @@ mod tests {
             num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
+            data_columns: vec![],
         };
         shadow::create_shadow_tables(&db, "main", "test_table", &config).unwrap();
         shadow::create_hnsw_shadow_tables(&db, "test_table", "embedding").unwrap();
