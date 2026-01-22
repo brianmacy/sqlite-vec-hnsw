@@ -278,3 +278,133 @@ fn test_update_non_vector_columns_before_vector() {
     // Distance should be near zero for exact match
     assert!(results[0].1 < 0.001, "Distance should be near zero");
 }
+
+/// Test SELECT embedding returns proper data with non-vector columns first
+/// Verifies that embedding data can be read back and converted to JSON
+#[test]
+fn test_select_embedding_with_non_vector_columns_first() {
+    let db = Connection::open_in_memory().unwrap();
+    sqlite_vec_hnsw::init(&db).unwrap();
+
+    // Create table with non-vector columns before vector column
+    db.execute(
+        "CREATE VIRTUAL TABLE test USING vec0(
+            id INTEGER,
+            label TEXT,
+            embedding float[4] hnsw()
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert test data
+    db.execute(
+        "INSERT INTO test(rowid, id, label, embedding) VALUES (1, 100, 'first', vec_f32('[1.0, 2.0, 3.0, 4.0]'))",
+        [],
+    )
+    .unwrap();
+
+    // SELECT embedding should return correct binary data
+    let embedding_blob: Vec<u8> = db
+        .query_row("SELECT embedding FROM test WHERE rowid = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    // Verify blob size (4 floats * 4 bytes = 16 bytes)
+    assert_eq!(
+        embedding_blob.len(),
+        16,
+        "Embedding blob should be 16 bytes (4 float32s)"
+    );
+
+    // Parse blob back to floats
+    let floats: Vec<f32> = embedding_blob
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+
+    assert_eq!(floats.len(), 4, "Should have 4 float values");
+    assert!((floats[0] - 1.0).abs() < 0.001, "First float should be 1.0");
+    assert!((floats[1] - 2.0).abs() < 0.001, "Second float should be 2.0");
+    assert!((floats[2] - 3.0).abs() < 0.001, "Third float should be 3.0");
+    assert!((floats[3] - 4.0).abs() < 0.001, "Fourth float should be 4.0");
+
+    // Verify vec_to_json works to convert back to JSON array
+    let json_str: String = db
+        .query_row(
+            "SELECT vec_to_json(embedding) FROM test WHERE rowid = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // Parse JSON and verify values
+    assert!(
+        json_str.starts_with('[') && json_str.ends_with(']'),
+        "vec_to_json should return JSON array, got: {}",
+        json_str
+    );
+
+    // Verify the JSON contains expected values
+    let expected_values = ["1.0", "2.0", "3.0", "4.0"];
+    for (i, val) in expected_values.iter().enumerate() {
+        assert!(
+            json_str.contains(val) || json_str.contains(&val.replace(".0", "")),
+            "JSON should contain {} at position {}, got: {}",
+            val,
+            i,
+            json_str
+        );
+    }
+}
+
+/// Test multiple rows with SELECT embedding
+#[test]
+fn test_select_multiple_embeddings() {
+    let db = Connection::open_in_memory().unwrap();
+    sqlite_vec_hnsw::init(&db).unwrap();
+
+    // Create table with non-vector column first
+    db.execute(
+        "CREATE VIRTUAL TABLE vectors USING vec0(
+            name TEXT,
+            vec float[3] hnsw()
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert multiple rows
+    db.execute("INSERT INTO vectors(rowid, name, vec) VALUES (1, 'a', vec_f32('[1.0, 0.0, 0.0]'))", []).unwrap();
+    db.execute("INSERT INTO vectors(rowid, name, vec) VALUES (2, 'b', vec_f32('[0.0, 1.0, 0.0]'))", []).unwrap();
+    db.execute("INSERT INTO vectors(rowid, name, vec) VALUES (3, 'c', vec_f32('[0.0, 0.0, 1.0]'))", []).unwrap();
+
+    // Query all rows and verify embeddings can be converted to JSON
+    let mut stmt = db
+        .prepare("SELECT rowid, vec_to_json(vec) FROM vectors ORDER BY rowid")
+        .unwrap();
+
+    let results: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(results.len(), 3, "Should have 3 rows");
+
+    // Verify each row's embedding
+    assert!(results[0].1.contains("1"), "Row 1 should have [1,0,0]");
+    assert!(results[1].1.contains("1"), "Row 2 should have [0,1,0]");
+    assert!(results[2].1.contains("1"), "Row 3 should have [0,0,1]");
+
+    // Verify they're all valid JSON arrays
+    for (rowid, json) in &results {
+        assert!(
+            json.starts_with('[') && json.ends_with(']'),
+            "Row {} should have valid JSON array, got: {}",
+            rowid,
+            json
+        );
+    }
+}

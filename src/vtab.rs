@@ -706,21 +706,23 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         // First, parse arguments and create the base virtual table
         let (sql, vtab) = Self::connect(db, aux, args)?;
 
-        // Count column types
+        // Count column types for shadow table creation
+        // Shadow tables use sequential indices (0, 1, 2) for vector columns,
+        // regardless of their position in the overall table definition
         let num_vector_columns = vtab
             .columns
             .iter()
             .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
             .count();
-        let num_auxiliary_columns = vtab
-            .columns
-            .iter()
-            .filter(|c| matches!(c.col_type, ColumnType::Auxiliary))
-            .count();
         let num_metadata_columns = vtab
             .columns
             .iter()
             .filter(|c| matches!(c.col_type, ColumnType::Metadata))
+            .count();
+        let num_auxiliary_columns = vtab
+            .columns
+            .iter()
+            .filter(|c| matches!(c.col_type, ColumnType::Auxiliary))
             .count();
         let num_partition_columns = vtab
             .columns
@@ -738,8 +740,8 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             // Create base shadow tables
             let config = shadow::ShadowTablesConfig {
                 num_vector_columns,
-                num_auxiliary_columns,
                 num_metadata_columns,
+                num_auxiliary_columns,
                 has_text_pk: false, // TODO: detect from args
                 num_partition_columns,
             };
@@ -1709,11 +1711,18 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                         }
                     } else {
                         // ENN mode: exact nearest neighbor via brute force
+                        // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
+                        let vec_col_idx = vtab
+                            .columns
+                            .iter()
+                            .take(col_idx)
+                            .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
+                            .count();
                         brute_force_search(
                             &conn,
                             &vtab.schema_name,
                             &vtab.table_name,
-                            col_idx,
+                            vec_col_idx,
                             &query_vector,
                             k as usize,
                             distance_metric,
@@ -1791,6 +1800,14 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
         if col_idx < vtab.columns.len()
             && let ColumnType::Vector { .. } = &vtab.columns[col_idx].col_type
         {
+            // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
+            let vec_col_idx = vtab
+                .columns
+                .iter()
+                .take(col_idx)
+                .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
+                .count();
+
             // Read vector from shadow tables
             // SAFETY: vtab.db is valid for the lifetime of the virtual table
             let vector_data = unsafe {
@@ -1801,7 +1818,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                     &conn,
                     &vtab.schema_name,
                     &vtab.table_name,
-                    col_idx,
+                    vec_col_idx,
                     rowid,
                 )
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;

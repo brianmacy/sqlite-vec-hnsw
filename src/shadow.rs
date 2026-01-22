@@ -90,9 +90,11 @@ impl ValidityBitmap {
 
 /// Configuration for shadow table creation
 pub struct ShadowTablesConfig {
+    /// Number of vector columns (shadow tables named _vector_chunks00, 01, 02, etc.)
     pub num_vector_columns: usize,
-    pub num_auxiliary_columns: usize,
+    /// Number of metadata columns
     pub num_metadata_columns: usize,
+    pub num_auxiliary_columns: usize,
     pub has_text_pk: bool,
     pub num_partition_columns: usize,
 }
@@ -116,7 +118,7 @@ pub unsafe fn drop_shadow_tables_ffi(
         format!("\"{}\".\"{}_auxiliary\"", schema, table_name),
     ];
 
-    // Vector chunk tables
+    // Vector chunk tables (sequential indices: 0, 1, 2, etc.)
     for i in 0..config.num_vector_columns {
         tables_to_drop.push(format!(
             "\"{}\".\"{}_vector_chunks{:02}\"",
@@ -124,7 +126,7 @@ pub unsafe fn drop_shadow_tables_ffi(
         ));
     }
 
-    // Metadata tables
+    // Metadata tables (sequential indices: 0, 1, 2, etc.)
     for i in 0..config.num_metadata_columns {
         tables_to_drop.push(format!(
             "\"{}\".\"{}_metadatachunks{:02}\"",
@@ -264,7 +266,7 @@ pub fn create_shadow_tables(
     )
     .map_err(Error::Sqlite)?;
 
-    // Create vector_chunks shadow tables (one per vector column)
+    // Create vector_chunks shadow tables (sequential indices: 0, 1, 2, etc.)
     for i in 0..config.num_vector_columns {
         let vector_sql = format!(
             "CREATE TABLE \"{}\".\"{}_vector_chunks{:02}\" (\
@@ -277,7 +279,7 @@ pub fn create_shadow_tables(
         db.execute(&vector_sql, []).map_err(Error::Sqlite)?;
     }
 
-    // Create metadata shadow tables
+    // Create metadata shadow tables (sequential indices: 0, 1, 2, etc.)
     for i in 0..config.num_metadata_columns {
         let metadata_sql = format!(
             "CREATE TABLE \"{}\".\"{}_metadatachunks{:02}\" (\
@@ -538,7 +540,7 @@ pub unsafe fn create_shadow_tables_ffi(
         unsafe { execute_sql_ffi(db, &sql)? };
     }
 
-    // Create vector_chunks shadow tables
+    // Create vector_chunks shadow tables (sequential indices: 0, 1, 2, etc.)
     for i in 0..config.num_vector_columns {
         let vector_sql = format!(
             "CREATE TABLE \"{}\".\"{}_vector_chunks{:02}\" (\
@@ -551,7 +553,7 @@ pub unsafe fn create_shadow_tables_ffi(
         unsafe { execute_sql_ffi(db, &vector_sql)? };
     }
 
-    // Create metadata shadow tables
+    // Create metadata shadow tables (sequential indices: 0, 1, 2, etc.)
     for i in 0..config.num_metadata_columns {
         let metadata_sql = format!(
             "CREATE TABLE \"{}\".\"{}_metadatachunks{:02}\" (\
@@ -1356,8 +1358,8 @@ mod tests {
 
         let config = ShadowTablesConfig {
             num_vector_columns: 1,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
         };
@@ -1388,8 +1390,8 @@ mod tests {
 
         let config = ShadowTablesConfig {
             num_vector_columns: 1,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: true,
             num_partition_columns: 0,
         };
@@ -1414,8 +1416,8 @@ mod tests {
 
         let config = ShadowTablesConfig {
             num_vector_columns: 3,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
         };
@@ -1545,8 +1547,8 @@ mod tests {
         // Create shadow tables
         let config = ShadowTablesConfig {
             num_vector_columns: 1,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
         };
@@ -1572,8 +1574,8 @@ mod tests {
 
         let config = ShadowTablesConfig {
             num_vector_columns: 1,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
         };
@@ -1601,8 +1603,8 @@ mod tests {
 
         let config = ShadowTablesConfig {
             num_vector_columns: 1,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
         };

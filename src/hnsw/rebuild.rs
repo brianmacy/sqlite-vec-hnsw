@@ -163,8 +163,8 @@ mod tests {
         // Create shadow tables for virtual table
         let config = shadow::ShadowTablesConfig {
             num_vector_columns: 1,
-            num_auxiliary_columns: 0,
             num_metadata_columns: 0,
+            num_auxiliary_columns: 0,
             has_text_pk: false,
             num_partition_columns: 0,
         };
