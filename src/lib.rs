@@ -14,6 +14,7 @@ pub mod vtab;
 
 pub use error::{Error, Result};
 pub use vector::{Vector, VectorType};
+pub use vtab::StmtHandleGuard;
 
 use rusqlite::Connection;
 #[cfg(feature = "loadable_extension")]

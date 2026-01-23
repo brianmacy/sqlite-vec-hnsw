@@ -3,8 +3,12 @@
 //! This module implements HNSW node and edge operations that query shadow tables
 //! instead of keeping the entire graph in memory. This enables scaling to millions
 //! of vectors while keeping memory usage minimal (~64 bytes per index).
+//!
+//! All functions that use cached statements employ `StmtHandleGuard` for RAII-based
+//! statement reset. This ensures shared-cache locks are released even on error paths.
 
 use crate::error::{Error, Result};
+use crate::vtab::StmtHandleGuard;
 use rusqlite::{Connection, OptionalExtension, ffi};
 
 /// HNSW node data
@@ -35,35 +39,34 @@ pub fn fetch_node_data(
     // Fast path: use cached statement (avoids SQL parsing)
     if let Some(stmt) = cached_stmt {
         unsafe {
-            ffi::sqlite3_reset(stmt);
-            ffi::sqlite3_bind_int64(stmt, 1, rowid);
+            // RAII guard: resets on create (clears previous state) and on drop (releases locks)
+            let guard = StmtHandleGuard::new(stmt)
+                .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
-            let rc = ffi::sqlite3_step(stmt);
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 1, rowid);
+
+            let rc = ffi::sqlite3_step(guard.as_ptr());
             if rc == ffi::SQLITE_ROW {
-                let node_rowid = ffi::sqlite3_column_int64(stmt, 0);
-                let level = ffi::sqlite3_column_int(stmt, 1);
+                let node_rowid = ffi::sqlite3_column_int64(guard.as_ptr(), 0);
+                let level = ffi::sqlite3_column_int(guard.as_ptr(), 1);
 
-                let blob_ptr = ffi::sqlite3_column_blob(stmt, 2);
-                let blob_len = ffi::sqlite3_column_bytes(stmt, 2);
-                // CRITICAL: Copy data BEFORE reset (blob_ptr becomes invalid after reset)
+                let blob_ptr = ffi::sqlite3_column_blob(guard.as_ptr(), 2);
+                let blob_len = ffi::sqlite3_column_bytes(guard.as_ptr(), 2);
+                // CRITICAL: Copy data BEFORE guard drops (blob_ptr becomes invalid after reset)
                 let vector =
                     std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize).to_vec();
 
-                // CRITICAL: Reset immediately to release WAL lock
-                ffi::sqlite3_reset(stmt);
-
+                // Guard drops here, automatically resets statement
                 return Ok(Some(HnswNode {
                     rowid: node_rowid,
                     level,
                     vector,
                 }));
             } else if rc == ffi::SQLITE_DONE {
-                // Reset before return
-                ffi::sqlite3_reset(stmt);
+                // Guard drops here, automatically resets statement
                 return Ok(None);
             } else {
-                // Reset even on error
-                ffi::sqlite3_reset(stmt);
+                // Guard drops here, automatically resets statement even on error
                 return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rc),
                     None,
@@ -123,21 +126,23 @@ pub fn fetch_neighbors_cached(
     // Fast path: use cached statement (like C implementation)
     if let Some(stmt) = cached_stmt {
         unsafe {
-            ffi::sqlite3_reset(stmt);
-            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
-            ffi::sqlite3_bind_int(stmt, 2, level);
+            // RAII guard: resets on create (clears previous state) and on drop (releases locks)
+            let guard = StmtHandleGuard::new(stmt)
+                .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
+
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
+            ffi::sqlite3_bind_int(guard.as_ptr(), 2, level);
 
             let mut neighbors = Vec::new();
             loop {
-                let rc = ffi::sqlite3_step(stmt);
+                let rc = ffi::sqlite3_step(guard.as_ptr());
                 if rc == ffi::SQLITE_ROW {
-                    let to_rowid = ffi::sqlite3_column_int64(stmt, 0);
+                    let to_rowid = ffi::sqlite3_column_int64(guard.as_ptr(), 0);
                     neighbors.push(to_rowid);
                 } else if rc == ffi::SQLITE_DONE {
                     break;
                 } else {
-                    // Reset on error
-                    ffi::sqlite3_reset(stmt);
+                    // Guard drops here, automatically resets statement
                     return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rc),
                         None,
@@ -145,8 +150,7 @@ pub fn fetch_neighbors_cached(
                 }
             }
 
-            // CRITICAL: Reset immediately to release WAL lock
-            ffi::sqlite3_reset(stmt);
+            // Guard drops here, automatically resets statement
             return Ok(neighbors);
         }
     }
@@ -186,22 +190,24 @@ pub fn fetch_neighbors_with_distances(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            ffi::sqlite3_reset(stmt);
-            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
-            ffi::sqlite3_bind_int(stmt, 2, level);
+            // RAII guard: resets on create and on drop
+            let guard = StmtHandleGuard::new(stmt)
+                .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
+
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
+            ffi::sqlite3_bind_int(guard.as_ptr(), 2, level);
 
             let mut neighbors = Vec::new();
             loop {
-                let rc = ffi::sqlite3_step(stmt);
+                let rc = ffi::sqlite3_step(guard.as_ptr());
                 if rc == ffi::SQLITE_ROW {
-                    let to_rowid = ffi::sqlite3_column_int64(stmt, 0);
-                    let distance = ffi::sqlite3_column_double(stmt, 1) as f32;
+                    let to_rowid = ffi::sqlite3_column_int64(guard.as_ptr(), 0);
+                    let distance = ffi::sqlite3_column_double(guard.as_ptr(), 1) as f32;
                     neighbors.push((to_rowid, distance));
                 } else if rc == ffi::SQLITE_DONE {
                     break;
                 } else {
-                    // Reset on error
-                    ffi::sqlite3_reset(stmt);
+                    // Guard drops here, automatically resets statement
                     return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rc),
                         None,
@@ -209,8 +215,7 @@ pub fn fetch_neighbors_with_distances(
                 }
             }
 
-            // CRITICAL: Reset immediately to release WAL lock
-            ffi::sqlite3_reset(stmt);
+            // Guard drops here, automatically resets statement
             return Ok(neighbors);
         }
     }
@@ -247,24 +252,29 @@ pub fn insert_node(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            ffi::sqlite3_reset(stmt);
-            ffi::sqlite3_bind_int64(stmt, 1, rowid);
-            ffi::sqlite3_bind_int(stmt, 2, level);
+            // RAII guard: resets on create and on drop
+            let guard = StmtHandleGuard::new(stmt)
+                .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
+
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 1, rowid);
+            ffi::sqlite3_bind_int(guard.as_ptr(), 2, level);
             ffi::sqlite3_bind_blob(
-                stmt,
+                guard.as_ptr(),
                 3,
                 vector.as_ptr() as *const _,
                 vector.len() as i32,
                 ffi::SQLITE_TRANSIENT(),
             );
 
-            let rc = ffi::sqlite3_step(stmt);
+            let rc = ffi::sqlite3_step(guard.as_ptr());
             if rc != ffi::SQLITE_DONE {
+                // Guard drops here, automatically resets statement
                 return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rc),
                     None,
                 )));
             }
+            // Guard drops here, automatically resets statement
         }
     } else {
         // Slow path fallback
@@ -294,18 +304,23 @@ pub fn insert_edge(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            ffi::sqlite3_reset(stmt);
-            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
-            ffi::sqlite3_bind_int64(stmt, 2, to_rowid);
-            ffi::sqlite3_bind_int(stmt, 3, level);
+            // RAII guard: resets on create and on drop
+            let guard = StmtHandleGuard::new(stmt)
+                .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
-            let rc = ffi::sqlite3_step(stmt);
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 2, to_rowid);
+            ffi::sqlite3_bind_int(guard.as_ptr(), 3, level);
+
+            let rc = ffi::sqlite3_step(guard.as_ptr());
             if rc != ffi::SQLITE_DONE {
+                // Guard drops here, automatically resets statement
                 return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rc),
                     None,
                 )));
             }
+            // Guard drops here, automatically resets statement
         }
     } else {
         // Slow path fallback
@@ -434,28 +449,30 @@ pub unsafe fn fetch_nodes_batch_cached(
         return Ok(Vec::new());
     }
 
-    ffi::sqlite3_reset(stmt);
+    // RAII guard: resets on create and on drop
+    let guard = StmtHandleGuard::new(stmt)
+        .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
     // Bind actual rowids
     for (i, &rowid) in rowids.iter().enumerate() {
-        ffi::sqlite3_bind_int64(stmt, (i + 1) as i32, rowid);
+        ffi::sqlite3_bind_int64(guard.as_ptr(), (i + 1) as i32, rowid);
     }
     // Pad with -1 for unused slots (won't match any rowid)
     for i in rowids.len()..padded_size {
-        ffi::sqlite3_bind_int64(stmt, (i + 1) as i32, -1);
+        ffi::sqlite3_bind_int64(guard.as_ptr(), (i + 1) as i32, -1);
     }
 
     // Collect results
     let mut nodes = Vec::with_capacity(rowids.len());
     loop {
-        let rc = ffi::sqlite3_step(stmt);
+        let rc = ffi::sqlite3_step(guard.as_ptr());
         if rc == ffi::SQLITE_ROW {
-            let rowid = ffi::sqlite3_column_int64(stmt, 0);
-            let level = ffi::sqlite3_column_int(stmt, 1);
+            let rowid = ffi::sqlite3_column_int64(guard.as_ptr(), 0);
+            let level = ffi::sqlite3_column_int(guard.as_ptr(), 1);
 
-            let blob_ptr = ffi::sqlite3_column_blob(stmt, 2);
-            let blob_len = ffi::sqlite3_column_bytes(stmt, 2);
-            // Copy blob data before reset
+            let blob_ptr = ffi::sqlite3_column_blob(guard.as_ptr(), 2);
+            let blob_len = ffi::sqlite3_column_bytes(guard.as_ptr(), 2);
+            // Copy blob data before guard drops
             let vector = if blob_len > 0 && !blob_ptr.is_null() {
                 std::slice::from_raw_parts(blob_ptr as *const u8, blob_len as usize).to_vec()
             } else {
@@ -470,7 +487,7 @@ pub unsafe fn fetch_nodes_batch_cached(
         } else if rc == ffi::SQLITE_DONE {
             break;
         } else {
-            ffi::sqlite3_reset(stmt);
+            // Guard drops here, automatically resets statement
             return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rc),
                 None,
@@ -478,7 +495,7 @@ pub unsafe fn fetch_nodes_batch_cached(
         }
     }
 
-    ffi::sqlite3_reset(stmt);
+    // Guard drops here, automatically resets statement
     Ok(nodes)
 }
 
@@ -536,17 +553,22 @@ pub fn delete_edges_from_level(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            ffi::sqlite3_reset(stmt);
-            ffi::sqlite3_bind_int64(stmt, 1, from_rowid);
-            ffi::sqlite3_bind_int(stmt, 2, level);
+            // RAII guard: resets on create and on drop
+            let guard = StmtHandleGuard::new(stmt)
+                .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
-            let rc = ffi::sqlite3_step(stmt);
+            ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
+            ffi::sqlite3_bind_int(guard.as_ptr(), 2, level);
+
+            let rc = ffi::sqlite3_step(guard.as_ptr());
             if rc != ffi::SQLITE_DONE {
+                // Guard drops here, automatically resets statement
                 return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rc),
                     None,
                 )));
             }
+            // Guard drops here, automatically resets statement
         }
     } else {
         // Slow path fallback

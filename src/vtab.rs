@@ -14,6 +14,85 @@ use rusqlite::{Connection, OptionalExtension, ffi};
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 
+/// RAII guard for SQLite prepared statement handles.
+///
+/// Resets the statement on creation (to clear any previous state) and again on drop
+/// (to release shared-cache locks). This ensures proper cleanup on all code paths.
+///
+/// In shared-cache mode, prepared statements hold read locks even before execution.
+/// Failing to reset statements causes `SQLITE_LOCKED_SHAREDCACHE (262)` errors when
+/// other connections try to access the database.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Wrap a statement for use - resets automatically on create and drop
+/// let guard = unsafe { StmtHandleGuard::new(stmt_ptr)? };
+/// // Statement is already reset and ready for binding
+/// ffi::sqlite3_bind_int64(guard.as_ptr(), 1, value);
+/// ffi::sqlite3_step(guard.as_ptr());
+/// // guard drops here, automatically resets statement
+/// ```
+///
+/// # Safety
+///
+/// The caller must ensure:
+/// - The statement pointer is valid for the lifetime of the guard
+/// - The statement is not finalized while the guard exists
+/// - The statement belongs to a connection that is still open
+pub struct StmtHandleGuard {
+    stmt: *mut ffi::sqlite3_stmt,
+    // Make this type !Send and !Sync since sqlite3_stmt is not thread-safe.
+    // Using PhantomData<*mut ()> achieves this without unstable negative_impls.
+    _marker: PhantomData<*mut ()>,
+}
+
+impl StmtHandleGuard {
+    /// Create a new guard for a statement handle.
+    ///
+    /// The statement is reset immediately upon guard creation to clear any
+    /// previous state and prepare it for new bindings.
+    ///
+    /// Returns `None` if the statement pointer is null.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the statement pointer is valid and will not be
+    /// finalized while the guard exists.
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe fn new(stmt: *mut ffi::sqlite3_stmt) -> Option<Self> {
+        if stmt.is_null() {
+            None
+        } else {
+            // Reset on creation to clear previous state and prepare for new use
+            ffi::sqlite3_reset(stmt);
+            Some(StmtHandleGuard {
+                stmt,
+                _marker: PhantomData,
+            })
+        }
+    }
+
+    /// Get the underlying statement pointer for use with SQLite FFI functions.
+    #[inline]
+    pub fn as_ptr(&self) -> *mut ffi::sqlite3_stmt {
+        self.stmt
+    }
+}
+
+impl Drop for StmtHandleGuard {
+    fn drop(&mut self) {
+        if !self.stmt.is_null() {
+            // SAFETY: We verified the pointer is non-null and was valid when the guard was created.
+            // The drop resets to release locks even if the statement failed.
+            unsafe {
+                ffi::sqlite3_reset(self.stmt);
+            }
+        }
+    }
+}
+
 /// Register the vec0 virtual table module
 pub fn register_vec0_module(db: &Connection) -> Result<()> {
     // Use update_module_with_tx to support CREATE/INSERT/UPDATE/DELETE + transactions
@@ -104,6 +183,12 @@ pub enum IndexType {
 
 /// Prepared statement cache for HNSW operations
 /// Stores raw sqlite3_stmt pointers to avoid re-preparing statements
+///
+/// In shared-cache mode, even reset prepared statements hold read locks on the schema.
+/// To support concurrent access from other connections:
+/// - After table CREATE, statements are finalized to release locks
+/// - Statements are lazily re-prepared on first actual use (INSERT/SELECT)
+/// - The `needs_prepare` flag tracks when re-preparation is needed
 struct HnswStmtCache {
     get_node_data: *mut ffi::sqlite3_stmt,
     get_node_level: *mut ffi::sqlite3_stmt,
@@ -117,6 +202,11 @@ struct HnswStmtCache {
     /// Single batch fetch statement with 64 placeholders
     /// Unused slots are bound to -1 (won't match any rowid)
     batch_fetch_nodes: *mut ffi::sqlite3_stmt,
+    /// Table and column names for lazy re-preparation
+    table_name: String,
+    column_name: String,
+    /// Whether statements need to be prepared (true after finalize, false after prepare)
+    needs_prepare: bool,
 }
 
 impl HnswStmtCache {
@@ -131,6 +221,9 @@ impl HnswStmtCache {
             delete_edges_from: std::ptr::null_mut(),
             update_meta: std::ptr::null_mut(),
             batch_fetch_nodes: std::ptr::null_mut(),
+            table_name: String::new(),
+            column_name: String::new(),
+            needs_prepare: true, // Need to prepare on first use
         }
     }
 
@@ -320,7 +413,66 @@ impl HnswStmtCache {
             )));
         }
 
+        // Store table/column names for lazy re-preparation after finalize
+        self.table_name = table_name.to_string();
+        self.column_name = column_name.to_string();
+        self.needs_prepare = false;
+
+        // Note: We used to reset statements here, but that's not sufficient.
+        // In shared-cache mode, even reset statements hold schema read locks.
+        // The solution is to finalize after CREATE and re-prepare lazily on first use.
+        // See finalize_for_shared_cache() below.
+
         Ok(())
+    }
+
+    /// Finalize all statements to release schema locks in shared-cache mode
+    ///
+    /// In shared-cache mode, prepared statements hold read locks on the schema
+    /// even after being reset. This prevents other connections from writing.
+    /// Call this after table creation to allow other connections to work,
+    /// then statements will be re-prepared lazily on first actual use.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn finalize_for_shared_cache(&mut self) {
+        // Finalize all statements to fully release locks
+        if !self.get_node_data.is_null() {
+            ffi::sqlite3_finalize(self.get_node_data);
+            self.get_node_data = std::ptr::null_mut();
+        }
+        if !self.get_node_level.is_null() {
+            ffi::sqlite3_finalize(self.get_node_level);
+            self.get_node_level = std::ptr::null_mut();
+        }
+        if !self.get_edges.is_null() {
+            ffi::sqlite3_finalize(self.get_edges);
+            self.get_edges = std::ptr::null_mut();
+        }
+        if !self.get_edges_with_dist.is_null() {
+            ffi::sqlite3_finalize(self.get_edges_with_dist);
+            self.get_edges_with_dist = std::ptr::null_mut();
+        }
+        if !self.insert_node.is_null() {
+            ffi::sqlite3_finalize(self.insert_node);
+            self.insert_node = std::ptr::null_mut();
+        }
+        if !self.insert_edge.is_null() {
+            ffi::sqlite3_finalize(self.insert_edge);
+            self.insert_edge = std::ptr::null_mut();
+        }
+        if !self.delete_edges_from.is_null() {
+            ffi::sqlite3_finalize(self.delete_edges_from);
+            self.delete_edges_from = std::ptr::null_mut();
+        }
+        if !self.update_meta.is_null() {
+            ffi::sqlite3_finalize(self.update_meta);
+            self.update_meta = std::ptr::null_mut();
+        }
+        if !self.batch_fetch_nodes.is_null() {
+            ffi::sqlite3_finalize(self.batch_fetch_nodes);
+            self.batch_fetch_nodes = std::ptr::null_mut();
+        }
+        // Mark that statements need to be prepared on next use
+        self.needs_prepare = true;
     }
 
     #[allow(unsafe_op_in_unsafe_fn)]
@@ -903,6 +1055,17 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             let conn = Connection::from_handle(db_handle)?;
             conn.overload_function("match", 2)?;
             std::mem::forget(conn); // Don't close the connection
+
+            // CRITICAL: Finalize all statements to release schema locks in shared-cache mode.
+            // In shared-cache mode, even reset prepared statements hold read locks on the
+            // schema, preventing other connections from accessing the database.
+            // By finalizing here, we allow Senzing (via a different connection) to access
+            // the database immediately after CREATE TABLE completes.
+            // Statements will be lazily re-prepared on first actual use (INSERT/SELECT).
+            let vtab_mut = &vtab as *const _ as *mut Vec0Tab;
+            for cache in (*vtab_mut).hnsw_stmt_cache.iter_mut() {
+                cache.finalize_for_shared_cache();
+            }
         }
 
         Ok((sql, vtab))
@@ -1356,6 +1519,27 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             )
                             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
+                            // Also prepare get_edges_with_dist (used by pruning during insert)
+                            conn.prepare_or_reuse(
+                                &mut cache.get_edges_with_dist,
+                                &format!(
+                                    "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                    edges_table
+                                ),
+                            )
+                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                            // Also prepare batch_fetch_nodes (used for batch vector lookups)
+                            let placeholders = (0..16).map(|_| "?").collect::<Vec<_>>().join(",");
+                            conn.prepare_or_reuse(
+                                &mut cache.batch_fetch_nodes,
+                                &format!(
+                                    "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+                                    nodes_table, placeholders
+                                ),
+                            )
+                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
                             let cache = &self.hnsw_stmt_cache[vec_col_idx];
                             Some(hnsw::insert::HnswStmtCache {
                                 get_node_data: cache.get_node_data,
@@ -1673,6 +1857,28 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                                     ),
                                 )
                                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                // Also prepare get_edges_with_dist (used by pruning during insert)
+                                conn.prepare_or_reuse(
+                                    &mut cache.get_edges_with_dist,
+                                    &format!(
+                                        "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                        edges_table
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                                // Also prepare batch_fetch_nodes (used for batch vector lookups)
+                                let placeholders =
+                                    (0..16).map(|_| "?").collect::<Vec<_>>().join(",");
+                                conn.prepare_or_reuse(
+                                    &mut cache.batch_fetch_nodes,
+                                    &format!(
+                                        "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+                                        nodes_table, placeholders
+                                    ),
+                                )
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                             }
 
                             let cache = &self.hnsw_stmt_cache[vec_col_idx];
@@ -1783,8 +1989,7 @@ impl<'vtab> rusqlite::vtab::TransactionVTab<'vtab> for Vec0Tab {
     }
 
     fn sync(&mut self) -> rusqlite::Result<()> {
-        // No-op: no prepared statement caching yet
-        // Future: finalize temporary prepared statements and clear caches
+        // No-op: statements are reset immediately after each use in storage.rs
         Ok(())
     }
 

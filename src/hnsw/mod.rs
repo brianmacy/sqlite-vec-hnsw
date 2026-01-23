@@ -356,18 +356,21 @@ impl HnswMetadata {
         cached_stmt: *mut rusqlite::ffi::sqlite3_stmt,
         _update_entry_point: bool, // ignored - always update all dynamic fields
     ) -> Result<()> {
+        use crate::vtab::StmtHandleGuard;
         use rusqlite::ffi;
 
-        ffi::sqlite3_reset(cached_stmt);
+        // RAII guard: resets on create and on drop
+        let guard = StmtHandleGuard::new(cached_stmt)
+            .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
         // Bind parameters: entry_point_rowid, entry_point_level, num_nodes, hnsw_version
-        ffi::sqlite3_bind_int64(cached_stmt, 1, self.entry_point_rowid);
-        ffi::sqlite3_bind_int(cached_stmt, 2, self.entry_point_level);
-        ffi::sqlite3_bind_int(cached_stmt, 3, self.num_nodes);
-        ffi::sqlite3_bind_int64(cached_stmt, 4, self.hnsw_version);
+        ffi::sqlite3_bind_int64(guard.as_ptr(), 1, self.entry_point_rowid);
+        ffi::sqlite3_bind_int(guard.as_ptr(), 2, self.entry_point_level);
+        ffi::sqlite3_bind_int(guard.as_ptr(), 3, self.num_nodes);
+        ffi::sqlite3_bind_int64(guard.as_ptr(), 4, self.hnsw_version);
 
-        let rc = ffi::sqlite3_step(cached_stmt);
-        ffi::sqlite3_reset(cached_stmt);
+        let rc = ffi::sqlite3_step(guard.as_ptr());
+        // Guard drops here, automatically resets statement
 
         if rc != ffi::SQLITE_DONE {
             return Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
