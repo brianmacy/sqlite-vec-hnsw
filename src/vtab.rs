@@ -74,6 +74,33 @@ impl StmtHandleGuard {
         }
     }
 
+    /// Create a new guard WITHOUT resetting the statement on creation.
+    ///
+    /// Use this for sequential statement reuse where the previous guard's drop
+    /// already reset the statement, or for freshly prepared statements.
+    /// Saves one FFI call per statement use.
+    ///
+    /// # Safety
+    ///
+    /// - The statement must already be in a reset state (from a previous guard
+    ///   drop, or from being freshly prepared)
+    /// - The statement pointer must be valid and will not be finalized while
+    ///   the guard exists
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    #[allow(dead_code)] // Reserved for future use
+    pub unsafe fn new_skip_reset(stmt: *mut ffi::sqlite3_stmt) -> Option<Self> {
+        if stmt.is_null() {
+            None
+        } else {
+            // Skip reset - caller guarantees statement is in reset state
+            Some(StmtHandleGuard {
+                stmt,
+                _marker: PhantomData,
+            })
+        }
+    }
+
     /// Get the underlying statement pointer for use with SQLite FFI functions.
     #[inline]
     pub fn as_ptr(&self) -> *mut ffi::sqlite3_stmt {
@@ -390,9 +417,9 @@ impl HnswStmtCache {
             )));
         }
 
-        // Prepare batch_fetch_nodes with 16 placeholders (pad unused with -1)
+        // Prepare batch_fetch_nodes with 64 placeholders (pad unused with -1)
         let nodes_table = format!("{}_{}_hnsw_nodes", table_name, column_name);
-        let placeholders = (0..16).map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = CString::new(format!(
             "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
             nodes_table, placeholders
@@ -1530,7 +1557,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
                             // Also prepare batch_fetch_nodes (used for batch vector lookups)
-                            let placeholders = (0..16).map(|_| "?").collect::<Vec<_>>().join(",");
+                            let placeholders = (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
                             conn.prepare_or_reuse(
                                 &mut cache.batch_fetch_nodes,
                                 &format!(
@@ -1870,7 +1897,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
 
                                 // Also prepare batch_fetch_nodes (used for batch vector lookups)
                                 let placeholders =
-                                    (0..16).map(|_| "?").collect::<Vec<_>>().join(",");
+                                    (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
                                 conn.prepare_or_reuse(
                                     &mut cache.batch_fetch_nodes,
                                     &format!(
@@ -2113,6 +2140,14 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                         (false, DistanceMetric::Cosine) // Default to cosine
                     };
 
+                // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
+                let vec_col_idx = vtab
+                    .columns
+                    .iter()
+                    .take(col_idx)
+                    .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
+                    .count();
+
                 // Execute search: HNSW if enabled, otherwise brute-force ENN
                 // SAFETY: vtab.db is valid for the lifetime of the virtual table
                 let results = unsafe {
@@ -2121,13 +2156,85 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                     })?;
 
                     let result = if hnsw_enabled {
-                        // HNSW mode: use approximate search
+                        // HNSW mode: use approximate search with cached statements
                         let metadata =
                             HnswMetadata::load_from_db(&conn, &vtab.table_name, &col.name)
                                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
                         if let Some(meta) = metadata {
-                            hnsw::search::search_hnsw(
+                            // Prepare search statements for this query using raw FFI
+                            // Create local statement handles (prepared once per query)
+                            let nodes_table =
+                                format!("{}_{}_hnsw_nodes", vtab.table_name, col.name);
+                            let edges_table =
+                                format!("{}_{}_hnsw_edges", vtab.table_name, col.name);
+
+                            let mut get_node_stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+                            let mut get_edges_stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+                            let mut batch_fetch_stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+
+                            // Prepare get_node_data
+                            let sql = std::ffi::CString::new(format!(
+                                "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
+                                nodes_table
+                            ))
+                            .unwrap();
+                            ffi::sqlite3_prepare_v2(
+                                conn.handle(),
+                                sql.as_ptr(),
+                                -1,
+                                &mut get_node_stmt,
+                                std::ptr::null_mut(),
+                            );
+
+                            // Prepare get_edges
+                            let sql = std::ffi::CString::new(format!(
+                                "SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                edges_table
+                            ))
+                            .unwrap();
+                            ffi::sqlite3_prepare_v2(
+                                conn.handle(),
+                                sql.as_ptr(),
+                                -1,
+                                &mut get_edges_stmt,
+                                std::ptr::null_mut(),
+                            );
+
+                            // Prepare batch_fetch_nodes (64 placeholders)
+                            let placeholders = (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
+                            let sql = std::ffi::CString::new(format!(
+                                "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+                                nodes_table, placeholders
+                            ))
+                            .unwrap();
+                            ffi::sqlite3_prepare_v2(
+                                conn.handle(),
+                                sql.as_ptr(),
+                                -1,
+                                &mut batch_fetch_stmt,
+                                std::ptr::null_mut(),
+                            );
+
+                            let search_cache = hnsw::search::SearchStmtCache {
+                                get_node_data: if get_node_stmt.is_null() {
+                                    None
+                                } else {
+                                    Some(get_node_stmt)
+                                },
+                                get_edges: if get_edges_stmt.is_null() {
+                                    None
+                                } else {
+                                    Some(get_edges_stmt)
+                                },
+                                batch_fetch_nodes: if batch_fetch_stmt.is_null() {
+                                    None
+                                } else {
+                                    Some(batch_fetch_stmt)
+                                },
+                            };
+
+                            let search_result = hnsw::search::search_hnsw(
                                 &conn,
                                 &meta,
                                 &vtab.table_name,
@@ -2135,9 +2242,22 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                                 &query_vector,
                                 k as usize,
                                 None,
-                                None, // stmt_cache
+                                Some(&search_cache),
                             )
-                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)));
+
+                            // Finalize local statements
+                            if !get_node_stmt.is_null() {
+                                ffi::sqlite3_finalize(get_node_stmt);
+                            }
+                            if !get_edges_stmt.is_null() {
+                                ffi::sqlite3_finalize(get_edges_stmt);
+                            }
+                            if !batch_fetch_stmt.is_null() {
+                                ffi::sqlite3_finalize(batch_fetch_stmt);
+                            }
+
+                            search_result?
                         } else {
                             // HNSW index is missing or corrupted
                             std::mem::forget(conn);
@@ -2151,13 +2271,6 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                         }
                     } else {
                         // ENN mode: exact nearest neighbor via brute force
-                        // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
-                        let vec_col_idx = vtab
-                            .columns
-                            .iter()
-                            .take(col_idx)
-                            .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
-                            .count();
                         brute_force_search(
                             &conn,
                             &vtab.schema_name,

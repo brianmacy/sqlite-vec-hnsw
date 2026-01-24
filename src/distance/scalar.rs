@@ -4,12 +4,12 @@
 //! CPU feature detection (AVX512, AVX2, SSE, NEON).
 
 use crate::error::{Error, Result};
-use crate::vector::Vector;
+use crate::vector::VectorData;
 use simsimd::{BinarySimilarity, SpatialSimilarity};
 
 /// L2 distance for Float32 vectors
 #[inline]
-pub fn distance_l2_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_l2_f32_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // Zero-copy: reinterpret bytes as f32 slice without allocation
     let a_vals = a.as_f32_slice();
     let b_vals = b.as_f32_slice();
@@ -22,7 +22,7 @@ pub fn distance_l2_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 
 /// L1 distance for Float32 vectors
 #[inline]
-pub fn distance_l1_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_l1_f32_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // Zero-copy: reinterpret bytes as f32 slice without allocation
     let a_vals = a.as_f32_slice();
     let b_vals = b.as_f32_slice();
@@ -39,7 +39,7 @@ pub fn distance_l1_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 
 /// Cosine distance for Float32 vectors
 #[inline]
-pub fn distance_cosine_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_cosine_f32_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // Zero-copy: reinterpret bytes as f32 slice without allocation
     let a_vals = a.as_f32_slice();
     let b_vals = b.as_f32_slice();
@@ -53,7 +53,7 @@ pub fn distance_cosine_f32_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 
 /// L2 distance for Int8 vectors
 #[inline]
-pub fn distance_l2_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_l2_i8_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // Zero-copy: reinterpret bytes as i8 slice without allocation
     let a_vals = a.as_i8_slice();
     let b_vals = b.as_i8_slice();
@@ -67,7 +67,7 @@ pub fn distance_l2_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 
 /// L1 distance for Int8 vectors
 #[inline]
-pub fn distance_l1_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_l1_i8_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // Zero-copy: reinterpret bytes as i8 slice without allocation
     let a_vals = a.as_i8_slice();
     let b_vals = b.as_i8_slice();
@@ -85,7 +85,7 @@ pub fn distance_l1_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 /// Cosine distance for Int8 vectors
 /// Uses simsimd which supports i8 cosine distance
 #[inline]
-pub fn distance_cosine_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_cosine_i8_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // Zero-copy: reinterpret bytes as i8 slice without allocation
     let a_vals = a.as_i8_slice();
     let b_vals = b.as_i8_slice();
@@ -99,7 +99,7 @@ pub fn distance_cosine_i8_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 
 /// Hamming distance for binary vectors
 #[inline]
-pub fn distance_hamming_scalar(a: &Vector, b: &Vector) -> Result<f32> {
+pub fn distance_hamming_scalar<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     // as_bytes() is already zero-copy
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -114,6 +114,7 @@ pub fn distance_hamming_scalar(a: &Vector, b: &Vector) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::Vector;
 
     #[test]
     fn test_scalar_l2_f32() {

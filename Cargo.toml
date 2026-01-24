@@ -26,6 +26,9 @@ fixedbitset = "0.5"
 
 [features]
 default = []
+# Enable timing statistics collection (adds ~31 atomic operations per insert)
+# Disabled by default for maximum performance in production
+timing = []
 # Enable loadable_extension for building as a SQLite shared library
 # This is automatically enabled in profile.release (see below)
 # For tests/dev, use rusqlite without loadable_extension

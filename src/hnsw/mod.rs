@@ -381,38 +381,74 @@ impl HnswMetadata {
         Ok(())
     }
 
-    /// Validate metadata is current and reload if changed by another connection
-    /// Matches C implementation: hnsw_validate_and_refresh_caches()
+    /// Refresh entry point from database
     ///
-    /// Returns Ok(true) if metadata was current, Ok(false) if reloaded, Err on failure
-    pub fn validate_and_refresh(
+    /// Reads only the dynamic fields (entry_point_rowid, entry_point_level, num_nodes)
+    /// that can change when other connections insert vectors.
+    ///
+    /// This is called at the start of each insert to ensure we have the current
+    /// entry point for HNSW traversal. SQLite's transaction locking ensures
+    /// consistency within our operation.
+    ///
+    /// This replaces the old validate_and_refresh which had version checking overhead.
+    pub fn refresh_entry_point(
         &mut self,
         db: &Connection,
         table_name: &str,
         column_name: &str,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let meta_table = format!("{}_{}_hnsw_meta", table_name, column_name);
 
-        // Single query to check version
-        let current_version: Option<i64> = db
-            .query_row(
-                &format!("SELECT hnsw_version FROM \"{}\" WHERE id = 1", meta_table),
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        // Read only the dynamic fields we need - single row, 3 columns
+        let query = format!(
+            "SELECT entry_point_rowid, entry_point_level, num_nodes FROM \"{}\" WHERE id = 1",
+            meta_table
+        );
 
-        if let Some(curr_ver) = current_version
-            && curr_ver != self.hnsw_version
+        if let Some((entry_rowid, entry_level, num_nodes)) = db
+            .query_row(&query, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                ))
+            })
+            .optional()?
         {
-            // Version changed - reload full metadata (single SELECT)
-            if let Some(current) = HnswMetadata::load_from_db(db, table_name, column_name)? {
-                *self = current;
-                return Ok(false); // Metadata was stale, reloaded
-            }
+            self.entry_point_rowid = entry_rowid;
+            self.entry_point_level = entry_level;
+            self.num_nodes = num_nodes;
         }
 
-        Ok(true) // Metadata is current
+        Ok(())
+    }
+
+    /// Refresh entry point using cached prepared statement (FAST PATH)
+    ///
+    /// # Safety
+    /// cached_stmt must be a valid prepared statement for:
+    /// SELECT entry_point_rowid, entry_point_level, num_nodes FROM meta WHERE id=1
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe fn refresh_entry_point_cached(
+        &mut self,
+        cached_stmt: *mut rusqlite::ffi::sqlite3_stmt,
+    ) -> Result<()> {
+        use crate::vtab::StmtHandleGuard;
+        use rusqlite::ffi;
+
+        // RAII guard: resets on create and on drop
+        let guard = StmtHandleGuard::new(cached_stmt)
+            .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
+
+        let rc = ffi::sqlite3_step(guard.as_ptr());
+        if rc == ffi::SQLITE_ROW {
+            self.entry_point_rowid = ffi::sqlite3_column_int64(guard.as_ptr(), 0);
+            self.entry_point_level = ffi::sqlite3_column_int(guard.as_ptr(), 1);
+            self.num_nodes = ffi::sqlite3_column_int(guard.as_ptr(), 2);
+        }
+        // Guard drops here, automatically resets statement
+
+        Ok(())
     }
 }
 

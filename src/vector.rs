@@ -82,6 +82,134 @@ impl IndexQuantization {
     }
 }
 
+/// Common interface for vector data access
+///
+/// Implemented by both `Vector` (owned) and `VectorRef` (borrowed).
+/// Distance functions accept `impl VectorData` for maximum flexibility,
+/// allowing zero-copy operations when the data lifetime permits.
+pub trait VectorData {
+    /// Get the vector element type
+    fn vec_type(&self) -> VectorType;
+
+    /// Get number of dimensions
+    fn dimensions(&self) -> usize;
+
+    /// Get raw data as byte slice
+    fn as_bytes(&self) -> &[u8];
+
+    /// Get data as f32 slice (zero-copy via bytemuck)
+    ///
+    /// # Panics
+    /// Panics in debug builds if vector type is not Float32
+    fn as_f32_slice(&self) -> &[f32];
+
+    /// Get data as i8 slice (zero-copy via bytemuck)
+    ///
+    /// # Panics
+    /// Panics in debug builds if vector type is not Int8
+    fn as_i8_slice(&self) -> &[i8];
+}
+
+/// Zero-copy borrowed vector reference
+///
+/// Unlike `Vector` which owns its data, `VectorRef` borrows existing
+/// byte data without copying. Use this in hot paths where the source
+/// data outlives the distance calculation.
+///
+/// # Example
+/// ```ignore
+/// // Hot path - no allocation
+/// let vec_ref = VectorRef::from_blob(&blob_data, VectorType::Float32, 768);
+/// let dist = distance::compute(metric, &query_vec, &vec_ref)?;
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct VectorRef<'a> {
+    vec_type: VectorType,
+    dimensions: usize,
+    data: &'a [u8],
+}
+
+impl<'a> VectorRef<'a> {
+    /// Create a borrowed vector reference from a byte slice
+    ///
+    /// This is zero-copy - no allocation occurs.
+    #[inline]
+    pub fn from_blob(blob: &'a [u8], vec_type: VectorType, dimensions: usize) -> Self {
+        VectorRef {
+            vec_type,
+            dimensions,
+            data: blob,
+        }
+    }
+
+    /// Get vector type
+    #[inline]
+    pub fn vec_type(&self) -> VectorType {
+        self.vec_type
+    }
+
+    /// Get number of dimensions
+    #[inline]
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    /// Get raw data as slice
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.data
+    }
+
+    /// Get data as f32 slice WITHOUT allocation (zero-copy)
+    #[inline]
+    pub fn as_f32_slice(&self) -> &[f32] {
+        debug_assert_eq!(
+            self.vec_type,
+            VectorType::Float32,
+            "as_f32_slice called on non-Float32 vector"
+        );
+        cast_slice(self.data)
+    }
+
+    /// Get data as i8 slice WITHOUT allocation (zero-copy)
+    #[inline]
+    pub fn as_i8_slice(&self) -> &[i8] {
+        debug_assert_eq!(
+            self.vec_type,
+            VectorType::Int8,
+            "as_i8_slice called on non-Int8 vector"
+        );
+        cast_slice(self.data)
+    }
+}
+
+impl VectorData for VectorRef<'_> {
+    #[inline]
+    fn vec_type(&self) -> VectorType {
+        self.vec_type
+    }
+
+    #[inline]
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        self.data
+    }
+
+    #[inline]
+    fn as_f32_slice(&self) -> &[f32] {
+        VectorRef::as_f32_slice(self)
+    }
+
+    #[inline]
+    fn as_i8_slice(&self) -> &[i8] {
+        VectorRef::as_i8_slice(self)
+    }
+}
+
 /// Vector data container
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vector {
@@ -480,6 +608,33 @@ impl Vector {
     }
 }
 
+impl VectorData for Vector {
+    #[inline]
+    fn vec_type(&self) -> VectorType {
+        self.vec_type
+    }
+
+    #[inline]
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    #[inline]
+    fn as_f32_slice(&self) -> &[f32] {
+        Vector::as_f32_slice(self)
+    }
+
+    #[inline]
+    fn as_i8_slice(&self) -> &[i8] {
+        Vector::as_i8_slice(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +882,79 @@ mod tests {
     #[test]
     fn test_index_quantization_default() {
         assert_eq!(IndexQuantization::default(), IndexQuantization::None);
+    }
+
+    #[test]
+    fn test_vector_ref_from_blob_f32() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut blob: Vec<u8> = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let vec_ref = VectorRef::from_blob(&blob, VectorType::Float32, 3);
+
+        assert_eq!(vec_ref.vec_type(), VectorType::Float32);
+        assert_eq!(vec_ref.dimensions(), 3);
+        assert_eq!(vec_ref.as_f32_slice(), &values[..]);
+    }
+
+    #[test]
+    fn test_vector_ref_from_blob_i8() {
+        let values: Vec<i8> = vec![-128, 0, 127];
+        let blob: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+
+        let vec_ref = VectorRef::from_blob(&blob, VectorType::Int8, 3);
+
+        assert_eq!(vec_ref.vec_type(), VectorType::Int8);
+        assert_eq!(vec_ref.dimensions(), 3);
+        assert_eq!(vec_ref.as_i8_slice(), &values[..]);
+    }
+
+    #[test]
+    fn test_vector_ref_same_as_vector() {
+        // Verify VectorRef produces same results as Vector
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let mut blob: Vec<u8> = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let vector = Vector::from_blob(&blob, VectorType::Float32, 4).unwrap();
+        let vec_ref = VectorRef::from_blob(&blob, VectorType::Float32, 4);
+
+        // Both should give same results via VectorData trait
+        assert_eq!(
+            <Vector as VectorData>::vec_type(&vector),
+            <VectorRef as VectorData>::vec_type(&vec_ref)
+        );
+        assert_eq!(
+            <Vector as VectorData>::dimensions(&vector),
+            <VectorRef as VectorData>::dimensions(&vec_ref)
+        );
+        assert_eq!(
+            <Vector as VectorData>::as_f32_slice(&vector),
+            <VectorRef as VectorData>::as_f32_slice(&vec_ref)
+        );
+    }
+
+    #[test]
+    fn test_vector_data_trait_with_generics() {
+        // Test that generic functions work with both types
+        fn compute_sum<V: VectorData>(v: &V) -> f32 {
+            v.as_f32_slice().iter().sum()
+        }
+
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let mut blob: Vec<u8> = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let vector = Vector::from_f32(&values);
+        let vec_ref = VectorRef::from_blob(&blob, VectorType::Float32, 3);
+
+        assert_eq!(compute_sum(&vector), 6.0);
+        assert_eq!(compute_sum(&vec_ref), 6.0);
     }
 }

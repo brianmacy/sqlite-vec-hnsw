@@ -258,12 +258,13 @@ pub fn insert_node(
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, rowid);
             ffi::sqlite3_bind_int(guard.as_ptr(), 2, level);
+            // SQLITE_STATIC is safe: vector data lives on stack until after step() completes
             ffi::sqlite3_bind_blob(
                 guard.as_ptr(),
                 3,
                 vector.as_ptr() as *const _,
                 vector.len() as i32,
-                ffi::SQLITE_TRANSIENT(),
+                ffi::SQLITE_STATIC(),
             );
 
             let rc = ffi::sqlite3_step(guard.as_ptr());

@@ -7,26 +7,44 @@ use crate::error::Result;
 use crate::hnsw::{HnswMetadata, search, storage};
 use crate::vector::{IndexQuantization, Vector, VectorType};
 use rusqlite::Connection;
+#[cfg(feature = "timing")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "timing")]
 use std::time::Instant;
 
-// Global timing counters
+// Global timing counters (only when timing feature is enabled)
+#[cfg(feature = "timing")]
 static VALIDATE_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_LAYER_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static INSERT_EDGE_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_FETCH_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_DELETE_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_REINSERT_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static METADATA_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_EARLY_RETURNS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_ACTUAL_PRUNES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_EDGES_DELETED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static PRUNE_EDGES_REINSERTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SMART_CONNECT_SKIPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SMART_CONNECT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "timing")]
 pub fn print_timing_stats() {
     let prune_actual = PRUNE_ACTUAL_PRUNES.load(Ordering::Relaxed);
     let edges_deleted = PRUNE_EDGES_DELETED.load(Ordering::Relaxed);
@@ -86,6 +104,10 @@ pub fn print_timing_stats() {
     );
 }
 
+#[cfg(not(feature = "timing"))]
+#[inline(always)]
+pub fn print_timing_stats() {}
+
 /// Generate a random level for a new node
 ///
 /// Uses exponential decay: level = floor(-ln(uniform_random()) * level_factor)
@@ -134,9 +156,11 @@ fn prune_neighbor_if_needed(
     _get_edges_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
     _insert_edge_stmt: Option<*mut rusqlite::ffi::sqlite3_stmt>,
 ) -> Result<()> {
+    #[cfg(feature = "timing")]
     PRUNE_CALLS.fetch_add(1, Ordering::Relaxed);
 
     // Fetch current neighbor edges WITH stored distances (O(1) per edge)
+    #[cfg(feature = "timing")]
     let t = Instant::now();
     // Only use cached statement if it's not null
     let get_edges_with_dist_stmt = stmt_cache
@@ -150,15 +174,19 @@ fn prune_neighbor_if_needed(
         level,
         get_edges_with_dist_stmt,
     )?;
+    #[cfg(feature = "timing")]
     PRUNE_FETCH_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     // Early return if under limit - no pruning needed
     if candidates.len() <= max_connections {
+        #[cfg(feature = "timing")]
         PRUNE_EARLY_RETURNS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
+    #[cfg(feature = "timing")]
     PRUNE_ACTUAL_PRUNES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "timing")]
     PRUNE_EDGES_DELETED.fetch_add(candidates.len() as u64, Ordering::Relaxed);
 
     // Sort by stored distance (closest first) - distances are already from neighbor's perspective
@@ -171,9 +199,11 @@ fn prune_neighbor_if_needed(
         .map(|(rowid, _)| *rowid)
         .collect();
 
+    #[cfg(feature = "timing")]
     PRUNE_EDGES_REINSERTED.fetch_add(max_connections as u64, Ordering::Relaxed);
 
     // Delete the worst edges
+    #[cfg(feature = "timing")]
     let t = Instant::now();
     if !edges_to_delete.is_empty() {
         storage::delete_edges_batch(
@@ -185,6 +215,7 @@ fn prune_neighbor_if_needed(
             &edges_to_delete,
         )?;
     }
+    #[cfg(feature = "timing")]
     PRUNE_DELETE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     Ok(())
@@ -254,10 +285,13 @@ pub fn insert_hnsw(
     vector: &[u8],
     stmt_cache: Option<&HnswStmtCache>,
 ) -> Result<()> {
-    // CRITICAL: Validate metadata before insert (multi-connection safety)
-    // This ensures our metadata is current and reloads if another connection modified the index
+    // Refresh entry point from database (multi-connection safety)
+    // This ensures we have the current entry point for HNSW traversal
+    // SQLite's transaction locking ensures consistency within our operation
+    #[cfg(feature = "timing")]
     let t = Instant::now();
-    metadata.validate_and_refresh(db, table_name, column_name)?;
+    metadata.refresh_entry_point(db, table_name, column_name)?;
+    #[cfg(feature = "timing")]
     VALIDATE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     // Generate level for new node
@@ -360,8 +394,10 @@ pub fn insert_hnsw(
     // Traverse from top level down to insertion level + 1 (greedy search with ef=1)
     // This matches C implementation's hnsw_search_layer_query with ef=1
     for lv in (level + 1..=metadata.entry_point_level).rev() {
+        #[cfg(feature = "timing")]
         let t = Instant::now();
         let results = search::search_layer(&ctx, current_nearest, 1, lv)?;
+        #[cfg(feature = "timing")]
         SEARCH_LAYER_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         if let Some((nearest_rowid, _dist)) = results.first() {
             current_nearest = *nearest_rowid;
@@ -371,6 +407,7 @@ pub fn insert_hnsw(
     // Insert at each level from insertion level down to 0
     for lv in (0..=level).rev() {
         // Find M nearest neighbors at this level
+        #[cfg(feature = "timing")]
         let t = Instant::now();
         let neighbors = search::search_layer(
             &ctx,
@@ -378,6 +415,7 @@ pub fn insert_hnsw(
             metadata.params.ef_construction as usize,
             lv,
         )?;
+        #[cfg(feature = "timing")]
         SEARCH_LAYER_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         // Determine max connections for this level
@@ -410,14 +448,17 @@ pub fn insert_hnsw(
 
             if would_survive {
                 selected.push((neighbor_rowid, dist));
+                #[cfg(feature = "timing")]
                 SMART_CONNECT_ALLOWED.fetch_add(1, Ordering::Relaxed);
             } else {
+                #[cfg(feature = "timing")]
                 SMART_CONNECT_SKIPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         // Batch insert all edges for this level (only for neighbors that would keep us)
         // Include distance for O(1) prune operations
+        #[cfg(feature = "timing")]
         let t = Instant::now();
         let mut edges_to_insert: Vec<(i64, i64, i32, f32)> = Vec::with_capacity(selected.len() * 2);
         for (neighbor_rowid, dist) in selected.iter() {
@@ -427,6 +468,7 @@ pub fn insert_hnsw(
             edges_to_insert.push((*neighbor_rowid, rowid, lv, *dist));
         }
         storage::insert_edges_batch(db, table_name, column_name, &edges_to_insert)?;
+        #[cfg(feature = "timing")]
         INSERT_EDGE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         // Prune neighbors that may now exceed max_connections
@@ -434,6 +476,7 @@ pub fn insert_hnsw(
         let get_edges_stmt = stmt_cache.map(|c| c.get_edges);
         let insert_edge_stmt = stmt_cache.map(|c| c.insert_edge);
         for (neighbor_rowid, _dist) in selected.iter() {
+            #[cfg(feature = "timing")]
             let t = Instant::now();
             prune_neighbor_if_needed(
                 db,
@@ -450,6 +493,7 @@ pub fn insert_hnsw(
                 get_edges_stmt,
                 insert_edge_stmt,
             )?;
+            #[cfg(feature = "timing")]
             PRUNE_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
 
@@ -471,6 +515,7 @@ pub fn insert_hnsw(
     metadata.hnsw_version += 1;
 
     // Use cached statement if available (FAST PATH - like C)
+    #[cfg(feature = "timing")]
     let t = Instant::now();
     if let Some(cache) = stmt_cache {
         unsafe {
@@ -480,6 +525,7 @@ pub fn insert_hnsw(
         // Fallback: slower path for tests without cache
         metadata.save_dynamic_to_db(db, table_name, column_name)?;
     }
+    #[cfg(feature = "timing")]
     METADATA_TIME.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     Ok(())

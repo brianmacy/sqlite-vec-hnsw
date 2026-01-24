@@ -1,7 +1,7 @@
 //! Distance metric calculations
 
 use crate::error::{Error, Result};
-use crate::vector::{Vector, VectorType};
+use crate::vector::{VectorData, VectorType};
 
 pub mod scalar;
 // Note: SIMD optimization is provided by the simsimd crate (used in scalar.rs)
@@ -45,7 +45,15 @@ impl DistanceMetric {
 }
 
 /// Calculate distance between two vectors
-pub fn distance(a: &Vector, b: &Vector, metric: DistanceMetric) -> Result<f32> {
+///
+/// This function is generic over VectorData, allowing zero-copy operations
+/// when using VectorRef in hot paths.
+#[inline]
+pub fn distance<V1: VectorData, V2: VectorData>(
+    a: &V1,
+    b: &V2,
+    metric: DistanceMetric,
+) -> Result<f32> {
     if a.dimensions() != b.dimensions() {
         return Err(Error::DimensionMismatch {
             expected: a.dimensions(),
@@ -77,49 +85,57 @@ pub fn distance(a: &Vector, b: &Vector, metric: DistanceMetric) -> Result<f32> {
 
 /// L2 distance for Float32 vectors
 /// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
-pub fn distance_l2_f32(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_l2_f32<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_l2_f32_scalar(a, b)
 }
 
 /// L1 distance for Float32 vectors
 /// Pure Rust implementation (simsimd doesn't provide L1)
-pub fn distance_l1_f32(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_l1_f32<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_l1_f32_scalar(a, b)
 }
 
 /// Cosine distance for Float32 vectors
 /// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
-pub fn distance_cosine_f32(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_cosine_f32<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_cosine_f32_scalar(a, b)
 }
 
 /// L2 distance for Int8 vectors
 /// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
-pub fn distance_l2_i8(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_l2_i8<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_l2_i8_scalar(a, b)
 }
 
 /// L1 distance for Int8 vectors
 /// Pure Rust implementation (simsimd doesn't provide L1 for int8)
-pub fn distance_l1_i8(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_l1_i8<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_l1_i8_scalar(a, b)
 }
 
 /// Cosine distance for Int8 vectors
 /// Uses simsimd with automatic SIMD detection (AVX512/AVX2/SSE/NEON)
-pub fn distance_cosine_i8(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_cosine_i8<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_cosine_i8_scalar(a, b)
 }
 
 /// Hamming distance for binary vectors
 /// Uses simsimd with automatic SIMD detection
-pub fn distance_hamming(a: &Vector, b: &Vector) -> Result<f32> {
+#[inline]
+pub fn distance_hamming<V1: VectorData, V2: VectorData>(a: &V1, b: &V2) -> Result<f32> {
     scalar::distance_hamming_scalar(a, b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::Vector;
 
     #[test]
     fn test_distance_metric_from_str() {

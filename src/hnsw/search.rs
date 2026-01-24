@@ -7,10 +7,11 @@ use crate::distance;
 use crate::error::{Error, Result};
 use crate::hnsw::HnswMetadata;
 use crate::hnsw::storage;
-use crate::vector::{IndexQuantization, Vector, VectorType};
+use crate::vector::{IndexQuantization, Vector, VectorRef, VectorType};
 use fixedbitset::FixedBitSet;
 use rusqlite::{Connection, ffi};
 use std::collections::{BinaryHeap, HashSet};
+#[cfg(feature = "timing")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hybrid visited set: FixedBitSet for dense rowids [1, capacity), HashSet for outliers
@@ -50,24 +51,40 @@ impl HybridVisited {
     }
 }
 
-// Timing counters for search_layer breakdown
+// Timing counters for search_layer breakdown (only when timing feature is enabled)
+#[cfg(feature = "timing")]
 static SEARCH_FETCH_EDGES_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_FETCH_NODES_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_DISTANCE_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_HEAP_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_VISITED_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_FROM_BLOB_TIME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_LOOP_ITERATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_NEIGHBORS_FETCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static SEARCH_DISTANCES_COMPUTED: AtomicU64 = AtomicU64::new(0);
 // Batch size distribution buckets: 1-4, 5-16, 17-32, 33-64, 65+
+#[cfg(feature = "timing")]
 static BATCH_SIZE_1_4: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static BATCH_SIZE_5_16: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static BATCH_SIZE_17_32: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static BATCH_SIZE_33_64: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static BATCH_SIZE_65_PLUS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "timing")]
 static BATCH_FETCH_CALLS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "timing")]
 pub fn print_search_timing_stats() {
     eprintln!("\n=== SEARCH_LAYER BREAKDOWN ===");
     eprintln!(
@@ -126,6 +143,11 @@ pub fn print_search_timing_stats() {
     }
 }
 
+#[cfg(not(feature = "timing"))]
+#[inline(always)]
+pub fn print_search_timing_stats() {}
+
+#[cfg(feature = "timing")]
 pub fn reset_search_timing_stats() {
     SEARCH_FETCH_EDGES_TIME.store(0, Ordering::Relaxed);
     SEARCH_FETCH_NODES_TIME.store(0, Ordering::Relaxed);
@@ -143,6 +165,10 @@ pub fn reset_search_timing_stats() {
     BATCH_SIZE_65_PLUS.store(0, Ordering::Relaxed);
     BATCH_FETCH_CALLS.store(0, Ordering::Relaxed);
 }
+
+#[cfg(not(feature = "timing"))]
+#[inline(always)]
+pub fn reset_search_timing_stats() {}
 
 /// Cached statement pointers for search operations
 pub struct SearchStmtCache {
@@ -349,15 +375,16 @@ pub fn search_layer(
         _ => ctx.metadata.element_type,
     };
 
-    let entry_vec = Vector::from_blob(
+    // Zero-copy: use VectorRef instead of Vector to avoid allocation
+    let entry_ref = VectorRef::from_blob(
         &entry_node.vector,
         stored_element_type,
         ctx.metadata.dimensions as usize,
-    )?;
+    );
 
     let entry_dist = distance::distance(
         ctx.query_vec,
-        &entry_vec,
+        &entry_ref,
         ctx.metadata.internal_distance_metric(),
     )?;
 
@@ -410,31 +437,35 @@ pub fn search_layer(
             continue;
         }
 
+        #[cfg(feature = "timing")]
         SEARCH_NEIGHBORS_FETCHED.fetch_add(unvisited_neighbors.len() as u64, Ordering::Relaxed);
 
         // Track batch size distribution
-        BATCH_FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
-        let batch_size = unvisited_neighbors.len();
-        match batch_size {
-            1..=4 => BATCH_SIZE_1_4.fetch_add(1, Ordering::Relaxed),
-            5..=16 => BATCH_SIZE_5_16.fetch_add(1, Ordering::Relaxed),
-            17..=32 => BATCH_SIZE_17_32.fetch_add(1, Ordering::Relaxed),
-            33..=64 => BATCH_SIZE_33_64.fetch_add(1, Ordering::Relaxed),
-            _ => BATCH_SIZE_65_PLUS.fetch_add(1, Ordering::Relaxed),
-        };
+        #[cfg(feature = "timing")]
+        {
+            BATCH_FETCH_CALLS.fetch_add(1, Ordering::Relaxed);
+            let batch_size = unvisited_neighbors.len();
+            match batch_size {
+                1..=4 => BATCH_SIZE_1_4.fetch_add(1, Ordering::Relaxed),
+                5..=16 => BATCH_SIZE_5_16.fetch_add(1, Ordering::Relaxed),
+                17..=32 => BATCH_SIZE_17_32.fetch_add(1, Ordering::Relaxed),
+                33..=64 => BATCH_SIZE_33_64.fetch_add(1, Ordering::Relaxed),
+                _ => BATCH_SIZE_65_PLUS.fetch_add(1, Ordering::Relaxed),
+            };
+        }
 
         // BATCH FETCH: Get ONLY unvisited neighbor nodes
-        // Use cached statement (16 placeholders) for fast path, fallback to dynamic SQL
+        // Use cached statement (64 placeholders) for fast path, fallback to dynamic SQL
         let neighbor_nodes = if let Some(stmt) = ctx
             .stmt_cache
             .and_then(|c| c.batch_fetch_nodes)
             .filter(|s| !s.is_null())
         {
-            // Fast path: use cached prepared statement with 16 placeholders
+            // Fast path: use cached prepared statement with 64 placeholders
             let mut all_nodes = Vec::with_capacity(unvisited_neighbors.len());
-            for chunk in unvisited_neighbors.chunks(16) {
+            for chunk in unvisited_neighbors.chunks(64) {
                 unsafe {
-                    let nodes = storage::fetch_nodes_batch_cached(stmt, 16, chunk)?;
+                    let nodes = storage::fetch_nodes_batch_cached(stmt, 64, chunk)?;
                     all_nodes.extend(nodes);
                 }
             }
@@ -450,15 +481,16 @@ pub fn search_layer(
         };
 
         for neighbor_node in neighbor_nodes {
-            let neighbor_vec = Vector::from_blob(
+            // Zero-copy: use VectorRef instead of Vector to avoid allocation
+            let neighbor_ref = VectorRef::from_blob(
                 &neighbor_node.vector,
                 stored_element_type,
                 ctx.metadata.dimensions as usize,
-            )?;
+            );
 
             let neighbor_dist = distance::distance(
                 ctx.query_vec,
-                &neighbor_vec,
+                &neighbor_ref,
                 ctx.metadata.internal_distance_metric(),
             )?;
 
