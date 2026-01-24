@@ -359,8 +359,8 @@ impl HnswMetadata {
         use crate::vtab::StmtHandleGuard;
         use rusqlite::ffi;
 
-        // RAII guard: resets on create and on drop
-        let guard = StmtHandleGuard::new(cached_stmt)
+        // RAII guard: skip reset on create (saves 1 FFI call)
+        let guard = StmtHandleGuard::new_skip_reset(cached_stmt)
             .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
         // Bind parameters: entry_point_rowid, entry_point_level, num_nodes, hnsw_version
@@ -436,8 +436,8 @@ impl HnswMetadata {
         use crate::vtab::StmtHandleGuard;
         use rusqlite::ffi;
 
-        // RAII guard: resets on create and on drop
-        let guard = StmtHandleGuard::new(cached_stmt)
+        // RAII guard: skip reset on create (saves 1 FFI call)
+        let guard = StmtHandleGuard::new_skip_reset(cached_stmt)
             .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
         let rc = ffi::sqlite3_step(guard.as_ptr());

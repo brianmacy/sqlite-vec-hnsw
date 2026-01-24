@@ -455,13 +455,31 @@ pub fn search_layer(
         }
 
         // BATCH FETCH: Get ONLY unvisited neighbor nodes
-        // Use cached statement (64 placeholders) for fast path, fallback to dynamic SQL
-        let neighbor_nodes = if let Some(stmt) = ctx
+        // Optimization: For small batches (1-4 items = 98% of cases), use individual fetches
+        // to avoid binding 60+ unused parameters in the 64-placeholder batch statement.
+        // This saves ~64 FFI calls per small batch.
+        let neighbor_nodes = if unvisited_neighbors.len() <= 4 {
+            // Small batch: individual fetches are faster (fewer FFI calls)
+            let cached_node_stmt = ctx.stmt_cache.and_then(|c| c.get_node_data);
+            let mut nodes = Vec::with_capacity(unvisited_neighbors.len());
+            for &rowid in &unvisited_neighbors {
+                if let Some(node) = storage::fetch_node_data(
+                    ctx.db,
+                    ctx.table_name,
+                    ctx.column_name,
+                    rowid,
+                    cached_node_stmt,
+                )? {
+                    nodes.push(node);
+                }
+            }
+            nodes
+        } else if let Some(stmt) = ctx
             .stmt_cache
             .and_then(|c| c.batch_fetch_nodes)
             .filter(|s| !s.is_null())
         {
-            // Fast path: use cached prepared statement with 64 placeholders
+            // Large batch: use cached prepared statement with 64 placeholders
             let mut all_nodes = Vec::with_capacity(unvisited_neighbors.len());
             for chunk in unvisited_neighbors.chunks(64) {
                 unsafe {

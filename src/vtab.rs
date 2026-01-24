@@ -88,7 +88,6 @@ impl StmtHandleGuard {
     ///   the guard exists
     #[inline]
     #[allow(unsafe_op_in_unsafe_fn)]
-    #[allow(dead_code)] // Reserved for future use
     pub unsafe fn new_skip_reset(stmt: *mut ffi::sqlite3_stmt) -> Option<Self> {
         if stmt.is_null() {
             None

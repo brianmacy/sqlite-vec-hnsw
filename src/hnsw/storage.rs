@@ -39,8 +39,9 @@ pub fn fetch_node_data(
     // Fast path: use cached statement (avoids SQL parsing)
     if let Some(stmt) = cached_stmt {
         unsafe {
-            // RAII guard: resets on create (clears previous state) and on drop (releases locks)
-            let guard = StmtHandleGuard::new(stmt)
+            // RAII guard: skip reset on create (statement already reset by previous drop or freshly prepared)
+            // We rebind all parameters, so old bindings don't matter. Saves 1 FFI call.
+            let guard = StmtHandleGuard::new_skip_reset(stmt)
                 .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, rowid);
@@ -126,8 +127,9 @@ pub fn fetch_neighbors_cached(
     // Fast path: use cached statement (like C implementation)
     if let Some(stmt) = cached_stmt {
         unsafe {
-            // RAII guard: resets on create (clears previous state) and on drop (releases locks)
-            let guard = StmtHandleGuard::new(stmt)
+            // RAII guard: skip reset on create (saves 1 FFI call)
+            // Statement is already reset by previous drop or freshly prepared
+            let guard = StmtHandleGuard::new_skip_reset(stmt)
                 .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
@@ -190,8 +192,8 @@ pub fn fetch_neighbors_with_distances(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            // RAII guard: resets on create and on drop
-            let guard = StmtHandleGuard::new(stmt)
+            // RAII guard: skip reset on create (saves 1 FFI call)
+            let guard = StmtHandleGuard::new_skip_reset(stmt)
                 .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
@@ -252,8 +254,8 @@ pub fn insert_node(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            // RAII guard: resets on create and on drop
-            let guard = StmtHandleGuard::new(stmt)
+            // RAII guard: skip reset on create (saves 1 FFI call)
+            let guard = StmtHandleGuard::new_skip_reset(stmt)
                 .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, rowid);
@@ -305,8 +307,8 @@ pub fn insert_edge(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            // RAII guard: resets on create and on drop
-            let guard = StmtHandleGuard::new(stmt)
+            // RAII guard: skip reset on create (saves 1 FFI call)
+            let guard = StmtHandleGuard::new_skip_reset(stmt)
                 .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
@@ -450,8 +452,9 @@ pub unsafe fn fetch_nodes_batch_cached(
         return Ok(Vec::new());
     }
 
-    // RAII guard: resets on create and on drop
-    let guard = StmtHandleGuard::new(stmt)
+    // RAII guard: skip reset on create (saves 1 FFI call)
+    // Statement is already reset by previous drop or freshly prepared
+    let guard = StmtHandleGuard::new_skip_reset(stmt)
         .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
     // Bind actual rowids
@@ -554,8 +557,8 @@ pub fn delete_edges_from_level(
     // Fast path: use cached statement
     if let Some(stmt) = cached_stmt {
         unsafe {
-            // RAII guard: resets on create and on drop
-            let guard = StmtHandleGuard::new(stmt)
+            // RAII guard: skip reset on create (saves 1 FFI call)
+            let guard = StmtHandleGuard::new_skip_reset(stmt)
                 .ok_or_else(|| Error::InvalidParameter("null statement".to_string()))?;
 
             ffi::sqlite3_bind_int64(guard.as_ptr(), 1, from_rowid);
