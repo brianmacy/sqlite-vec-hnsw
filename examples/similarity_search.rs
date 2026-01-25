@@ -21,9 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🔍 Similarity Search Example\n");
 
-    // Create a virtual table with a 128-dimensional float32 vector column
+    // Create a virtual table with a 128-dimensional float32 vector column with HNSW index
+    // Default distance is cosine (best for embeddings)
     db.execute(
-        "CREATE VIRTUAL TABLE embeddings USING vec0(vector float[128])",
+        "CREATE VIRTUAL TABLE embeddings USING vec0(vector float[128] hnsw())",
         [],
     )?;
 
@@ -148,8 +149,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let brute_start = Instant::now();
     let mut brute_results = Vec::new();
 
-    // Query all vectors and calculate distances
-    let mut stmt = db.prepare("SELECT rowid, vector FROM embeddings")?;
+    // Query all vectors from the _data table (vectors stored as blobs)
+    let mut stmt = db.prepare("SELECT rowid, vec00 FROM embeddings_data")?;
     let rows = stmt.query_map([], |row| {
         let rowid: i64 = row.get(0)?;
         let vector_bytes: Vec<u8> = row.get(1)?;
@@ -160,8 +161,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (rowid, vector_bytes) = row?;
         let vector = Vector::from_blob(&vector_bytes, VectorType::Float32, 128)?;
         let query_vec = Vector::from_blob(&query_bytes, VectorType::Float32, 128)?;
+        // Use Cosine distance to match HNSW default
         let distance =
-            sqlite_vec_hnsw::distance::distance(&query_vec, &vector, DistanceMetric::L2)?;
+            sqlite_vec_hnsw::distance::distance(&query_vec, &vector, DistanceMetric::Cosine)?;
         brute_results.push((rowid, distance));
     }
 

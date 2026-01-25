@@ -192,20 +192,14 @@ fn test_write_for_c_compatibility() {
         println!("   - {}", table);
     }
 
-    // Verify expected shadow tables exist
+    // Verify expected shadow tables exist (unified storage architecture)
     assert!(
-        tables.contains(&"test_vectors_chunks".to_string()),
-        "Missing chunks table"
+        tables.contains(&"test_vectors_data".to_string()),
+        "Missing unified _data table"
     );
     assert!(
-        tables.contains(&"test_vectors_rowids".to_string()),
-        "Missing rowids table"
-    );
-    assert!(
-        tables
-            .iter()
-            .any(|t| t.contains("_chunks") && t.contains("chunks0")),
-        "Missing vector chunks table"
+        tables.contains(&"test_vectors_info".to_string()),
+        "Missing _info table"
     );
     assert!(
         tables.iter().any(|t| t.contains("hnsw_meta")),
@@ -219,39 +213,34 @@ fn test_write_for_c_compatibility() {
         tables.iter().any(|t| t.contains("hnsw_edges")),
         "Missing HNSW edges table"
     );
-    assert!(
-        tables.iter().any(|t| t.contains("hnsw_levels")),
-        "Missing HNSW levels table"
-    );
+    // Note: No more _chunks, _rowids, _vector_chunks tables - unified storage in _data
 
-    // Check shadow table schemas match C expectations
+    // Check shadow table schemas match expected unified architecture
     println!("\n🔍 Verifying shadow table schemas...");
 
-    // Check chunks table schema
-    let chunks_schema: String = db
+    // Check unified _data table schema
+    let data_schema: String = db
         .query_row(
-            "SELECT sql FROM sqlite_master WHERE name='test_vectors_chunks'",
+            "SELECT sql FROM sqlite_master WHERE name='test_vectors_data'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    println!("   chunks: {}", chunks_schema);
-    assert!(chunks_schema.contains("chunk_id"));
-    assert!(chunks_schema.contains("size"));
-    assert!(chunks_schema.contains("validity"));
+    println!("   _data: {}", data_schema);
+    assert!(data_schema.contains("rowid INTEGER PRIMARY KEY"));
+    assert!(data_schema.contains("vec00 BLOB")); // First vector column
 
-    // Check rowids table schema
-    let rowids_schema: String = db
+    // Check _info table schema (key-value store)
+    let info_schema: String = db
         .query_row(
-            "SELECT sql FROM sqlite_master WHERE name='test_vectors_rowids'",
+            "SELECT sql FROM sqlite_master WHERE name='test_vectors_info'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    println!("   rowids: {}", rowids_schema);
-    assert!(rowids_schema.contains("rowid"));
-    assert!(rowids_schema.contains("chunk_id"));
-    assert!(rowids_schema.contains("chunk_offset"));
+    println!("   _info: {}", info_schema);
+    assert!(info_schema.contains("key TEXT PRIMARY KEY"));
+    assert!(info_schema.contains("value"));
 
     // Check HNSW metadata (find the meta table dynamically)
     let meta_table = tables
@@ -311,7 +300,7 @@ fn test_write_for_c_compatibility() {
     assert!(num_nodes > 0, "Should have nodes indexed");
 
     println!("\n✅ Schema compatibility test passed!");
-    println!("   - All expected shadow tables created");
-    println!("   - Shadow table schemas match expected");
+    println!("   - Unified _data and _info tables created");
+    println!("   - HNSW shadow tables created (meta, nodes, edges)");
     println!("   - HNSW metadata is populated");
 }

@@ -118,9 +118,9 @@ fn test_storage_breakdown_float32() {
 }
 
 #[test]
-fn test_chunk_inspection() {
+fn test_unified_storage_inspection() {
     let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("chunk_test.db");
+    let db_path = temp_dir.path().join("unified_test.db");
 
     let db = Connection::open(&db_path).unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
@@ -131,9 +131,9 @@ fn test_chunk_inspection() {
     )
     .unwrap();
 
-    println!("\n=== Chunk Storage Inspection ===");
+    println!("\n=== Unified Storage Inspection ===");
 
-    // Insert 300 vectors (should create 2 chunks at 256 vectors/chunk)
+    // Insert 300 vectors (all in unified _data table)
     db.execute("BEGIN TRANSACTION", []).unwrap();
     for i in 1..=300 {
         let vector: Vec<f32> = (0..768).map(|j| ((i + j) % 100) as f32 / 100.0).collect();
@@ -146,46 +146,31 @@ fn test_chunk_inspection() {
     }
     db.execute("COMMIT", []).unwrap();
 
-    // Inspect chunks table
-    let chunks: Vec<(i64, i64, i64, i64)> = db
-        .prepare("SELECT chunk_id, size, length(validity), length(rowids) FROM vectors_chunks")
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    // Inspect unified _data table
+    let data_row_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vectors_data", [], |row| row.get(0))
+        .unwrap();
+
+    println!("Unified _data table:");
+    println!("  Total rows: {}", data_row_count);
+    assert_eq!(data_row_count, 300, "Should have 300 rows in _data table");
+
+    // Check vector sizes
+    let avg_vec_size: f64 = db
+        .query_row("SELECT AVG(LENGTH(vec00)) FROM vectors_data", [], |row| {
+            row.get(0)
         })
-        .unwrap()
-        .collect::<Result<_, _>>()
         .unwrap();
 
-    println!("Chunks table:");
-    for (chunk_id, size, validity_bytes, rowids_bytes) in chunks {
-        println!(
-            "  Chunk {}: size={}, validity={} bytes, rowids={} bytes",
-            chunk_id, size, validity_bytes, rowids_bytes
-        );
-    }
-
-    // Inspect vector_chunks table
-    let vector_chunks: Vec<(i64, i64)> = db
-        .prepare("SELECT rowid, length(vectors) FROM vectors_vector_chunks00")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-
-    println!("\nVector chunks table:");
-    for (chunk_rowid, vectors_size) in &vector_chunks {
-        println!("  Chunk rowid {}: {} bytes", chunk_rowid, vectors_size);
-    }
+    println!("  Average vector size: {:.0} bytes", avg_vec_size);
+    println!("  Expected: {} bytes (768 floats × 4 bytes)", 768 * 4);
 
     println!("\nExpected for 300 vectors:");
     println!(
         "  Raw data: {} bytes (768 floats × 4 bytes × 300)",
         768 * 4 * 300
     );
-    println!("  C overhead: ~10-20% for chunking + HNSW");
-    println!("  Expected total: ~{} bytes", (768 * 4 * 300) as f64 * 1.15);
+    println!("  With unified storage: minimal overhead");
 
     let actual_size = std::fs::metadata(&db_path).unwrap().len();
     println!("\nActual database size: {} bytes", actual_size);

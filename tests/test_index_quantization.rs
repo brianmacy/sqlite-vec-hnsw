@@ -154,22 +154,21 @@ fn test_index_quantization_main_storage_unchanged() {
     )
     .unwrap();
 
-    // Main storage (chunk tables) should still have float32 vectors (4 bytes per dimension)
-    // Note: vector_chunks tables store vectors as BLOBs for entire chunks
-    let chunk_vector_size: i32 = db
+    // Unified _data table should store original float32 vectors (4 bytes per dimension)
+    let data_vector_size: i32 = db
         .query_row(
-            "SELECT LENGTH(vectors) FROM test_vector_chunks00 LIMIT 1",
+            "SELECT LENGTH(vec00) FROM test_data WHERE rowid = 1",
             [],
             |row| row.get(0),
         )
         .unwrap();
 
-    // The chunk stores float32 vectors (4 bytes per dimension)
+    // The _data table stores float32 vectors (4 bytes per dimension)
     // One vector of 4 dimensions = 16 bytes
-    assert!(
-        chunk_vector_size >= 16,
-        "Main storage should contain float32 vectors (got {} bytes)",
-        chunk_vector_size
+    assert_eq!(
+        data_vector_size, 16,
+        "Main storage (_data) should contain float32 vectors (got {} bytes)",
+        data_vector_size
     );
 }
 
@@ -200,15 +199,27 @@ fn test_non_vector_columns_before_vector() {
     )
     .unwrap();
 
-    // Verify the vector was stored in the correct chunk table (chunks00, not chunks02)
-    let chunk_exists: i64 = db
+    // Verify the unified _data table exists with vec00 column (first vector column)
+    let data_exists: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='test_vector_chunks00'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='test_data'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(chunk_exists, 1, "Should use test_vector_chunks00");
+    assert_eq!(data_exists, 1, "Should have unified test_data table");
+
+    // Verify vector is stored in vec00 column (not vec02)
+    let vec_data: Vec<u8> = db
+        .query_row("SELECT vec00 FROM test_data WHERE rowid = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        vec_data.len(),
+        16,
+        "vec00 should contain 4 floats = 16 bytes"
+    );
 
     // Insert more data
     db.execute(

@@ -328,6 +328,44 @@ CREATE VIRTUAL TABLE vec_example USING vec0(
    - Increase `ef_construction` for better recall (slower builds)
    - Increase `M` for better recall (more memory)
 5. **Filter with metadata columns** instead of post-filtering in application code
+6. **Set optimal page_size for large vectors** - see below
+
+### Page Size Optimization for Large Vectors
+
+SQLite stores large BLOBs in overflow pages when they exceed ~1/4 of the page size. For vector search, this means an extra B-tree traversal per lookup - a significant performance penalty when doing many random lookups.
+
+**Inline Thresholds by Page Size:**
+
+| Page Size | Max Inline (bytes) | Max Float32 Dims | Notes |
+|-----------|-------------------|------------------|-------|
+| 4KB (default) | ~1013 | ~253D | Most vectors overflow |
+| 8KB | ~2037 | ~509D | Good for 384D |
+| 16KB | ~4087 | ~1021D | Good for 768D |
+| 32KB | ~8183 | ~2045D | Good for 1536D+ |
+
+**Setting Page Size:**
+
+```sql
+-- MUST be set before creating any tables!
+-- Only works on a new database or immediately after VACUUM INTO
+PRAGMA page_size = 16384;
+
+-- Then create your vector tables
+CREATE VIRTUAL TABLE vectors USING vec0(embedding float[768] hnsw());
+```
+
+**Performance Impact:**
+- 16KB pages: ~1.7x faster lookups for 384D-768D vectors
+- 32KB pages: ~2.7x faster lookups for 768D-1536D vectors
+
+**Automatic Warning:**
+sqlite-vec-hnsw will print a warning to stderr when creating an HNSW-indexed table if the page_size is suboptimal for your vector dimensions.
+
+**Recommendation:**
+- 384D vectors (1536 bytes): Use 8KB or 16KB pages
+- 512D vectors (2048 bytes): Use 16KB pages
+- 768D vectors (3072 bytes): Use 16KB pages
+- 1536D vectors (6144 bytes): Use 32KB pages
 
 ## Troubleshooting
 

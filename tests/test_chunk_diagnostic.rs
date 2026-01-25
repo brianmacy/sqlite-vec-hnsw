@@ -1,9 +1,9 @@
-// Diagnostic test to understand chunk allocations
+// Diagnostic test to understand unified storage allocations
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[test]
-fn test_1000_vector_chunk_breakdown() {
+fn test_1000_vector_unified_storage() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("diag.db");
     let db = Connection::open(&db_path).unwrap();
@@ -25,53 +25,16 @@ fn test_1000_vector_chunk_breakdown() {
 
     db.execute("COMMIT", []).unwrap();
 
-    println!("\n=== Chunk Allocations (1000 vectors) ===");
+    println!("\n=== Unified Storage Allocations (1000 vectors) ===");
 
-    // Check _chunks table
-    let chunks: Vec<(i64, i64)> = db
-        .prepare("SELECT chunk_id, size FROM v_chunks")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
+    // Check unified _data table
+    let data_row_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM v_data", [], |row| row.get(0))
         .unwrap();
 
-    println!("v_chunks table ({} rows):", chunks.len());
-    for (id, size) in &chunks {
-        println!("  Chunk {}: size={} (max 1024)", id, size);
-    }
-
-    if chunks.len() > 1 {
-        println!("❌ FOUND BLOAT: Multiple chunks created for 1000 vectors!");
-    } else {
-        println!("✓ Only 1 chunk created");
-    }
-
-    // Check vector_chunks table
-    let vec_chunks: Vec<(i64, i64)> = db
-        .prepare("SELECT rowid, length(vectors) FROM v_vector_chunks00")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-
-    println!("\nv_vector_chunks00 table ({} rows):", vec_chunks.len());
-    for (id, len) in &vec_chunks {
-        println!("  Chunk rowid {}: {} bytes", id, len);
-        let expected = 1024 * 768 * 4;
-        println!(
-            "    Expected: {} bytes (1024 vectors × 3,072 bytes)",
-            expected
-        );
-        if *len != expected {
-            println!("    ⚠️ Size mismatch!");
-        }
-    }
-
-    if vec_chunks.len() > 1 {
-        println!("❌ FOUND BLOAT: Multiple vector_chunks rows!");
-    }
+    println!("v_data table: {} rows", data_row_count);
+    assert_eq!(data_row_count, 1000, "Should have 1000 rows in _data table");
+    println!("✓ All 1000 vectors stored in unified _data table");
 
     // Check HNSW node count
     let node_count: i64 = db
@@ -79,9 +42,8 @@ fn test_1000_vector_chunk_breakdown() {
         .unwrap();
 
     println!("\nHNSW nodes: {}", node_count);
-    if node_count != 1000 {
-        println!("⚠️ Expected 1000 nodes, got {}", node_count);
-    }
+    assert_eq!(node_count, 1000, "Should have 1000 HNSW nodes");
+    println!("✓ HNSW index has 1000 nodes");
 
     // Summary
     let total_size = std::fs::metadata(&db_path).unwrap().len();
@@ -90,6 +52,18 @@ fn test_1000_vector_chunk_breakdown() {
         total_size,
         total_size / 1000
     );
-    println!("C expected: ~2,929 bytes/vector");
-    println!("Bloat: {:.1}x", (total_size / 1000) as f64 / 2929.0);
+
+    // With unified storage (no chunking overhead), storage should be more efficient
+    let bytes_per_vector = total_size / 1000;
+    let raw_vector_size = 768 * 4; // 3,072 bytes
+    let overhead = bytes_per_vector as f64 / raw_vector_size as f64;
+    println!("Raw vector size: {} bytes", raw_vector_size);
+    println!("Overhead: {:.2}x", overhead);
+
+    // With HNSW enabled, we expect ~2-3x overhead (vector in _data + vector in hnsw_nodes + edges)
+    if bytes_per_vector < 10000 {
+        println!("✅ Storage efficiency is acceptable (< 10KB/vector)");
+    } else {
+        println!("⚠️ Storage may have bloat (> 10KB/vector)");
+    }
 }

@@ -110,9 +110,12 @@ fn test_shadow_tables_created() {
         .unwrap();
 
     println!("Shadow tables created: {}", shadow_count);
-    // Without hnsw(), should have: chunks, rowids, vector_chunks00, info (4 tables)
+    // Without hnsw(), should have: _data, _info (2 tables)
     // HNSW tables are only created when hnsw() is specified
-    assert!(shadow_count >= 4, "Should have at least 4 shadow tables");
+    assert!(
+        shadow_count >= 2,
+        "Should have at least 2 shadow tables (_data, _info)"
+    );
 }
 
 #[test]
@@ -179,16 +182,19 @@ fn test_multiple_vector_columns() {
         "CREATE TABLE with multiple vector columns should succeed"
     );
 
-    // Verify shadow tables for both columns exist
-    let shadow_count: i64 = db
+    // Verify unified _data table exists (stores all vector columns)
+    let data_table_exists: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'vec_multi_vector_chunks%'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'vec_multi_data'",
             [],
             |row| row.get(0),
         )
         .unwrap();
 
-    assert_eq!(shadow_count, 2, "Should have 2 vector_chunks tables");
+    assert_eq!(
+        data_table_exists, 1,
+        "Should have unified _data table for all vector columns"
+    );
 }
 
 #[test]
@@ -492,7 +498,7 @@ fn test_persistence_across_connections() {
 
         assert_eq!(count, 2, "Data should persist across connections");
 
-        // Verify shadow tables still exist
+        // Verify shadow tables still exist (_data and _info)
         let shadow_count: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'vec_persist_%'",
@@ -501,7 +507,10 @@ fn test_persistence_across_connections() {
             )
             .unwrap();
 
-        assert!(shadow_count >= 3, "Shadow tables should persist");
+        assert!(
+            shadow_count >= 2,
+            "Shadow tables should persist (_data, _info)"
+        );
     }
 }
 
@@ -537,21 +546,21 @@ fn test_insert_with_auto_rowid() {
 }
 
 #[test]
-fn test_chunk_allocation() {
+fn test_unified_data_storage() {
     let db = create_test_db().expect("Failed to create database");
     init_extension(&db).expect("Failed to init extension");
 
     db.execute(
-        "CREATE VIRTUAL TABLE vec_chunks USING vec0(embedding float[3])",
+        "CREATE VIRTUAL TABLE vec_unified USING vec0(embedding float[3])",
         [],
     )
     .unwrap();
 
-    // Insert multiple vectors to test chunk management
+    // Insert multiple vectors to test unified _data table storage
     for i in 1..=10 {
         db.execute(
             &format!(
-                "INSERT INTO vec_chunks(rowid, embedding) VALUES ({}, vec_f32('[{}.0, {}.0, {}.0]'))",
+                "INSERT INTO vec_unified(rowid, embedding) VALUES ({}, vec_f32('[{}.0, {}.0, {}.0]'))",
                 i, i, i + 1, i + 2
             ),
             [],
@@ -561,19 +570,22 @@ fn test_chunk_allocation() {
 
     // Verify all inserts succeeded
     let count: i64 = db
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM vec_unified", [], |row| row.get(0))
         .unwrap();
 
     assert_eq!(count, 10, "Should have 10 vectors");
 
-    // Verify chunks table has entries
-    let chunk_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM vec_chunks_chunks", [], |row| {
+    // Verify unified _data table has entries (one row per vector)
+    let data_row_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vec_unified_data", [], |row| {
             row.get(0)
         })
         .unwrap();
 
-    assert!(chunk_count >= 1, "Should have at least one chunk");
+    assert_eq!(
+        data_row_count, 10,
+        "Unified _data table should have 10 rows"
+    );
 }
 
 #[test]
@@ -1004,7 +1016,7 @@ fn test_insert_both_methods_equivalent() {
         .unwrap();
     assert_eq!(count, 2, "Both insert methods should work");
 
-    // Verify shadow tables exist and have data
+    // Verify shadow tables exist (_data and _info)
     let shadow_count: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'vec_equiv_%'",
@@ -1012,7 +1024,10 @@ fn test_insert_both_methods_equivalent() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(shadow_count >= 3, "Should have shadow tables for vec_equiv");
+    assert!(
+        shadow_count >= 2,
+        "Should have shadow tables for vec_equiv (_data, _info)"
+    );
 }
 
 #[test]

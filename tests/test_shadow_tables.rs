@@ -29,20 +29,14 @@ fn test_shadow_tables_created() {
         }
     }
 
-    // Check that expected shadow tables exist
+    // Check that expected shadow tables exist (unified storage architecture)
     assert!(
-        tables.iter().any(|t| t == "test_vec_chunks"),
-        "Missing test_vec_chunks"
+        tables.iter().any(|t| t == "test_vec_data"),
+        "Missing test_vec_data (unified storage)"
     );
     assert!(
-        tables.iter().any(|t| t == "test_vec_rowids"),
-        "Missing test_vec_rowids"
-    );
-    assert!(
-        tables
-            .iter()
-            .any(|t| t.starts_with("test_vec_vector_chunks")),
-        "Missing vector chunks table"
+        tables.iter().any(|t| t == "test_vec_info"),
+        "Missing test_vec_info"
     );
 
     // Check HNSW shadow tables
@@ -57,10 +51,6 @@ fn test_shadow_tables_created() {
     assert!(
         tables.iter().any(|t| t == "test_vec_embedding_hnsw_meta"),
         "Missing HNSW meta table"
-    );
-    assert!(
-        tables.iter().any(|t| t == "test_vec_embedding_hnsw_levels"),
-        "Missing HNSW levels table"
     );
 }
 
@@ -82,27 +72,26 @@ fn test_data_persisted_in_shadow_tables() {
     )
     .unwrap();
 
-    // Check rowids table
-    let rowid_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM docs_rowids", [], |row| row.get(0))
+    // Check unified _data table
+    let data_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM docs_data", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(rowid_count, 1, "Should have 1 row in rowids table");
+    assert_eq!(data_count, 1, "Should have 1 row in _data table");
 
-    // Check that we can read the chunk_id and chunk_offset
-    let (chunk_id, chunk_offset): (i64, i64) = db
-        .query_row(
-            "SELECT chunk_id, chunk_offset FROM docs_rowids WHERE rowid = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    // Check that we can read the vector blob from _data
+    let vec_blob: Vec<u8> = db
+        .query_row("SELECT vec00 FROM docs_data WHERE rowid = 1", [], |row| {
+            row.get(0)
+        })
         .unwrap();
 
     println!(
-        "\nRowid 1 stored in chunk_id={}, chunk_offset={}",
-        chunk_id, chunk_offset
+        "\nRowid 1 stored in unified _data table: {} bytes",
+        vec_blob.len()
     );
+    assert_eq!(vec_blob.len(), 12, "3 floats = 12 bytes");
 
-    // Verify we can read the vector back (now returns JSON string)
+    // Verify we can read the vector back via virtual table (now returns JSON string)
     let embedding_json: String = db
         .query_row("SELECT embedding FROM docs WHERE rowid = 1", [], |row| {
             row.get(0)

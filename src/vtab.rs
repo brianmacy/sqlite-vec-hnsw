@@ -144,6 +144,77 @@ pub fn register_vec0_module(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Check if the current page_size is optimal for storing vectors of the given dimensions.
+///
+/// SQLite stores large BLOBs (> ~page_size/4) in overflow pages, requiring an extra B-tree
+/// traversal per lookup. For vector search (many random lookups), this is a significant
+/// performance penalty.
+///
+/// # Returns
+/// - `None` if page_size is optimal (vectors fit inline)
+/// - `Some((current_page_size, recommended_page_size))` if suboptimal
+///
+/// # Safety
+/// The db handle must be valid.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn check_page_size_for_vectors(
+    db: *mut ffi::sqlite3,
+    dimensions: usize,
+    vec_type: VectorType,
+) -> Option<(i32, i32)> {
+    // Calculate vector size in bytes
+    let vector_bytes = match vec_type {
+        VectorType::Float32 => dimensions * 4,
+        VectorType::Int8 => dimensions,
+        VectorType::Bit => dimensions.div_ceil(8),
+    };
+
+    // Query current page_size
+    let sql = std::ffi::CString::new("PRAGMA page_size").unwrap();
+    let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+    let rc = ffi::sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut());
+    if rc != ffi::SQLITE_OK || stmt.is_null() {
+        return None;
+    }
+
+    let page_size = if ffi::sqlite3_step(stmt) == ffi::SQLITE_ROW {
+        ffi::sqlite3_column_int(stmt, 0)
+    } else {
+        ffi::sqlite3_finalize(stmt);
+        return None;
+    };
+    ffi::sqlite3_finalize(stmt);
+
+    // SQLite inline threshold: ~(page_size - 35) / 4
+    // Records larger than this go to overflow pages
+    let inline_threshold = (page_size - 35) / 4;
+
+    if vector_bytes as i32 > inline_threshold {
+        // Find minimum recommended page_size
+        // inline_threshold >= vector_bytes
+        // (page_size - 35) / 4 >= vector_bytes
+        // page_size >= vector_bytes * 4 + 35
+        let min_page_size = (vector_bytes as i32 * 4) + 35;
+
+        // Round up to next power of 2 (SQLite requires power-of-2 page sizes)
+        let recommended = if min_page_size <= 4096 {
+            4096
+        } else if min_page_size <= 8192 {
+            8192
+        } else if min_page_size <= 16384 {
+            16384
+        } else if min_page_size <= 32768 {
+            32768
+        } else {
+            65536 // SQLite max
+        };
+
+        Some((page_size, recommended))
+    } else {
+        None
+    }
+}
+
 /// Column definition for vec0 table
 #[derive(Debug, Clone)]
 struct ColumnDef {
@@ -550,7 +621,6 @@ pub struct Vec0Tab {
     schema_name: String,
     table_name: String,
     columns: Vec<ColumnDef>,
-    chunk_size: usize,
     index_type: IndexType,
     db: *mut ffi::sqlite3,               // Raw database handle for operations
     hnsw_stmt_cache: Vec<HnswStmtCache>, // One cache per vector column
@@ -862,7 +932,6 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
                 schema_name,
                 table_name,
                 columns,
-                chunk_size: shadow::DEFAULT_CHUNK_SIZE,
                 index_type,
                 db: db_handle,
                 hnsw_stmt_cache,
@@ -952,36 +1021,38 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         // First, parse arguments and create the base virtual table
         let (sql, vtab) = Self::connect(db, aux, args)?;
 
-        // Count column types for shadow table creation
-        // Shadow tables use sequential indices (0, 1, 2) for vector columns,
-        // regardless of their position in the overall table definition
-        let num_vector_columns = vtab
-            .columns
-            .iter()
-            .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
-            .count();
-        let num_metadata_columns = vtab
-            .columns
-            .iter()
-            .filter(|c| matches!(c.col_type, ColumnType::Metadata))
-            .count();
-        let num_auxiliary_columns = vtab
-            .columns
-            .iter()
-            .filter(|c| matches!(c.col_type, ColumnType::Auxiliary))
-            .count();
-        let num_partition_columns = vtab
-            .columns
-            .iter()
-            .filter(|c| matches!(c.col_type, ColumnType::PartitionKey))
-            .count();
-
         // Create shadow tables using raw FFI
         // SAFETY: We're using the raw sqlite3 handle to execute DDL statements
         // This is necessary because rusqlite's VTab trait doesn't provide
         // a way to execute arbitrary SQL during table creation
         unsafe {
             let db_handle = db.handle();
+
+            // Build vector column definitions
+            let vector_columns: Vec<shadow::VectorColumnDef> = vtab
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    if let ColumnType::Vector {
+                        vec_type,
+                        dimensions,
+                        ..
+                    } = &c.col_type
+                    {
+                        Some(shadow::VectorColumnDef {
+                            name: c.name.clone(),
+                            dimensions: *dimensions,
+                            element_size: match vec_type {
+                                VectorType::Float32 => 4,
+                                VectorType::Int8 => 1,
+                                VectorType::Bit => 1, // div_ceil(8) at storage level
+                            },
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             // Build data column definitions for non-vector columns
             // Use the actual SQL type from the column definition for type preservation
@@ -995,13 +1066,9 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                 })
                 .collect();
 
-            // Create base shadow tables
+            // Create unified storage config
             let config = shadow::ShadowTablesConfig {
-                num_vector_columns,
-                num_metadata_columns,
-                num_auxiliary_columns,
-                has_text_pk: false, // TODO: detect from args
-                num_partition_columns,
+                vector_columns,
                 data_columns,
             };
 
@@ -1048,6 +1115,30 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                 {
                     // Only create HNSW tables if hnsw() was specified
                     if hnsw_params.enabled {
+                        // Check page_size and warn if suboptimal for vector storage
+                        // Vectors that overflow require extra B-tree traversal per lookup
+                        if let Some((current, recommended)) =
+                            check_page_size_for_vectors(db_handle, *dimensions, *vec_type)
+                        {
+                            let vec_bytes = match vec_type {
+                                VectorType::Float32 => dimensions * 4,
+                                VectorType::Int8 => *dimensions,
+                                VectorType::Bit => dimensions.div_ceil(8),
+                            };
+                            eprintln!(
+                                "WARNING: sqlite-vec-hnsw page_size suboptimal for {}.{}:\n  \
+                                 Current page_size={}, vectors={}D ({} bytes) will overflow.\n  \
+                                 Recommend: PRAGMA page_size={} before creating database.\n  \
+                                 This can improve lookup performance by 2-3x.",
+                                vtab.table_name,
+                                col.name,
+                                current,
+                                dimensions,
+                                vec_bytes,
+                                recommended
+                            );
+                        }
+
                         shadow::create_hnsw_shadow_tables_with_params_ffi(
                             db_handle,
                             &vtab.table_name,
@@ -1113,50 +1204,31 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
         // SAFETY: db is a valid sqlite3 handle from SQLite
         let conn = unsafe { Connection::from_handle(self.db)? };
 
-        // Build list of shadow tables to drop
+        // Build list of shadow tables to drop (unified storage schema)
         let mut shadow_tables = vec![
-            format!("{}_chunks", self.table_name),
-            format!("{}_rowids", self.table_name),
-            format!("{}_info", self.table_name),
+            format!("{}_data", self.table_name), // Unified data table (vectors + non-vectors)
+            format!("{}_info", self.table_name), // Version metadata
         ];
 
-        // Add per-column shadow tables for each column
-        // Note: vector_chunks tables use vector-column-specific index (0, 1, 2... for each vector column)
-        // while metadata tables use overall column index
-        let mut vec_col_idx = 0;
-        for (col_idx, col) in self.columns.iter().enumerate() {
+        // Add HNSW tables for each vector column
+        for col in self.columns.iter() {
             if let ColumnType::Vector { .. } = col.col_type {
-                // Vector chunk table (uses vector column index, not overall column index)
-                shadow_tables.push(format!(
-                    "{}_vector_chunks{:02}",
-                    self.table_name, vec_col_idx
-                ));
-
                 // HNSW tables
                 shadow_tables.push(format!("{}_{}_hnsw_nodes", self.table_name, col.name));
                 shadow_tables.push(format!("{}_{}_hnsw_edges", self.table_name, col.name));
-                shadow_tables.push(format!("{}_{}_hnsw_levels", self.table_name, col.name));
                 shadow_tables.push(format!("{}_{}_hnsw_meta", self.table_name, col.name));
-
-                vec_col_idx += 1;
             }
-
-            // Legacy metadata tables (may exist from older versions)
-            shadow_tables.push(format!("{}_metadatachunks{:02}", self.table_name, col_idx));
-            shadow_tables.push(format!("{}_metadatatext{:02}", self.table_name, col_idx));
         }
 
-        // Add auxiliary table if there are auxiliary columns
-        if self
-            .columns
-            .iter()
-            .any(|c| matches!(c.col_type, ColumnType::Auxiliary))
-        {
-            shadow_tables.push(format!("{}_auxiliary", self.table_name));
+        // Legacy tables (from old chunked schema - for migration cleanup)
+        shadow_tables.push(format!("{}_chunks", self.table_name));
+        shadow_tables.push(format!("{}_rowids", self.table_name));
+        shadow_tables.push(format!("{}_auxiliary", self.table_name));
+        for i in 0..16 {
+            shadow_tables.push(format!("{}_vector_chunks{:02}", self.table_name, i));
+            shadow_tables.push(format!("{}_metadatachunks{:02}", self.table_name, i));
+            shadow_tables.push(format!("{}_metadatatext{:02}", self.table_name, i));
         }
-
-        // Add _data table for non-vector column storage
-        shadow_tables.push(format!("{}_data", self.table_name));
 
         // Drop each shadow table (ignore errors for tables that don't exist)
         for table in shadow_tables {
@@ -1243,114 +1315,68 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         // SAFETY: db is a valid sqlite3 handle from SQLite
         let conn = unsafe { Connection::from_handle(self.db)? };
 
-        // Get chunk position for this rowid
-        let rowids_table = format!("{}_rowids", self.table_name);
-        let query = format!(
-            "SELECT chunk_id, chunk_offset FROM \"{}\".\"{}\" WHERE rowid = ?",
-            self.schema_name, rowids_table
-        );
+        // Delete from HNSW index for each vector column with HNSW enabled
+        for col in &self.columns {
+            if let ColumnType::Vector { hnsw_params, .. } = &col.col_type
+                && hnsw_params.enabled
+            {
+                let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
+                let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
 
-        let chunk_info: Option<(i64, i64)> = conn
-            .query_row(&query, [rowid], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?;
+                // Delete node (ignore errors if table doesn't exist)
+                let _ = conn.execute(
+                    &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
+                    [rowid],
+                );
 
-        if let Some((chunk_id, chunk_offset)) = chunk_info {
-            // Mark as invalid in validity bitmap
-            let chunks_table = format!("{}_chunks", self.table_name);
-            shadow::mark_chunk_row_invalid(&conn, &chunks_table, chunk_id, chunk_offset as usize)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                // Delete edges (ignore errors if table doesn't exist)
+                let _ = conn.execute(
+                    &format!(
+                        "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
+                        edges_table
+                    ),
+                    rusqlite::params![rowid, rowid],
+                );
 
-            // Delete from HNSW index if column is a vector with HNSW enabled
-            for col in &self.columns {
-                if let ColumnType::Vector { hnsw_params, .. } = &col.col_type
-                    && hnsw_params.enabled
+                // Update metadata if it exists
+                if let Ok(Some(mut meta)) =
+                    HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
                 {
-                    let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
-                    let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
-                    let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
+                    meta.num_nodes = meta.num_nodes.saturating_sub(1);
+                    meta.hnsw_version += 1;
 
-                    // Delete node (ignore errors if table doesn't exist)
-                    let _ = conn.execute(
-                        &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
-                        [rowid],
-                    );
+                    // If we deleted the entry point, need to find a new one
+                    if meta.entry_point_rowid == rowid {
+                        let new_entry: Option<(i64, i32)> = conn
+                            .query_row(
+                                &format!(
+                                    "SELECT rowid, level FROM \"{}\" ORDER BY level DESC LIMIT 1",
+                                    nodes_table
+                                ),
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .optional()
+                            .unwrap_or(None);
 
-                    // Delete edges (ignore errors if table doesn't exist)
-                    let _ = conn.execute(
-                        &format!(
-                            "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
-                            edges_table
-                        ),
-                        rusqlite::params![rowid, rowid],
-                    );
-
-                    // Delete from levels (ignore errors if table doesn't exist)
-                    let _ = conn.execute(
-                        &format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table),
-                        [rowid],
-                    );
-
-                    // Update metadata if it exists
-                    if let Ok(Some(mut meta)) =
-                        HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
-                    {
-                        meta.num_nodes = meta.num_nodes.saturating_sub(1);
-                        meta.hnsw_version += 1;
-
-                        // If we deleted the entry point, need to find a new one
-                        if meta.entry_point_rowid == rowid {
-                            let new_entry: Option<(i64, i32)> = conn
-                                .query_row(
-                                    &format!(
-                                        "SELECT rowid, level FROM \"{}\" ORDER BY level DESC LIMIT 1",
-                                        nodes_table
-                                    ),
-                                    [],
-                                    |row| Ok((row.get(0)?, row.get(1)?)),
-                                )
-                                .optional()
-                                .unwrap_or(None);
-
-                            if let Some((new_rowid, new_level)) = new_entry {
-                                meta.entry_point_rowid = new_rowid;
-                                meta.entry_point_level = new_level;
-                            } else {
-                                // No nodes left
-                                meta.entry_point_rowid = -1;
-                                meta.entry_point_level = -1;
-                            }
+                        if let Some((new_rowid, new_level)) = new_entry {
+                            meta.entry_point_rowid = new_rowid;
+                            meta.entry_point_level = new_level;
+                        } else {
+                            // No nodes left
+                            meta.entry_point_rowid = -1;
+                            meta.entry_point_level = -1;
                         }
-
-                        let _ = meta.save_to_db(&conn, &self.table_name, &col.name);
                     }
+
+                    let _ = meta.save_to_db(&conn, &self.table_name, &col.name);
                 }
             }
-
-            // Delete from rowids table
-            conn.execute(
-                &format!(
-                    "DELETE FROM \"{}\".\"{}\" WHERE rowid = ?",
-                    self.schema_name, rowids_table
-                ),
-                [rowid],
-            )?;
-
-            // Delete from _data table (non-vector columns)
-            let has_data_columns = self
-                .columns
-                .iter()
-                .any(|c| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary));
-            if has_data_columns {
-                let data_table = format!("{}_data", self.table_name);
-                conn.execute(
-                    &format!(
-                        "DELETE FROM \"{}\".\"{}\" WHERE rowid = ?",
-                        self.schema_name, data_table
-                    ),
-                    [rowid],
-                )?;
-            }
         }
+
+        // Delete from unified _data table (single delete for all columns)
+        shadow::delete_row(&conn, &self.schema_name, &self.table_name, rowid)
+            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
         // Release connection without closing the database
         std::mem::forget(conn);
@@ -1363,190 +1389,224 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
         // args[1]: new rowid (or NULL for auto)
         // args[2..]: column values
 
-        // Determine rowid
+        // SAFETY: self.db is valid for the lifetime of the virtual table
+        let conn = unsafe {
+            Connection::from_handle(self.db)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?
+        };
+
+        // Determine rowid from unified _data table
         let rowid = if args.len() > 1 {
             match args.get::<Option<i64>>(1)? {
                 Some(r) => r,
                 None => {
-                    // Auto-generate rowid by querying max rowid from _rowids table
-                    // SAFETY: self.db is valid for the lifetime of the virtual table
-                    unsafe {
-                        let conn = Connection::from_handle(self.db).map_err(|e| {
-                            rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
-                        })?;
-
-                        let table_name = format!("{}_rowids", self.table_name);
-                        let query = format!(
-                            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM \"{}\".\"{}\"",
-                            self.schema_name, table_name
-                        );
-
-                        let auto_rowid = conn
-                            .query_row(&query, [], |row| row.get::<_, i64>(0))
-                            .unwrap_or(1);
-
-                        std::mem::forget(conn);
-                        auto_rowid
-                    }
+                    // Auto-generate rowid from _data table
+                    shadow::next_rowid(&conn, &self.schema_name, &self.table_name)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                 }
             }
         } else {
             1
         };
 
-        // Process vector columns
+        // Collect all vector data for unified INSERT
+        let mut vectors: Vec<Vec<u8>> = Vec::new();
+        let mut hnsw_insert_info: Vec<(usize, Vec<u8>, String)> = Vec::new(); // (vec_col_idx, vector_data, col_name)
+
         let mut vec_col_idx = 0;
         for (col_idx, col) in self.columns.iter().enumerate() {
             if let ColumnType::Vector {
                 vec_type,
                 dimensions,
-                index_quantization,
+                index_quantization: _,
                 hnsw_params,
             } = &col.col_type
             {
                 let value_idx = col_idx + 2; // Skip NULL and rowid args
-                if value_idx >= args.len() {
-                    continue;
-                }
 
                 // Get the vector data as raw bytes - try blob first, then JSON text
-                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx) {
-                    Ok(Some(data)) => data,
-                    Ok(None) => continue, // NULL vector, skip
-                    Err(_) => {
-                        // Not a blob, try as JSON text string
-                        match args.get::<Option<String>>(value_idx)? {
-                            Some(json_str) => {
-                                let vector = Vector::from_json(&json_str, *vec_type)
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                                vector.as_bytes().to_vec()
+                let vector_data: Option<Vec<u8>> = if value_idx >= args.len() {
+                    None
+                } else {
+                    match args.get::<Option<Vec<u8>>>(value_idx) {
+                        Ok(Some(data)) => Some(data),
+                        Ok(None) => None,
+                        Err(_) => {
+                            // Not a blob, try as JSON text string
+                            match args.get::<Option<String>>(value_idx)? {
+                                Some(json_str) => {
+                                    let vector =
+                                        Vector::from_json(&json_str, *vec_type).map_err(|e| {
+                                            rusqlite::Error::UserFunctionError(Box::new(e))
+                                        })?;
+                                    Some(vector.as_bytes().to_vec())
+                                }
+                                None => None,
                             }
-                            None => continue, // NULL vector, skip
                         }
                     }
                 };
 
-                // Validate the byte size matches expected dimensions
-                let expected_bytes = match vec_type {
-                    VectorType::Float32 => dimensions * 4,
-                    VectorType::Int8 => *dimensions,
-                    VectorType::Bit => dimensions.div_ceil(8),
-                };
-
-                if vector_data.len() != expected_bytes {
-                    // Provide user-friendly dimension-based error messages
-                    let error_msg = if vector_data.is_empty() {
-                        "zero-length vectors are not supported".to_string()
-                    } else {
-                        let actual_dims = match vec_type {
-                            VectorType::Float32 => vector_data.len() / 4,
-                            VectorType::Int8 => vector_data.len(),
-                            VectorType::Bit => vector_data.len() * 8,
-                        };
-                        format!(
-                            "Dimension mismatch for vector column: expected {} dimensions, got {}",
-                            dimensions, actual_dims
-                        )
+                if let Some(data) = vector_data {
+                    // Validate the byte size matches expected dimensions
+                    let expected_bytes = match vec_type {
+                        VectorType::Float32 => dimensions * 4,
+                        VectorType::Int8 => *dimensions,
+                        VectorType::Bit => dimensions.div_ceil(8),
                     };
-                    return Err(rusqlite::Error::UserFunctionError(Box::new(
-                        Error::InvalidParameter(error_msg),
-                    )));
-                }
 
-                // Write the vector to shadow tables
-                // SAFETY: self.db is valid for the lifetime of the virtual table
-                unsafe {
-                    shadow::insert_vector_ffi(
-                        self.db,
-                        &self.schema_name,
-                        &self.table_name,
-                        self.chunk_size,
-                        rowid,
-                        vec_col_idx, // Use vector-specific column index, not overall col_idx
-                        &vector_data,
-                    )
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                }
-
-                // Also insert into HNSW index if this column has HNSW enabled
-                if hnsw_params.enabled {
-                    // SAFETY: self.db is valid for the lifetime of the virtual table
-                    unsafe {
-                        let conn = Connection::from_handle(self.db).map_err(|e| {
-                            rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
-                        })?;
-
-                        // Load or initialize HNSW metadata
-                        let mut metadata =
-                            HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
-                                .unwrap_or_else(|| {
-                                    // Initialize new HNSW index with column's settings
-                                    HnswMetadata::with_index_quantization(
-                                        *dimensions as i32,
-                                        *vec_type,
-                                        hnsw_params.distance_metric,
-                                        *index_quantization,
-                                    )
-                                });
-
-                        // Get statement cache for this vector column
-                        // CRITICAL: Lazy prepare statements on THIS connection using extension trait
-                        let stmt_cache_ref = if vec_col_idx < self.hnsw_stmt_cache.len() {
-                            let self_mut = self as *const _ as *mut Vec0Tab;
-                            let cache = &mut (&mut *self_mut).hnsw_stmt_cache[vec_col_idx];
-
-                            // Prepare statements lazily on this connection (ConnectionExt trait)
-                            let nodes_table =
-                                format!("{}_{}_hnsw_nodes", self.table_name, col.name);
-                            let edges_table =
-                                format!("{}_{}_hnsw_edges", self.table_name, col.name);
-                            let meta_table = format!("{}_{}_hnsw_meta", self.table_name, col.name);
-
-                            conn.prepare_or_reuse(
-                                &mut cache.get_node_data,
-                                &format!(
-                                    "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
-                                    nodes_table
-                                ),
+                    if data.len() != expected_bytes {
+                        std::mem::forget(conn);
+                        let error_msg = if data.is_empty() {
+                            "zero-length vectors are not supported".to_string()
+                        } else {
+                            let actual_dims = match vec_type {
+                                VectorType::Float32 => data.len() / 4,
+                                VectorType::Int8 => data.len(),
+                                VectorType::Bit => data.len() * 8,
+                            };
+                            format!(
+                                "Dimension mismatch for vector column: expected {} dimensions, got {}",
+                                dimensions, actual_dims
                             )
-                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                        };
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            Error::InvalidParameter(error_msg),
+                        )));
+                    }
 
-                            conn.prepare_or_reuse(&mut cache.get_edges,
-                                    &format!("SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?", edges_table))
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    // Queue for HNSW insert if enabled
+                    if hnsw_params.enabled {
+                        hnsw_insert_info.push((vec_col_idx, data.clone(), col.name.clone()));
+                    }
+                    vectors.push(data);
+                } else {
+                    vectors.push(Vec::new()); // NULL vector stored as empty blob
+                }
 
-                            conn.prepare_or_reuse(&mut cache.insert_node,
+                vec_col_idx += 1;
+            }
+        }
+
+        // Collect all non-vector column values
+        let mut data_columns: Vec<rusqlite::types::Value> = Vec::new();
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if matches!(col.col_type, ColumnType::Metadata | ColumnType::Auxiliary) {
+                let value_idx = col_idx + 2; // Skip NULL and rowid args
+                if value_idx < args.len() {
+                    // Preserve original type
+                    if let Ok(Some(i)) = args.get::<Option<i64>>(value_idx) {
+                        data_columns.push(i.into());
+                    } else if let Ok(Some(f)) = args.get::<Option<f64>>(value_idx) {
+                        data_columns.push(f.into());
+                    } else if let Ok(Some(s)) = args.get::<Option<String>>(value_idx) {
+                        data_columns.push(s.into());
+                    } else if let Ok(Some(b)) = args.get::<Option<Vec<u8>>>(value_idx) {
+                        data_columns.push(b.into());
+                    } else {
+                        data_columns.push(rusqlite::types::Value::Null);
+                    }
+                } else {
+                    data_columns.push(rusqlite::types::Value::Null);
+                }
+            }
+        }
+
+        // Single INSERT into unified _data table (vectors + non-vector columns)
+        let vector_refs: Vec<&[u8]> = vectors.iter().map(|v| v.as_slice()).collect();
+        shadow::insert_row(
+            &conn,
+            &self.schema_name,
+            &self.table_name,
+            rowid,
+            &vector_refs,
+            &data_columns,
+        )
+        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+        // Insert into HNSW index for enabled columns
+        for (vec_col_idx, vector_data, col_name) in hnsw_insert_info {
+            // Find the column to get its settings
+            let col = self.columns.iter().find(|c| c.name == col_name);
+            if let Some(col) = col
+                && let ColumnType::Vector {
+                    vec_type,
+                    dimensions,
+                    index_quantization,
+                    hnsw_params,
+                } = &col.col_type
+            {
+                // Load or initialize HNSW metadata
+                let mut metadata = HnswMetadata::load_from_db(&conn, &self.table_name, &col_name)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                    .unwrap_or_else(|| {
+                        HnswMetadata::with_index_quantization(
+                            *dimensions as i32,
+                            *vec_type,
+                            hnsw_params.distance_metric,
+                            *index_quantization,
+                        )
+                    });
+
+                // Get statement cache for this vector column
+                // SAFETY: We need mutable access to the cache
+                let stmt_cache_ref = unsafe {
+                    if vec_col_idx < self.hnsw_stmt_cache.len() {
+                        let self_mut = self as *const _ as *mut Vec0Tab;
+                        let cache = &mut (&mut *self_mut).hnsw_stmt_cache[vec_col_idx];
+
+                        let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col_name);
+                        let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col_name);
+                        let meta_table = format!("{}_{}_hnsw_meta", self.table_name, col_name);
+
+                        conn.prepare_or_reuse(
+                            &mut cache.get_node_data,
+                            &format!(
+                                "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
+                                nodes_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(
+                            &mut cache.get_edges,
+                            &format!(
+                                "SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                edges_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(&mut cache.insert_node,
                                     &format!("INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)", nodes_table))
                                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                            conn.prepare_or_reuse(&mut cache.insert_edge,
+                        conn.prepare_or_reuse(&mut cache.insert_edge,
                                     &format!("INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES (?, ?, ?)", edges_table))
                                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                            conn.prepare_or_reuse(
-                                &mut cache.delete_edges_from,
-                                &format!(
-                                    "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
-                                    edges_table
-                                ),
-                            )
-                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                        conn.prepare_or_reuse(
+                            &mut cache.delete_edges_from,
+                            &format!(
+                                "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                edges_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                            conn.prepare_or_reuse(
-                                &mut cache.update_meta,
-                                &format!(
-                                    "UPDATE \"{}\" SET \
+                        conn.prepare_or_reuse(
+                            &mut cache.update_meta,
+                            &format!(
+                                "UPDATE \"{}\" SET \
                                      entry_point_rowid = ?, entry_point_level = ?, \
                                      num_nodes = ?, hnsw_version = ? \
                                      WHERE id = 1",
-                                    meta_table
-                                ),
-                            )
-                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                                meta_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                            // Also prepare get_edges_with_dist (used by pruning during insert)
-                            conn.prepare_or_reuse(
+                        conn.prepare_or_reuse(
                                 &mut cache.get_edges_with_dist,
                                 &format!(
                                     "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ?",
@@ -1555,111 +1615,47 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                             )
                             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                            // Also prepare batch_fetch_nodes (used for batch vector lookups)
-                            let placeholders = (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
-                            conn.prepare_or_reuse(
-                                &mut cache.batch_fetch_nodes,
-                                &format!(
-                                    "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
-                                    nodes_table, placeholders
-                                ),
-                            )
-                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                            let cache = &self.hnsw_stmt_cache[vec_col_idx];
-                            Some(hnsw::insert::HnswStmtCache {
-                                get_node_data: cache.get_node_data,
-                                get_edges: cache.get_edges,
-                                get_edges_with_dist: cache.get_edges_with_dist,
-                                insert_node: cache.insert_node,
-                                insert_edge: cache.insert_edge,
-                                delete_edges_from: cache.delete_edges_from,
-                                update_meta: cache.update_meta,
-                                batch_fetch_nodes: cache.batch_fetch_nodes,
-                            })
-                        } else {
-                            None
-                        };
-
-                        // Insert into HNSW graph with cached statements
-                        hnsw::insert::insert_hnsw(
-                            &conn,
-                            &mut metadata,
-                            &self.table_name,
-                            &col.name,
-                            rowid,
-                            &vector_data,
-                            stmt_cache_ref.as_ref(),
+                        let placeholders = (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
+                        conn.prepare_or_reuse(
+                            &mut cache.batch_fetch_nodes,
+                            &format!(
+                                "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+                                nodes_table, placeholders
+                            ),
                         )
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                        std::mem::forget(conn);
-                    }
-                }
-
-                vec_col_idx += 1;
-            }
-        }
-
-        // Process ALL non-vector columns - single efficient INSERT into _data table
-        let data_columns: Vec<usize> = self
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary))
-            .map(|(col_idx, _)| col_idx)
-            .collect();
-
-        if !data_columns.is_empty() {
-            // SAFETY: self.db is valid for the lifetime of the virtual table
-            unsafe {
-                let conn = Connection::from_handle(self.db)
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
-
-                // Build single INSERT statement for _data table
-                // Schema: (rowid, col00, col01, col02, ...)
-                let data_table = format!("{}_data", self.table_name);
-                let mut col_names = String::from("rowid");
-                let mut placeholders = String::from("?");
-                for i in 0..data_columns.len() {
-                    col_names.push_str(&format!(", col{:02}", i));
-                    placeholders.push_str(", ?");
-                }
-
-                let insert_sql = format!(
-                    "INSERT OR REPLACE INTO \"{}\".\"{}\" ({}) VALUES ({})",
-                    self.schema_name, data_table, col_names, placeholders
-                );
-
-                // Collect all values in order
-                let mut values: Vec<rusqlite::types::Value> = vec![rowid.into()];
-                for col_idx in &data_columns {
-                    let value_idx = col_idx + 2; // Skip NULL and rowid args
-                    if value_idx < args.len() {
-                        // Preserve original type for efficiency
-                        if let Ok(Some(i)) = args.get::<Option<i64>>(value_idx) {
-                            values.push(i.into());
-                        } else if let Ok(Some(f)) = args.get::<Option<f64>>(value_idx) {
-                            values.push(f.into());
-                        } else if let Ok(Some(s)) = args.get::<Option<String>>(value_idx) {
-                            values.push(s.into());
-                        } else if let Ok(Some(b)) = args.get::<Option<Vec<u8>>>(value_idx) {
-                            values.push(b.into());
-                        } else {
-                            values.push(rusqlite::types::Value::Null);
-                        }
+                        let cache = &self.hnsw_stmt_cache[vec_col_idx];
+                        Some(hnsw::insert::HnswStmtCache {
+                            get_node_data: cache.get_node_data,
+                            get_edges: cache.get_edges,
+                            get_edges_with_dist: cache.get_edges_with_dist,
+                            insert_node: cache.insert_node,
+                            insert_edge: cache.insert_edge,
+                            delete_edges_from: cache.delete_edges_from,
+                            update_meta: cache.update_meta,
+                            batch_fetch_nodes: cache.batch_fetch_nodes,
+                        })
                     } else {
-                        values.push(rusqlite::types::Value::Null);
+                        None
                     }
-                }
+                };
 
-                conn.execute(&insert_sql, rusqlite::params_from_iter(values))
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
-
-                std::mem::forget(conn);
+                // Insert into HNSW graph
+                hnsw::insert::insert_hnsw(
+                    &conn,
+                    &mut metadata,
+                    &self.table_name,
+                    &col_name,
+                    rowid,
+                    &vector_data,
+                    stmt_cache_ref.as_ref(),
+                )
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
             }
         }
 
+        std::mem::forget(conn);
         Ok(rowid)
     }
 
@@ -1685,324 +1681,319 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             )));
         }
 
-        // Process vector columns
+        // SAFETY: self.db is valid for the lifetime of the virtual table
+        let conn = unsafe {
+            Connection::from_handle(self.db)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?
+        };
+
+        // Collect all vector updates for unified UPDATE
+        let mut vector_updates: Vec<Option<&[u8]>> = Vec::new();
+        let mut hnsw_update_info: Vec<(usize, Vec<u8>, String)> = Vec::new();
+
         let mut vec_col_idx = 0;
         for (col_idx, col) in self.columns.iter().enumerate() {
             if let ColumnType::Vector {
                 vec_type,
                 dimensions,
-                index_quantization,
+                index_quantization: _,
                 hnsw_params,
             } = &col.col_type
             {
                 let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
-                if value_idx >= args.len() {
-                    vec_col_idx += 1;
-                    continue;
-                }
 
                 // Get the new vector data - try blob first, then JSON text
-                let vector_data: Vec<u8> = match args.get::<Option<Vec<u8>>>(value_idx) {
-                    Ok(Some(data)) => data,
-                    Ok(None) => {
-                        vec_col_idx += 1;
-                        continue; // NULL vector, skip (could implement DELETE here)
-                    }
-                    Err(_) => {
-                        // Not a blob, try as JSON text string
-                        match args.get::<Option<String>>(value_idx)? {
-                            Some(json_str) => {
-                                let vector = Vector::from_json(&json_str, *vec_type)
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                                vector.as_bytes().to_vec()
-                            }
-                            None => {
-                                vec_col_idx += 1;
-                                continue; // NULL vector, skip
+                let vector_data: Option<Vec<u8>> = if value_idx >= args.len() {
+                    None
+                } else {
+                    match args.get::<Option<Vec<u8>>>(value_idx) {
+                        Ok(Some(data)) => Some(data),
+                        Ok(None) => None,
+                        Err(_) => {
+                            // Not a blob, try as JSON text string
+                            match args.get::<Option<String>>(value_idx)? {
+                                Some(json_str) => {
+                                    let vector =
+                                        Vector::from_json(&json_str, *vec_type).map_err(|e| {
+                                            rusqlite::Error::UserFunctionError(Box::new(e))
+                                        })?;
+                                    Some(vector.as_bytes().to_vec())
+                                }
+                                None => None,
                             }
                         }
                     }
                 };
 
-                // Validate byte size
-                let expected_bytes = match vec_type {
-                    VectorType::Float32 => dimensions * 4,
-                    VectorType::Int8 => *dimensions,
-                    VectorType::Bit => dimensions.div_ceil(8),
-                };
-
-                if vector_data.len() != expected_bytes {
-                    // Provide user-friendly dimension-based error messages
-                    let error_msg = if vector_data.is_empty() {
-                        "zero-length vectors are not supported".to_string()
-                    } else {
-                        let actual_dims = match vec_type {
-                            VectorType::Float32 => vector_data.len() / 4,
-                            VectorType::Int8 => vector_data.len(),
-                            VectorType::Bit => vector_data.len() * 8,
-                        };
-                        format!(
-                            "Dimension mismatch for vector column: expected {} dimensions, got {}",
-                            dimensions, actual_dims
-                        )
+                if let Some(ref data) = vector_data {
+                    // Validate byte size
+                    let expected_bytes = match vec_type {
+                        VectorType::Float32 => dimensions * 4,
+                        VectorType::Int8 => *dimensions,
+                        VectorType::Bit => dimensions.div_ceil(8),
                     };
-                    return Err(rusqlite::Error::UserFunctionError(Box::new(
-                        Error::InvalidParameter(error_msg),
-                    )));
-                }
 
-                // SAFETY: self.db is valid for the lifetime of the virtual table
-                let conn = unsafe { Connection::from_handle(self.db)? };
-
-                // Get chunk position for this rowid
-                let rowids_table = format!("{}_rowids", self.table_name);
-                let query = format!(
-                    "SELECT chunk_id, chunk_offset FROM \"{}\".\"{}\" WHERE rowid = ?",
-                    self.schema_name, rowids_table
-                );
-
-                let chunk_info: Option<(i64, i64)> = conn
-                    .query_row(&query, [old_rowid], |row| Ok((row.get(0)?, row.get(1)?)))
-                    .optional()?;
-
-                if let Some((chunk_id, chunk_offset)) = chunk_info {
-                    // Write new vector to shadow table (overwrite existing)
-                    shadow::write_vector_to_chunk(
-                        &conn,
-                        &self.schema_name,
-                        &self.table_name,
-                        vec_col_idx, // Use vector-specific column index, not overall col_idx
-                        chunk_id,
-                        chunk_offset,
-                        &vector_data,
-                    )
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                    // Update HNSW index if this column has HNSW enabled
-                    if hnsw_params.enabled {
-                        // Delete old HNSW node
-                        let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col.name);
-                        let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col.name);
-                        let levels_table = format!("{}_{}_hnsw_levels", self.table_name, col.name);
-
-                        // Get old level before deletion
-                        let old_level: Option<i32> = conn
-                            .query_row(
-                                &format!("SELECT level FROM \"{}\" WHERE rowid = ?", nodes_table),
-                                [old_rowid],
-                                |row| row.get(0),
-                            )
-                            .optional()?;
-
-                        // Delete old node and edges
-                        let _ = conn.execute(
-                            &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
-                            [old_rowid],
-                        );
-                        let _ = conn.execute(
-                            &format!(
-                                "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
-                                edges_table
-                            ),
-                            rusqlite::params![old_rowid, old_rowid],
-                        );
-                        let _ = conn.execute(
-                            &format!("DELETE FROM \"{}\" WHERE rowid = ?", levels_table),
-                            [old_rowid],
-                        );
-
-                        // Insert new node into HNSW
-                        let mut metadata =
-                            HnswMetadata::load_from_db(&conn, &self.table_name, &col.name)
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
-                                .unwrap_or_else(|| {
-                                    HnswMetadata::with_index_quantization(
-                                        *dimensions as i32,
-                                        *vec_type,
-                                        hnsw_params.distance_metric,
-                                        *index_quantization,
-                                    )
-                                });
-
-                        // Decrement node count since we're replacing
-                        if old_level.is_some() {
-                            metadata.num_nodes = metadata.num_nodes.saturating_sub(1);
-                        }
-
-                        // Get statement cache for this vector column
-                        // CRITICAL: Lazy prepare statements on THIS connection using extension trait
-                        let stmt_cache_ref = if vec_col_idx < self.hnsw_stmt_cache.len() {
-                            // SAFETY: We need mutable access to the cache to prepare statements
-                            unsafe {
-                                let self_mut = self as *const _ as *mut Vec0Tab;
-                                let cache = &mut (&mut *self_mut).hnsw_stmt_cache[vec_col_idx];
-
-                                // Prepare statements lazily on this connection (ConnectionExt trait)
-                                let nodes_table =
-                                    format!("{}_{}_hnsw_nodes", self.table_name, col.name);
-                                let edges_table =
-                                    format!("{}_{}_hnsw_edges", self.table_name, col.name);
-                                let meta_table =
-                                    format!("{}_{}_hnsw_meta", self.table_name, col.name);
-
-                                conn.prepare_or_reuse(
-                                    &mut cache.get_node_data,
-                                    &format!(
-                                        "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
-                                        nodes_table
-                                    ),
-                                )
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                conn.prepare_or_reuse(&mut cache.get_edges,
-                                    &format!("SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?", edges_table))
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                conn.prepare_or_reuse(&mut cache.insert_node,
-                                    &format!("INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)", nodes_table))
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                conn.prepare_or_reuse(&mut cache.insert_edge,
-                                    &format!("INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES (?, ?, ?)", edges_table))
-                                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                conn.prepare_or_reuse(
-                                    &mut cache.delete_edges_from,
-                                    &format!(
-                                        "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
-                                        edges_table
-                                    ),
-                                )
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                conn.prepare_or_reuse(
-                                    &mut cache.update_meta,
-                                    &format!(
-                                        "INSERT OR REPLACE INTO \"{}\" (key, value) VALUES (?, ?)",
-                                        meta_table
-                                    ),
-                                )
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                // Also prepare get_edges_with_dist (used by pruning during insert)
-                                conn.prepare_or_reuse(
-                                    &mut cache.get_edges_with_dist,
-                                    &format!(
-                                        "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ?",
-                                        edges_table
-                                    ),
-                                )
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-
-                                // Also prepare batch_fetch_nodes (used for batch vector lookups)
-                                let placeholders =
-                                    (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
-                                conn.prepare_or_reuse(
-                                    &mut cache.batch_fetch_nodes,
-                                    &format!(
-                                        "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
-                                        nodes_table, placeholders
-                                    ),
-                                )
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                            }
-
-                            let cache = &self.hnsw_stmt_cache[vec_col_idx];
-                            Some(hnsw::insert::HnswStmtCache {
-                                get_node_data: cache.get_node_data,
-                                get_edges: cache.get_edges,
-                                get_edges_with_dist: cache.get_edges_with_dist,
-                                insert_node: cache.insert_node,
-                                insert_edge: cache.insert_edge,
-                                delete_edges_from: cache.delete_edges_from,
-                                update_meta: cache.update_meta,
-                                batch_fetch_nodes: cache.batch_fetch_nodes,
-                            })
+                    if data.len() != expected_bytes {
+                        std::mem::forget(conn);
+                        let error_msg = if data.is_empty() {
+                            "zero-length vectors are not supported".to_string()
                         } else {
-                            None
+                            let actual_dims = match vec_type {
+                                VectorType::Float32 => data.len() / 4,
+                                VectorType::Int8 => data.len(),
+                                VectorType::Bit => data.len() * 8,
+                            };
+                            format!(
+                                "Dimension mismatch for vector column: expected {} dimensions, got {}",
+                                dimensions, actual_dims
+                            )
                         };
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            Error::InvalidParameter(error_msg),
+                        )));
+                    }
 
-                        // Re-insert with new vector using cached statements
-                        hnsw::insert::insert_hnsw(
-                            &conn,
-                            &mut metadata,
-                            &self.table_name,
-                            &col.name,
-                            old_rowid,
-                            &vector_data,
-                            stmt_cache_ref.as_ref(),
-                        )
-                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    // Queue for HNSW update if enabled
+                    if hnsw_params.enabled {
+                        hnsw_update_info.push((vec_col_idx, data.clone(), col.name.clone()));
                     }
                 }
 
-                std::mem::forget(conn);
+                // Store a temporary None - we'll handle vectors after building the list
+                vector_updates.push(None);
                 vec_col_idx += 1;
             }
         }
 
-        // Process ALL non-vector columns on UPDATE - single efficient UPDATE to _data table
-        let data_columns: Vec<usize> = self
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| matches!(c.col_type, ColumnType::Metadata | ColumnType::Auxiliary))
-            .map(|(col_idx, _)| col_idx)
-            .collect();
-
-        if !data_columns.is_empty() {
-            // SAFETY: self.db is valid for the lifetime of the virtual table
-            unsafe {
-                let conn = Connection::from_handle(self.db)
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
-
-                let data_table = format!("{}_data", self.table_name);
-
-                // Build single UPDATE statement for all non-vector columns
-                let mut set_clauses = Vec::new();
-                let mut values: Vec<rusqlite::types::Value> = Vec::new();
-
-                for (data_idx, col_idx) in data_columns.iter().enumerate() {
-                    let value_idx = col_idx + 2; // Skip old_rowid and new_rowid args
-                    if value_idx < args.len() {
-                        set_clauses.push(format!("col{:02} = ?", data_idx));
-
-                        // Preserve type information
-                        if let Ok(Some(i)) = args.get::<Option<i64>>(value_idx) {
-                            values.push(i.into());
-                        } else if let Ok(Some(f)) = args.get::<Option<f64>>(value_idx) {
-                            values.push(f.into());
-                        } else if let Ok(Some(s)) = args.get::<Option<String>>(value_idx) {
-                            values.push(s.into());
-                        } else if let Ok(Some(b)) = args.get::<Option<Vec<u8>>>(value_idx) {
-                            values.push(b.into());
-                        } else {
-                            values.push(rusqlite::types::Value::Null);
-                        }
+        // Rebuild vector_updates with actual data references from hnsw_update_info
+        // and collect all vector data for UPDATE
+        let mut vector_data_storage: Vec<Vec<u8>> = Vec::new();
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if let ColumnType::Vector { vec_type, .. } = &col.col_type {
+                let value_idx = col_idx + 2;
+                let vector_data: Option<Vec<u8>> = if value_idx >= args.len() {
+                    None
+                } else {
+                    match args.get::<Option<Vec<u8>>>(value_idx) {
+                        Ok(Some(data)) => Some(data),
+                        Ok(None) => None,
+                        Err(_) => match args.get::<Option<String>>(value_idx).ok().flatten() {
+                            Some(json_str) => Vector::from_json(&json_str, *vec_type)
+                                .ok()
+                                .map(|v| v.as_bytes().to_vec()),
+                            None => None,
+                        },
                     }
-                }
-
-                if !set_clauses.is_empty() {
-                    // Add rowid for WHERE clause
-                    values.push(old_rowid.into());
-
-                    let update_sql = format!(
-                        "UPDATE \"{}\".\"{}\" SET {} WHERE rowid = ?",
-                        self.schema_name,
-                        data_table,
-                        set_clauses.join(", ")
-                    );
-
-                    conn.execute(&update_sql, rusqlite::params_from_iter(values))
-                        .map_err(|e| {
-                            rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e)))
-                        })?;
-                }
-
-                std::mem::forget(conn);
+                };
+                vector_data_storage.push(vector_data.unwrap_or_default());
             }
         }
 
+        // Collect all non-vector column updates
+        let mut column_updates: Vec<Option<rusqlite::types::Value>> = Vec::new();
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            if matches!(col.col_type, ColumnType::Metadata | ColumnType::Auxiliary) {
+                let value_idx = col_idx + 2;
+                if value_idx < args.len() {
+                    // Preserve original type
+                    if let Ok(Some(i)) = args.get::<Option<i64>>(value_idx) {
+                        column_updates.push(Some(i.into()));
+                    } else if let Ok(Some(f)) = args.get::<Option<f64>>(value_idx) {
+                        column_updates.push(Some(f.into()));
+                    } else if let Ok(Some(s)) = args.get::<Option<String>>(value_idx) {
+                        column_updates.push(Some(s.into()));
+                    } else if let Ok(Some(b)) = args.get::<Option<Vec<u8>>>(value_idx) {
+                        column_updates.push(Some(b.into()));
+                    } else {
+                        column_updates.push(Some(rusqlite::types::Value::Null));
+                    }
+                } else {
+                    column_updates.push(None); // Don't update this column
+                }
+            }
+        }
+
+        // Single UPDATE to unified _data table
+        let vector_update_refs: Vec<Option<&[u8]>> = vector_data_storage
+            .iter()
+            .map(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.as_slice())
+                }
+            })
+            .collect();
+        shadow::update_row(
+            &conn,
+            &self.schema_name,
+            &self.table_name,
+            old_rowid,
+            &vector_update_refs,
+            &column_updates,
+        )
+        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+        // Update HNSW index for each vector that changed
+        for (vec_col_idx, vector_data, col_name) in hnsw_update_info {
+            let col = self.columns.iter().find(|c| c.name == col_name);
+            if let Some(col) = col
+                && let ColumnType::Vector {
+                    vec_type,
+                    dimensions,
+                    index_quantization,
+                    hnsw_params,
+                } = &col.col_type
+            {
+                let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col_name);
+                let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col_name);
+
+                // Get old level before deletion
+                let old_level: Option<i32> = conn
+                    .query_row(
+                        &format!("SELECT level FROM \"{}\" WHERE rowid = ?", nodes_table),
+                        [old_rowid],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                // Delete old node and edges
+                let _ = conn.execute(
+                    &format!("DELETE FROM \"{}\" WHERE rowid = ?", nodes_table),
+                    [old_rowid],
+                );
+                let _ = conn.execute(
+                    &format!(
+                        "DELETE FROM \"{}\" WHERE from_rowid = ? OR to_rowid = ?",
+                        edges_table
+                    ),
+                    rusqlite::params![old_rowid, old_rowid],
+                );
+
+                // Insert new node into HNSW
+                let mut metadata = HnswMetadata::load_from_db(&conn, &self.table_name, &col_name)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
+                    .unwrap_or_else(|| {
+                        HnswMetadata::with_index_quantization(
+                            *dimensions as i32,
+                            *vec_type,
+                            hnsw_params.distance_metric,
+                            *index_quantization,
+                        )
+                    });
+
+                // Decrement node count since we're replacing
+                if old_level.is_some() {
+                    metadata.num_nodes = metadata.num_nodes.saturating_sub(1);
+                }
+
+                // Get statement cache for this vector column
+                let stmt_cache_ref = unsafe {
+                    if vec_col_idx < self.hnsw_stmt_cache.len() {
+                        let self_mut = self as *const _ as *mut Vec0Tab;
+                        let cache = &mut (&mut *self_mut).hnsw_stmt_cache[vec_col_idx];
+
+                        let nodes_table = format!("{}_{}_hnsw_nodes", self.table_name, col_name);
+                        let edges_table = format!("{}_{}_hnsw_edges", self.table_name, col_name);
+                        let meta_table = format!("{}_{}_hnsw_meta", self.table_name, col_name);
+
+                        conn.prepare_or_reuse(
+                            &mut cache.get_node_data,
+                            &format!(
+                                "SELECT rowid, level, vector FROM \"{}\" WHERE rowid = ?",
+                                nodes_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(
+                            &mut cache.get_edges,
+                            &format!(
+                                "SELECT to_rowid FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                edges_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(&mut cache.insert_node,
+                                &format!("INSERT OR REPLACE INTO \"{}\" (rowid, level, vector) VALUES (?, ?, ?)", nodes_table))
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(&mut cache.insert_edge,
+                                &format!("INSERT OR IGNORE INTO \"{}\" (from_rowid, to_rowid, level) VALUES (?, ?, ?)", edges_table))
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(
+                            &mut cache.delete_edges_from,
+                            &format!(
+                                "DELETE FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                edges_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(
+                            &mut cache.update_meta,
+                            &format!(
+                                "UPDATE \"{}\" SET \
+                                     entry_point_rowid = ?, entry_point_level = ?, \
+                                     num_nodes = ?, hnsw_version = ? \
+                                     WHERE id = 1",
+                                meta_table
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        conn.prepare_or_reuse(
+                                &mut cache.get_edges_with_dist,
+                                &format!(
+                                    "SELECT to_rowid, distance FROM \"{}\" WHERE from_rowid = ? AND level = ?",
+                                    edges_table
+                                ),
+                            )
+                            .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        let placeholders = (0..64).map(|_| "?").collect::<Vec<_>>().join(",");
+                        conn.prepare_or_reuse(
+                            &mut cache.batch_fetch_nodes,
+                            &format!(
+                                "SELECT rowid, level, vector FROM \"{}\" WHERE rowid IN ({})",
+                                nodes_table, placeholders
+                            ),
+                        )
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+
+                        let cache = &self.hnsw_stmt_cache[vec_col_idx];
+                        Some(hnsw::insert::HnswStmtCache {
+                            get_node_data: cache.get_node_data,
+                            get_edges: cache.get_edges,
+                            get_edges_with_dist: cache.get_edges_with_dist,
+                            insert_node: cache.insert_node,
+                            insert_edge: cache.insert_edge,
+                            delete_edges_from: cache.delete_edges_from,
+                            update_meta: cache.update_meta,
+                            batch_fetch_nodes: cache.batch_fetch_nodes,
+                        })
+                    } else {
+                        None
+                    }
+                };
+
+                // Re-insert with new vector
+                hnsw::insert::insert_hnsw(
+                    &conn,
+                    &mut metadata,
+                    &self.table_name,
+                    &col_name,
+                    old_rowid,
+                    &vector_data,
+                    stmt_cache_ref.as_ref(),
+                )
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+            }
+        }
+
+        std::mem::forget(conn);
         Ok(())
     }
 }
@@ -2353,7 +2344,8 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
             && let ColumnType::Vector {
                 vec_type,
                 dimensions,
-                ..
+                index_quantization,
+                hnsw_params,
             } = &vtab.columns[col_idx].col_type
         {
             // Compute vec_col_idx: the index among vector columns only (0 for first vector column)
@@ -2364,13 +2356,15 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 .filter(|c| matches!(c.col_type, ColumnType::Vector { .. }))
                 .count();
 
-            // Read vector from shadow tables
+            // Always read original vectors from unified _data table
+            // (HNSW nodes may contain normalized/quantized vectors, so _data is single source of truth)
             // SAFETY: vtab.db is valid for the lifetime of the virtual table
             let vector_data = unsafe {
                 let conn = Connection::from_handle(vtab.db)
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(Error::Sqlite(e))))?;
 
-                let result = shadow::read_vector_from_chunk(
+                // Read from unified _data table - single source of truth for user data
+                let result = shadow::read_vector(
                     &conn,
                     &vtab.schema_name,
                     &vtab.table_name,
@@ -2382,6 +2376,8 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 std::mem::forget(conn);
                 result
             };
+            // Suppress unused variable warnings for HNSW params (kept for future optimizations)
+            let _ = (hnsw_params, index_quantization);
 
             match vector_data {
                 Some(data) => {
@@ -2564,22 +2560,8 @@ fn brute_force_search(
     use crate::distance;
     use crate::vector::Vector;
 
-    // Get all rowids
-    let rowids_table = format!("{}_rowids", table_name);
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT rowid FROM \"{}\".\"{}\"",
-            schema, rowids_table
-        ))
-        .map_err(Error::Sqlite)?;
-
-    let rowids: Vec<i64> = stmt
-        .query_map([], |row| row.get(0))
-        .map_err(Error::Sqlite)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Error::Sqlite)?;
-
-    drop(stmt);
+    // Get all rowids from unified _data table
+    let rowids = shadow::get_all_rowids(conn, schema, table_name)?;
 
     // Parse query vector to get its properties
     let query_vec = Vector::from_blob(query_vector, VectorType::Float32, query_vector.len() / 4)
@@ -2588,13 +2570,13 @@ fn brute_force_search(
     // Calculate distances for all vectors
     let mut distances = Vec::with_capacity(rowids.len());
     for rowid in rowids {
-        // Read vector from shadow table
-        let vector_bytes =
-            match shadow::read_vector_from_chunk(conn, schema, table_name, column_idx, rowid) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => continue, // NULL vector, skip
-                Err(_) => continue,   // Error reading vector, skip
-            };
+        // Read vector from unified _data table
+        let vector_bytes = match shadow::read_vector(conn, schema, table_name, column_idx, rowid) {
+            Ok(Some(bytes)) if !bytes.is_empty() => bytes,
+            Ok(Some(_)) => continue, // Empty vector (NULL), skip
+            Ok(None) => continue,    // No row found, skip
+            Err(_) => continue,      // Error reading vector, skip
+        };
 
         // Parse vector and calculate distance
         let vec =
@@ -2745,18 +2727,14 @@ mod tests {
 
         println!("Created tables: {:?}", tables);
 
-        // Check that expected shadow tables exist
+        // Check that expected unified storage shadow tables exist
         assert!(
-            tables.contains(&"vec_test_chunks".to_string()),
-            "Missing _chunks table"
+            tables.contains(&"vec_test_data".to_string()),
+            "Missing _data table"
         );
         assert!(
-            tables.contains(&"vec_test_rowids".to_string()),
-            "Missing _rowids table"
-        );
-        assert!(
-            tables.contains(&"vec_test_vector_chunks00".to_string()),
-            "Missing _vector_chunks00 table"
+            tables.contains(&"vec_test_info".to_string()),
+            "Missing _info table"
         );
 
         // HNSW tables should NOT exist when hnsw() is not specified
@@ -2795,14 +2773,14 @@ mod tests {
 
         println!("Created tables: {:?}", tables);
 
-        // Check that basic shadow tables exist
+        // Check that unified storage shadow tables exist
         assert!(
-            tables.contains(&"vec_hnsw_chunks".to_string()),
-            "Missing _chunks table"
+            tables.contains(&"vec_hnsw_data".to_string()),
+            "Missing _data table"
         );
         assert!(
-            tables.contains(&"vec_hnsw_rowids".to_string()),
-            "Missing _rowids table"
+            tables.contains(&"vec_hnsw_info".to_string()),
+            "Missing _info table"
         );
 
         // Check HNSW tables exist when hnsw() is specified
@@ -2817,10 +2795,6 @@ mod tests {
         assert!(
             tables.contains(&"vec_hnsw_embedding_hnsw_edges".to_string()),
             "Missing HNSW edges table"
-        );
-        assert!(
-            tables.contains(&"vec_hnsw_embedding_hnsw_levels".to_string()),
-            "Missing HNSW levels table"
         );
     }
 
@@ -2876,15 +2850,15 @@ mod tests {
             }
         }
 
-        // Verify rowid mapping was created
-        let mapping_count = db.query_row("SELECT COUNT(*) FROM vec_test3_rowids", [], |row| {
+        // Verify row was created in unified _data table
+        let row_count = db.query_row("SELECT COUNT(*) FROM vec_test3_data", [], |row| {
             row.get::<_, i64>(0)
         });
 
-        if let Ok(count) = mapping_count {
-            println!("Rowid mappings: {}", count);
+        if let Ok(count) = row_count {
+            println!("Rows in _data table: {}", count);
             if count > 0 {
-                assert_eq!(count, 1, "Should have one rowid mapping");
+                assert_eq!(count, 1, "Should have one row in _data table");
             }
         }
     }

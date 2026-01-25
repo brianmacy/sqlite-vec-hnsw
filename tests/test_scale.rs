@@ -50,13 +50,11 @@ fn test_scale_10k_vectors() {
         10_000.0 / insert_duration.as_secs_f64()
     );
 
-    // Verify count
+    // Verify count (using unified _data table)
     let count: i64 = db
-        .query_row("SELECT COUNT(*) FROM embeddings_rowids", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM embeddings_data", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(count, 10_000, "Should have 10,000 vectors");
+    assert_eq!(count, 10_000, "Should have 10,000 vectors in _data table");
 
     // Check HNSW index was built
     let node_count: i64 = db

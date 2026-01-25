@@ -38,7 +38,11 @@ fn test_info_table_exists_and_populated() {
         println!("  {}: {:?}", key, value);
     }
 
-    assert_eq!(version_keys.len(), 4, "Should have 4 version keys");
+    assert_eq!(
+        version_keys.len(),
+        5,
+        "Should have 5 info keys (including STORAGE_SCHEMA)"
+    );
 
     // Check each key exists (values are stored as INTEGER or TEXT in SQLite)
     let keys: Vec<&str> = version_keys.iter().map(|(k, _)| k.as_str()).collect();
@@ -46,15 +50,16 @@ fn test_info_table_exists_and_populated() {
     assert!(keys.contains(&"CREATE_VERSION_MAJOR"));
     assert!(keys.contains(&"CREATE_VERSION_MINOR"));
     assert!(keys.contains(&"CREATE_VERSION_PATCH"));
+    assert!(keys.contains(&"STORAGE_SCHEMA"));
 
-    println!("✓ All version keys populated correctly");
+    println!("✓ All info keys populated correctly");
     println!("\n✅ _info table compatibility verified");
 }
 
 #[test]
-fn test_storage_with_1024_chunk_size() {
+fn test_unified_storage_efficiency() {
     let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("chunk_1024_test.db");
+    let db_path = temp_dir.path().join("unified_storage_test.db");
 
     let db = Connection::open(&db_path).unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
@@ -65,7 +70,7 @@ fn test_storage_with_1024_chunk_size() {
     )
     .unwrap();
 
-    println!("\n=== Testing Storage with chunk_size=1024 (C default) ===");
+    println!("\n=== Testing Unified Storage Architecture ===");
 
     // Insert 100 vectors
     db.execute("BEGIN TRANSACTION", []).unwrap();
@@ -85,48 +90,37 @@ fn test_storage_with_1024_chunk_size() {
 
     println!("Database size: {} bytes", db_size);
     println!("Per vector: {} bytes", bytes_per_vector);
-    println!("C expected: ~2,929 bytes/vector");
 
     let raw_vector_size = 768 * 4; // 3,072 bytes
     let overhead = bytes_per_vector as f64 / raw_vector_size as f64;
     println!("Overhead: {:.2}x", overhead);
 
-    // With chunk_size=1024 and storing full vectors in HNSW nodes,
-    // we expect ~2-3x overhead (not 5-6x like before)
+    // With unified storage (no chunking), we expect simpler overhead
     if bytes_per_vector > 10000 {
-        println!("⚠️ Still has bloat (> 10KB/vector)");
-        println!("Expected with HNSW: ~6-8KB/vector (vector + HNSW node + edges + metadata)");
+        println!("⚠️ Higher than expected (> 10KB/vector)");
     } else if bytes_per_vector < 5000 {
         println!("✅ Storage looks good (< 5KB/vector)");
     } else {
         println!("✓ Acceptable overhead");
     }
 
-    println!("\n=== Checking chunk allocation ===");
-    let chunk_info: (i64, i64, i64) = db
-        .query_row(
-            "SELECT chunk_id, size, length(validity) FROM vectors_chunks LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+    println!("\n=== Checking unified _data table ===");
+    let data_row_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM vectors_data", [], |row| row.get(0))
         .unwrap();
 
-    println!("Chunk ID: {}", chunk_info.0);
-    println!("Chunk size (current vectors): {}", chunk_info.1);
-    println!("Validity bitmap: {} bytes", chunk_info.2);
-
-    // With chunk_size=1024, validity should be 128 bytes (1024 bits / 8)
+    println!("Rows in _data table: {}", data_row_count);
     assert_eq!(
-        chunk_info.2, 128,
-        "Validity bitmap should be 128 bytes for chunk_size=1024"
+        data_row_count, 100,
+        "Should have 100 rows in unified _data table"
     );
-    println!("✓ Validity bitmap size matches C (128 bytes)");
+    println!("✓ Unified _data table has correct row count");
 
-    println!("\n✅ Chunk size compatibility verified");
+    println!("\n✅ Unified storage architecture verified");
 }
 
 #[test]
-fn test_shadow_table_names_match_c() {
+fn test_shadow_table_names_unified_schema() {
     let db = Connection::open_in_memory().unwrap();
     sqlite_vec_hnsw::init(&db).unwrap();
 
@@ -136,7 +130,7 @@ fn test_shadow_table_names_match_c() {
     )
     .unwrap();
 
-    println!("\n=== Comparing Shadow Table Names with C ===");
+    println!("\n=== Verifying Unified Storage Shadow Tables ===");
 
     let rust_tables: Vec<String> = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vecs_%' ORDER BY name")
@@ -146,33 +140,28 @@ fn test_shadow_table_names_match_c() {
         .collect::<Result<_, _>>()
         .unwrap();
 
-    println!("\nRust shadow tables:");
+    println!("\nShadow tables created:");
     for table in &rust_tables {
         println!("  {}", table);
     }
 
-    // C creates these tables:
-    // - {table}_chunks
-    // - {table}_info
-    // - {table}_rowids
-    // - {table}_vector_chunks00 (renamed from _{column}_chunks00)
+    // Unified storage architecture creates:
+    // - {table}_data (unified data table for all columns)
+    // - {table}_info (version metadata key-value store)
     // - {table}_{column}_hnsw_meta (if HNSW enabled)
     // - {table}_{column}_hnsw_nodes
     // - {table}_{column}_hnsw_edges
-    // - {table}_{column}_hnsw_levels
+    // Note: No more _chunks, _rowids, _vector_chunksNN tables
 
     let expected = vec![
-        "vecs_chunks",
+        "vecs_data",
         "vecs_emb_hnsw_edges",
-        "vecs_emb_hnsw_levels",
         "vecs_emb_hnsw_meta",
         "vecs_emb_hnsw_nodes",
         "vecs_info",
-        "vecs_rowids",
-        "vecs_vector_chunks00",
     ];
 
-    println!("\nExpected tables (from C):");
+    println!("\nExpected tables (unified storage):");
     for table in &expected {
         println!("  {}", table);
     }

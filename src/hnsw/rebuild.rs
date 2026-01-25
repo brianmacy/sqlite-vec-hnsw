@@ -42,36 +42,23 @@ pub fn rebuild_hnsw_index(
     metadata.hnsw_version = 1;
     metadata.save_to_db(db, table_name, column_name)?;
 
-    // Step 4: Query all vectors from the virtual table
-    // We need to read from the vector_chunks shadow tables directly
-    let vector_table = format!("{}_vector_chunks00", table_name);
-    let rowids_table = format!("{}_rowids", table_name);
-
-    let query = format!(
-        "SELECT r.rowid FROM \"{}\" r \
-         JOIN \"{}\" v ON r.chunk_id IS NOT NULL",
-        rowids_table, vector_table
-    );
-
-    let mut stmt = db.prepare(&query).map_err(Error::Sqlite)?;
-    let rowids: Vec<i64> = stmt
-        .query_map([], |row| row.get::<_, i64>(0))
-        .map_err(Error::Sqlite)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Error::Sqlite)?;
+    // Step 4: Get all rowids from unified _data table
+    let rowids = crate::shadow::get_all_rowids(db, "main", table_name)?;
 
     let vector_count = rowids.len();
 
     // Step 5: Re-insert all vectors to rebuild the index
     for rowid in rowids {
-        // Read vector from shadow table
-        let vector_data = crate::shadow::read_vector_from_chunk(
-            db, "main", // TODO: Get actual schema name
-            table_name, 0, // TODO: Handle multiple vector columns
-            rowid,
-        )?;
+        // Read vector from unified _data table
+        // TODO: Handle multiple vector columns (currently assumes vec_col_idx = 0)
+        let vector_data = crate::shadow::read_vector(db, "main", table_name, 0, rowid)?;
 
         if let Some(vector) = vector_data {
+            // Skip empty vectors (NULL)
+            if vector.is_empty() {
+                continue;
+            }
+
             // Re-insert into HNSW index
             insert::insert_hnsw(
                 db,
@@ -108,10 +95,6 @@ fn clear_hnsw_tables(db: &Connection, table_name: &str, column_name: &str) -> Re
 
     let edges_table = format!("{}_{}_hnsw_edges", table_name, column_name);
     db.execute(&format!("DELETE FROM \"{}\"", edges_table), [])
-        .map_err(Error::Sqlite)?;
-
-    let levels_table = format!("{}_{}_hnsw_levels", table_name, column_name);
-    db.execute(&format!("DELETE FROM \"{}\"", levels_table), [])
         .map_err(Error::Sqlite)?;
 
     Ok(())
@@ -160,13 +143,13 @@ mod tests {
     fn test_rebuild_with_new_params() {
         let db = Connection::open_in_memory().unwrap();
 
-        // Create shadow tables for virtual table
+        // Create shadow tables for virtual table (unified _data table approach)
         let config = shadow::ShadowTablesConfig {
-            num_vector_columns: 1,
-            num_metadata_columns: 0,
-            num_auxiliary_columns: 0,
-            has_text_pk: false,
-            num_partition_columns: 0,
+            vector_columns: vec![shadow::VectorColumnDef {
+                name: "embedding".to_string(),
+                dimensions: 3,
+                element_size: 4, // float32
+            }],
             data_columns: vec![],
         };
         shadow::create_shadow_tables(&db, "main", "test_table", &config).unwrap();
