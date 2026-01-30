@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-01-30
+
+### Added
+- StmtHandleGuard for RAII-based statement reset in shared-cache mode
+- Non-vector column support with proper type preservation and cleanup
+
+### Changed
+- **Major Architecture Refactor**: Unified storage architecture for improved maintainability
+- **Performance Optimization**: Zero-copy vectors and search caching in HNSW
+- **FFI Optimization**: Small batch path + skip redundant resets for improved performance
+- **HNSW Prune Optimization**: Use stored edge distances for 2x speedup
+
+### Fixed
+- Improved error messaging across the codebase
+- Fixed shadow table column indexing for tables with non-vector columns first
+- Fixed multithread stress test: enable HNSW index
+
+### Performance Improvements
+- 2x speedup in HNSW pruning operations
+- Reduced FFI barrier overhead with smart batching
+- Zero-copy vector handling eliminates unnecessary allocations
+
 ## [0.1.0] - 2026-01-19
 
 ### Added
@@ -89,6 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Virtual table infrastructure
 - Basic CRUD operations
 
-[Unreleased]: https://github.com/brianmacy/sqlite-vec-hnsw/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/brianmacy/sqlite-vec-hnsw/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/brianmacy/sqlite-vec-hnsw/releases/tag/v0.4.0
 [0.1.0]: https://github.com/brianmacy/sqlite-vec-hnsw/releases/tag/v0.1.0
 [0.0.1]: https://github.com/brianmacy/sqlite-vec-hnsw/releases/tag/v0.0.1
