@@ -117,11 +117,27 @@ pub fn init_with_pragmas(db: &Connection) -> Result<()> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
     db: *mut ffi::sqlite3,
-    _err_msg: *mut *mut std::os::raw::c_char,
+    err_msg: *mut *mut std::os::raw::c_char,
     p_api: *mut ffi::sqlite3_api_routines,
 ) -> std::os::raw::c_int {
+    // Helper to set error message
+    let set_error = |msg: &str| {
+        if !err_msg.is_null() {
+            let c_msg = std::ffi::CString::new(msg).unwrap_or_default();
+            let len = c_msg.as_bytes_with_nul().len();
+            unsafe {
+                let ptr = ffi::sqlite3_malloc(len as std::os::raw::c_int) as *mut std::os::raw::c_char;
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(c_msg.as_ptr(), ptr, len);
+                    *err_msg = ptr;
+                }
+            }
+        }
+    };
+
     // Initialize the SQLite API routines pointer (required for loadable extensions)
-    if unsafe { ffi::rusqlite_extension_init2(p_api) }.is_err() {
+    if let Err(e) = unsafe { ffi::rusqlite_extension_init2(p_api) } {
+        set_error(&format!("Failed to initialize SQLite extension API: {:?}", e));
         return ffi::SQLITE_ERROR;
     }
 
@@ -131,7 +147,10 @@ pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
         // SAFETY: db is a valid sqlite3 handle provided by SQLite
         let conn = match unsafe { Connection::from_handle(db) } {
             Ok(c) => c,
-            Err(_) => return ffi::SQLITE_ERROR,
+            Err(e) => {
+                set_error(&format!("Failed to create connection: {}", e));
+                return ffi::SQLITE_ERROR;
+            }
         };
 
         // Initialize the extension
@@ -141,11 +160,17 @@ pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
                 std::mem::forget(conn);
                 ffi::SQLITE_OK
             }
-            Err(_) => ffi::SQLITE_ERROR,
+            Err(e) => {
+                set_error(&format!("Failed to initialize extension: {}", e));
+                ffi::SQLITE_ERROR
+            }
         }
     }) {
         Ok(result) => result,
-        Err(_) => ffi::SQLITE_ERROR,
+        Err(_) => {
+            set_error("Panic during extension initialization");
+            ffi::SQLITE_ERROR
+        }
     }
 }
 
