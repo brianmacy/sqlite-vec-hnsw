@@ -39,7 +39,7 @@ loadable_extension = ["rusqlite/loadable_extension"]
 loadable_extension_alias = ["loadable_extension"]
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.27"
 rand = "0.10"
 criterion = "0.8"
 
