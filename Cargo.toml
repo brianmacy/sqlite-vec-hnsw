@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # Using forked rusqlite with custom operator support, DB handle access, and integrity check
 # Once PR is merged upstream, switch back to crates.io version
 # Base rusqlite without loadable_extension - tests use this
-rusqlite = { git = "https://github.com/brianmacy/rusqlite", branch = "custom-vtab-features", features = ["vtab", "blob", "functions"] }
+rusqlite = { git = "https://github.com/brianmacy/rusqlite", rev = "458d948922f3ac66c8bc5b9cb4d6be11f44668c6", features = ["vtab", "blob", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
