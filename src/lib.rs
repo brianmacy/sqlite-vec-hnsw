@@ -156,8 +156,8 @@ pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
         // Initialize the extension
         match init(&conn) {
             Ok(()) => {
-                // Don't drop the connection - SQLite owns it
-                std::mem::forget(conn);
+                // from_handle creates non-owned connection, safe to drop
+                drop(conn);
                 ffi::SQLITE_OK
             }
             Err(e) => {

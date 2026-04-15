@@ -21,7 +21,6 @@ serde_json = "1.0"
 thiserror = "2.0"
 simsimd = "6.5.16"
 bytemuck = { version = "1.25", features = ["derive"] }
-regex = "1"
 fixedbitset = "0.5.7"
 
 [features]

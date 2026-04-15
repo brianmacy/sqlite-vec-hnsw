@@ -614,6 +614,13 @@ impl HnswStmtCache {
     }
 }
 
+impl Drop for HnswStmtCache {
+    fn drop(&mut self) {
+        // Safety: finalize() checks for null pointers and handles them gracefully
+        unsafe { self.finalize(); }
+    }
+}
+
 /// vec0 virtual table structure
 #[repr(C)]
 pub struct Vec0Tab {
@@ -657,33 +664,46 @@ fn normalize_sql_type(type_spec: &str) -> String {
 
 /// Extract the hnsw(...) clause from a column definition string.
 /// Returns (string_without_hnsw, Some(hnsw_clause)) or (original_string, None).
-/// Uses regex to handle spaces inside hnsw() by matching balanced parentheses.
+/// Uses manual parsing with balanced parentheses matching (no regex dependency).
 fn extract_hnsw_clause(arg: &str) -> (String, Option<String>) {
-    use regex::Regex;
-    use std::sync::OnceLock;
+    // Case-insensitive search for "hnsw("
+    let lower = arg.to_lowercase();
+    let Some(start) = lower.find("hnsw(") else {
+        return (arg.to_string(), None);
+    };
 
-    // Compile regex once for efficiency
-    static HNSW_RE: OnceLock<Regex> = OnceLock::new();
-    let re = HNSW_RE.get_or_init(|| {
-        // Match hnsw(...) case-insensitively, capturing content with nested parens
-        // Uses non-greedy match with balanced parens workaround
-        Regex::new(r"(?i)hnsw\([^()]*(?:\([^()]*\)[^()]*)*\)").unwrap()
-    });
-
-    if let Some(m) = re.find(arg) {
-        let hnsw_clause = m.as_str().to_string();
-        let before = arg[..m.start()].trim();
-        let after = arg[m.end()..].trim();
-        let without_hnsw = if before.is_empty() {
-            after.to_string()
-        } else if after.is_empty() {
-            before.to_string()
-        } else {
-            format!("{} {}", before, after)
-        };
-        return (without_hnsw, Some(hnsw_clause));
+    // Find matching closing paren (handles one level of nesting)
+    let mut depth = 0;
+    let mut end = None;
+    for (i, ch) in arg[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
     }
-    (arg.to_string(), None)
+
+    let Some(end) = end else {
+        return (arg.to_string(), None);
+    };
+
+    let hnsw_clause = arg[start..end].to_string();
+    let before = arg[..start].trim();
+    let after = arg[end..].trim();
+    let without_hnsw = if before.is_empty() {
+        after.to_string()
+    } else if after.is_empty() {
+        before.to_string()
+    } else {
+        format!("{} {}", before, after)
+    };
+    (without_hnsw, Some(hnsw_clause))
 }
 
 impl Vec0Tab {
@@ -910,7 +930,7 @@ unsafe impl<'vtab> VTab<'vtab> for Vec0Tab {
         unsafe {
             let conn = Connection::from_handle(db_handle)?;
             conn.overload_function("match", 2)?;
-            std::mem::forget(conn); // Don't close the connection
+            drop(conn); // from_handle creates non-owned connection, safe to drop
         }
 
         // Initialize statement cache (one per vector column)
@@ -1171,7 +1191,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             // This enables syntax like: WHERE embedding MATCH '[1,2,3]'
             let conn = Connection::from_handle(db_handle)?;
             conn.overload_function("match", 2)?;
-            std::mem::forget(conn); // Don't close the connection
+            drop(conn); // from_handle creates non-owned connection, safe to drop
 
             // CRITICAL: Finalize all statements to release schema locks in shared-cache mode.
             // In shared-cache mode, even reset prepared statements hold read locks on the
@@ -1235,7 +1255,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             let _ = conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table), []);
         }
 
-        std::mem::forget(conn); // Don't close the connection
+        drop(conn); // Don't close the connection
         Ok(())
     }
 
@@ -1284,7 +1304,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
                             .unwrap_or(0);
 
                         if node_exists == 0 {
-                            std::mem::forget(conn);
+                            drop(conn);
                             return Ok(Some(format!(
                                 "HNSW index for column '{}': entry point rowid {} does not exist",
                                 col.name, entry_point
@@ -1295,7 +1315,7 @@ impl<'vtab> CreateVTab<'vtab> for Vec0Tab {
             }
         }
 
-        std::mem::forget(conn);
+        drop(conn);
         Ok(None) // No errors found
     }
 }
@@ -1379,7 +1399,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
         // Release connection without closing the database
-        std::mem::forget(conn);
+        drop(conn);
 
         Ok(())
     }
@@ -1456,7 +1476,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     };
 
                     if data.len() != expected_bytes {
-                        std::mem::forget(conn);
+                        drop(conn);
                         let error_msg = if data.is_empty() {
                             "zero-length vectors are not supported".to_string()
                         } else {
@@ -1655,7 +1675,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             }
         }
 
-        std::mem::forget(conn);
+        drop(conn);
         Ok(rowid)
     }
 
@@ -1734,7 +1754,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
                     };
 
                     if data.len() != expected_bytes {
-                        std::mem::forget(conn);
+                        drop(conn);
                         let error_msg = if data.is_empty() {
                             "zero-length vectors are not supported".to_string()
                         } else {
@@ -1993,7 +2013,7 @@ impl<'vtab> UpdateVTab<'vtab> for Vec0Tab {
             }
         }
 
-        std::mem::forget(conn);
+        drop(conn);
         Ok(())
     }
 }
@@ -2250,7 +2270,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                             search_result?
                         } else {
                             // HNSW index is missing or corrupted
-                            std::mem::forget(conn);
+                            drop(conn);
                             return Err(rusqlite::Error::UserFunctionError(Box::new(
                                 Error::InvalidState(format!(
                                     "HNSW index not available for column '{}'. \
@@ -2273,7 +2293,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?
                     };
 
-                    std::mem::forget(conn);
+                    drop(conn);
                     result
                 };
 
@@ -2294,7 +2314,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                     let result = shadow::get_all_rowids(&conn, &vtab.schema_name, &vtab.table_name)
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                    std::mem::forget(conn);
+                    drop(conn);
                     result
                 };
 
@@ -2373,7 +2393,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                 )
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 
-                std::mem::forget(conn);
+                drop(conn);
                 result
             };
             // Suppress unused variable warnings for HNSW params (kept for future optimizations)
@@ -2448,7 +2468,7 @@ unsafe impl VTabCursor for Vec0TabCursor<'_> {
                     ctx.set_result(&rusqlite::types::Null)?;
                 }
 
-                std::mem::forget(conn);
+                drop(conn);
             };
 
             return Ok(());

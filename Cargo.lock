@@ -744,7 +744,6 @@ dependencies = [
  "criterion",
  "fixedbitset",
  "rand",
- "regex",
  "rusqlite",
  "serde",
  "serde_json",

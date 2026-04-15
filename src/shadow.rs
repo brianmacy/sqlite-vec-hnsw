@@ -701,8 +701,8 @@ pub unsafe fn insert_row_ffi(
 
     insert_row(&conn, schema, table_name, rowid, vectors, columns)?;
 
-    // Forget the Connection to avoid double-free
-    std::mem::forget(conn);
+    // from_handle creates non-owned connection, safe to drop
+    drop(conn);
 
     Ok(())
 }
