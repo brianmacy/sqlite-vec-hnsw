@@ -422,7 +422,7 @@ checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 [[package]]
 name = "libsqlite3-sys"
 version = "0.36.0"
-source = "git+https://github.com/brianmacy/rusqlite?rev=452a7caa4eb7c9d1714c694d1c96fd23f88b0b41#452a7caa4eb7c9d1714c694d1c96fd23f88b0b41"
+source = "git+https://github.com/brianmacy/rusqlite?rev=18ce4dbced5f56faf4e3b5368f285253e795232c#18ce4dbced5f56faf4e3b5368f285253e795232c"
 dependencies = [
  "pkg-config",
  "prettyplease",
@@ -627,7 +627,7 @@ dependencies = [
 [[package]]
 name = "rusqlite"
 version = "0.38.0"
-source = "git+https://github.com/brianmacy/rusqlite?rev=452a7caa4eb7c9d1714c694d1c96fd23f88b0b41#452a7caa4eb7c9d1714c694d1c96fd23f88b0b41"
+source = "git+https://github.com/brianmacy/rusqlite?rev=18ce4dbced5f56faf4e3b5368f285253e795232c#18ce4dbced5f56faf4e3b5368f285253e795232c"
 dependencies = [
  "bitflags",
  "fallible-iterator",
