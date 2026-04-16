@@ -126,7 +126,8 @@ pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
             let c_msg = std::ffi::CString::new(msg).unwrap_or_default();
             let len = c_msg.as_bytes_with_nul().len();
             unsafe {
-                let ptr = ffi::sqlite3_malloc(len as std::os::raw::c_int) as *mut std::os::raw::c_char;
+                let ptr =
+                    ffi::sqlite3_malloc(len as std::os::raw::c_int) as *mut std::os::raw::c_char;
                 if !ptr.is_null() {
                     std::ptr::copy_nonoverlapping(c_msg.as_ptr(), ptr, len);
                     *err_msg = ptr;
@@ -137,7 +138,10 @@ pub unsafe extern "C" fn sqlite3_sqlitevechnsw_init(
 
     // Initialize the SQLite API routines pointer (required for loadable extensions)
     if let Err(e) = unsafe { ffi::rusqlite_extension_init2(p_api) } {
-        set_error(&format!("Failed to initialize SQLite extension API: {:?}", e));
+        set_error(&format!(
+            "Failed to initialize SQLite extension API: {:?}",
+            e
+        ));
         return ffi::SQLITE_ERROR;
     }
 

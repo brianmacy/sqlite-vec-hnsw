@@ -617,7 +617,9 @@ impl HnswStmtCache {
 impl Drop for HnswStmtCache {
     fn drop(&mut self) {
         // Safety: finalize() checks for null pointers and handles them gracefully
-        unsafe { self.finalize(); }
+        unsafe {
+            self.finalize();
+        }
     }
 }
 
