@@ -2,6 +2,7 @@
 name = "sqlite-vec-hnsw"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Brian Macy"]
 license = "Apache-2.0"
 description = "SQLite extension for vector search with HNSW indexing"
