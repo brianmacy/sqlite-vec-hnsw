@@ -343,7 +343,7 @@ version = "1.0.228"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_json]]
-version = "1.0.149"
+version = "1.0.150"
 criteria = "safe-to-deploy"
 
 [[exemptions.shlex]]
