@@ -3,7 +3,17 @@ use rusqlite::Connection;
 #[test]
 #[ignore] // Run with: cargo test test_c_compat -- --ignored --nocapture
 fn test_read_c_created_database() {
-    let db_path = "/Users/brianmacy/Downloads/opensanctions_export2_embedding.db";
+    // Path to a C-created database, supplied via the SZ_TEST_DB env var.
+    // The test is skipped when the env var is unset so it does not fail for
+    // anyone without that local file.
+    let db_path = match std::env::var("SZ_TEST_DB") {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("⚠️  SZ_TEST_DB env var not set; skipping C compatibility test");
+            return;
+        }
+    };
+    let db_path = db_path.as_str();
 
     // Check if the C-created database exists
     if !std::path::Path::new(db_path).exists() {
