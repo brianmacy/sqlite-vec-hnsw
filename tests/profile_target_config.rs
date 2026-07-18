@@ -328,7 +328,7 @@ fn profile_insert_breakdown() {
             let sql = format!(
                 "INSERT INTO vectors(rowid, embedding) VALUES ({}, vec_f32('{}'))",
                 rowid,
-                &json_vectors[rowid - 1]
+                json_vectors[rowid - 1]
             );
             db.execute(&sql, []).unwrap();
         }
