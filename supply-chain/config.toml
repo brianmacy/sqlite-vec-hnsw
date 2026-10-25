@@ -4,6 +4,33 @@
 [cargo-vet]
 version = "0.10"
 
+[imports.actix]
+url = "https://raw.githubusercontent.com/actix/supply-chain/main/audits.toml"
+
+[imports.ariel-os]
+url = "https://raw.githubusercontent.com/ariel-os/ariel-os/main/supply-chain/audits.toml"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.embark-studios]
+url = "https://raw.githubusercontent.com/EmbarkStudios/rust-ecosystem/main/audits.toml"
+
+[imports.fermyon]
+url = "https://raw.githubusercontent.com/fermyon/spin/main/supply-chain/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
+
 [policy.libsqlite3-sys]
 audit-as-crates-io = true
 
@@ -20,14 +47,6 @@ criteria = "safe-to-run"
 
 [[exemptions.anes]]
 version = "0.1.6"
-criteria = "safe-to-run"
-
-[[exemptions.anstyle]]
-version = "1.0.14"
-criteria = "safe-to-run"
-
-[[exemptions.anyhow]]
-version = "1.0.102"
 criteria = "safe-to-run"
 
 [[exemptions.autocfg]]
@@ -54,10 +73,6 @@ criteria = "safe-to-deploy"
 version = "0.3.0"
 criteria = "safe-to-run"
 
-[[exemptions.cc]]
-version = "1.2.60"
-criteria = "safe-to-deploy"
-
 [[exemptions.cfg-if]]
 version = "1.0.4"
 criteria = "safe-to-deploy"
@@ -78,18 +93,6 @@ criteria = "safe-to-run"
 version = "0.2.2"
 criteria = "safe-to-run"
 
-[[exemptions.clap]]
-version = "4.6.0"
-criteria = "safe-to-run"
-
-[[exemptions.clap_builder]]
-version = "4.6.0"
-criteria = "safe-to-run"
-
-[[exemptions.clap_lex]]
-version = "1.1.0"
-criteria = "safe-to-run"
-
 [[exemptions.cpufeatures]]
 version = "0.3.0"
 criteria = "safe-to-run"
@@ -102,16 +105,8 @@ criteria = "safe-to-run"
 version = "0.8.2"
 criteria = "safe-to-run"
 
-[[exemptions.crossbeam-deque]]
-version = "0.8.6"
-criteria = "safe-to-run"
-
 [[exemptions.crossbeam-epoch]]
 version = "0.9.20"
-criteria = "safe-to-run"
-
-[[exemptions.crossbeam-utils]]
-version = "0.8.21"
 criteria = "safe-to-run"
 
 [[exemptions.crunchy]]
@@ -138,14 +133,6 @@ criteria = "safe-to-deploy"
 version = "0.1.9"
 criteria = "safe-to-deploy"
 
-[[exemptions.fastrand]]
-version = "2.4.1"
-criteria = "safe-to-run"
-
-[[exemptions.find-msvc-tools]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
 [[exemptions.fixedbitset]]
 version = "0.5.7"
 criteria = "safe-to-deploy"
@@ -166,28 +153,8 @@ criteria = "safe-to-run"
 version = "2.7.1"
 criteria = "safe-to-run"
 
-[[exemptions.hashbrown]]
-version = "0.15.5"
-criteria = "safe-to-run"
-
-[[exemptions.hashbrown]]
-version = "0.16.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.hashbrown]]
-version = "0.17.0"
-criteria = "safe-to-run"
-
-[[exemptions.hashlink]]
-version = "0.11.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.heck]]
 version = "0.5.0"
-criteria = "safe-to-run"
-
-[[exemptions.id-arena]]
-version = "2.3.0"
 criteria = "safe-to-run"
 
 [[exemptions.indexmap]]
@@ -198,10 +165,6 @@ criteria = "safe-to-run"
 version = "0.13.0"
 criteria = "safe-to-run"
 
-[[exemptions.itoa]]
-version = "1.0.18"
-criteria = "safe-to-deploy"
-
 [[exemptions.js-sys]]
 version = "0.3.95"
 criteria = "safe-to-deploy"
@@ -210,33 +173,17 @@ criteria = "safe-to-deploy"
 version = "0.1.0"
 criteria = "safe-to-run"
 
-[[exemptions.libc]]
-version = "0.2.185"
-criteria = "safe-to-run"
-
 [[exemptions.libsqlite3-sys]]
 version = "0.36.0@git:18ce4dbced5f56faf4e3b5368f285253e795232c"
 criteria = "safe-to-deploy"
-
-[[exemptions.linux-raw-sys]]
-version = "0.12.1"
-criteria = "safe-to-run"
 
 [[exemptions.log]]
 version = "0.4.29"
 criteria = "safe-to-run"
 
-[[exemptions.memchr]]
-version = "2.8.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.num-traits]]
 version = "0.2.19"
 criteria = "safe-to-run"
-
-[[exemptions.once_cell]]
-version = "1.21.4"
-criteria = "safe-to-deploy"
 
 [[exemptions.oorandom]]
 version = "11.1.5"
@@ -262,10 +209,6 @@ criteria = "safe-to-run"
 version = "0.3.7"
 criteria = "safe-to-run"
 
-[[exemptions.prettyplease]]
-version = "0.2.37"
-criteria = "safe-to-deploy"
-
 [[exemptions.proc-macro2]]
 version = "1.0.106"
 criteria = "safe-to-deploy"
@@ -286,10 +229,6 @@ criteria = "safe-to-run"
 version = "0.10.1"
 criteria = "safe-to-run"
 
-[[exemptions.rayon]]
-version = "1.12.0"
-criteria = "safe-to-run"
-
 [[exemptions.rayon-core]]
 version = "1.13.0"
 criteria = "safe-to-run"
@@ -302,10 +241,6 @@ criteria = "safe-to-run"
 version = "0.4.14"
 criteria = "safe-to-run"
 
-[[exemptions.regex-syntax]]
-version = "0.8.10"
-criteria = "safe-to-run"
-
 [[exemptions.rsqlite-vfs]]
 version = "0.1.0"
 criteria = "safe-to-deploy"
@@ -313,10 +248,6 @@ criteria = "safe-to-deploy"
 [[exemptions.rusqlite]]
 version = "0.38.0@git:18ce4dbced5f56faf4e3b5368f285253e795232c"
 criteria = "safe-to-deploy"
-
-[[exemptions.rustix]]
-version = "1.1.4"
-criteria = "safe-to-run"
 
 [[exemptions.rustversion]]
 version = "1.0.22"
@@ -329,22 +260,6 @@ criteria = "safe-to-run"
 [[exemptions.semver]]
 version = "1.0.28"
 criteria = "safe-to-run"
-
-[[exemptions.serde]]
-version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_core]]
-version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_derive]]
-version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_json]]
-version = "1.0.151"
-criteria = "safe-to-deploy"
 
 [[exemptions.shlex]]
 version = "1.3.0"
@@ -362,33 +277,13 @@ criteria = "safe-to-deploy"
 version = "0.5.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.syn]]
-version = "2.0.117"
-criteria = "safe-to-deploy"
-
-[[exemptions.syn]]
-version = "3.0.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.tempfile]]
 version = "3.27.0"
 criteria = "safe-to-run"
 
-[[exemptions.thiserror]]
-version = "2.0.21"
-criteria = "safe-to-deploy"
-
-[[exemptions.thiserror-impl]]
-version = "2.0.21"
-criteria = "safe-to-deploy"
-
 [[exemptions.tinytemplate]]
 version = "1.2.1"
 criteria = "safe-to-run"
-
-[[exemptions.unicode-ident]]
-version = "1.0.24"
-criteria = "safe-to-deploy"
 
 [[exemptions.unicode-xid]]
 version = "0.2.6"
@@ -397,10 +292,6 @@ criteria = "safe-to-run"
 [[exemptions.vcpkg]]
 version = "0.2.15"
 criteria = "safe-to-deploy"
-
-[[exemptions.walkdir]]
-version = "2.5.0"
-criteria = "safe-to-run"
 
 [[exemptions.wasip2]]
 version = "1.0.2+wasi-0.2.9"
@@ -460,10 +351,6 @@ criteria = "safe-to-run"
 
 [[exemptions.windows-link]]
 version = "0.2.1"
-criteria = "safe-to-run"
-
-[[exemptions.windows-sys]]
-version = "0.61.2"
 criteria = "safe-to-run"
 
 [[exemptions.wit-bindgen]]
