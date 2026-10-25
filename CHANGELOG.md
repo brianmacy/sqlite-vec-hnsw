@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Supply chain (cargo-vet):** imports the Actix, Ariel OS, Bytecode Alliance, Embark, Fermyon, Google, ISRG, Mozilla and Zcash audit sets and trusts reputable publishers (evidence in each entry's notes); exemptions 123 -> 25, each with a notes line.
+
 ## [0.4.0] - 2026-01-30
 
 ### Added

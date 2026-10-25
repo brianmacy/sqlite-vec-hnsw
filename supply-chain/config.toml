@@ -4,500 +4,160 @@
 [cargo-vet]
 version = "0.10"
 
+[imports.actix]
+url = "https://raw.githubusercontent.com/actix/supply-chain/main/audits.toml"
+
+[imports.ariel-os]
+url = "https://raw.githubusercontent.com/ariel-os/ariel-os/main/supply-chain/audits.toml"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.embark-studios]
+url = "https://raw.githubusercontent.com/EmbarkStudios/rust-ecosystem/main/audits.toml"
+
+[imports.fermyon]
+url = "https://raw.githubusercontent.com/fermyon/spin/main/supply-chain/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.isrg]
+url = "https://raw.githubusercontent.com/divviup/libprio-rs/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
+
 [policy.libsqlite3-sys]
 audit-as-crates-io = true
 
 [policy.rusqlite]
 audit-as-crates-io = true
 
-[[exemptions.aho-corasick]]
-version = "1.1.4"
-criteria = "safe-to-run"
-
-[[exemptions.alloca]]
-version = "0.4.0"
-criteria = "safe-to-run"
-
-[[exemptions.anes]]
-version = "0.1.6"
-criteria = "safe-to-run"
-
-[[exemptions.anstyle]]
-version = "1.0.14"
-criteria = "safe-to-run"
-
-[[exemptions.anyhow]]
-version = "1.0.102"
-criteria = "safe-to-run"
-
-[[exemptions.autocfg]]
-version = "1.5.0"
-criteria = "safe-to-run"
-
-[[exemptions.bitflags]]
-version = "2.11.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.bumpalo]]
-version = "3.20.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.bytemuck]]
 version = "1.25.2"
 criteria = "safe-to-deploy"
+notes = "Zero-copy casts of vector buffers, used directly (shipped). Publisher Lokathor; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.bytemuck_derive]]
 version = "1.10.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.cast]]
-version = "0.3.0"
-criteria = "safe-to-run"
-
-[[exemptions.cc]]
-version = "1.2.60"
-criteria = "safe-to-deploy"
-
-[[exemptions.cfg-if]]
-version = "1.0.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.chacha20]]
-version = "0.10.0"
-criteria = "safe-to-run"
-
-[[exemptions.ciborium]]
-version = "0.2.2"
-criteria = "safe-to-run"
-
-[[exemptions.ciborium-io]]
-version = "0.2.2"
-criteria = "safe-to-run"
-
-[[exemptions.ciborium-ll]]
-version = "0.2.2"
-criteria = "safe-to-run"
-
-[[exemptions.clap]]
-version = "4.6.0"
-criteria = "safe-to-run"
-
-[[exemptions.clap_builder]]
-version = "4.6.0"
-criteria = "safe-to-run"
-
-[[exemptions.clap_lex]]
-version = "1.1.0"
-criteria = "safe-to-run"
-
-[[exemptions.cpufeatures]]
-version = "0.3.0"
-criteria = "safe-to-run"
+notes = "Derive macros for bytemuck (shipped code generation). Publisher Lokathor; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.criterion]]
 version = "0.8.2"
 criteria = "safe-to-run"
-
-[[exemptions.criterion-plot]]
-version = "0.8.2"
-criteria = "safe-to-run"
-
-[[exemptions.crossbeam-deque]]
-version = "0.8.6"
-criteria = "safe-to-run"
-
-[[exemptions.crossbeam-epoch]]
-version = "0.9.20"
-criteria = "safe-to-run"
-
-[[exemptions.crossbeam-utils]]
-version = "0.8.21"
-criteria = "safe-to-run"
-
-[[exemptions.crunchy]]
-version = "0.2.4"
-criteria = "safe-to-run"
-
-[[exemptions.either]]
-version = "1.15.0"
-criteria = "safe-to-run"
-
-[[exemptions.equivalent]]
-version = "1.0.2"
-criteria = "safe-to-run"
-
-[[exemptions.errno]]
-version = "0.3.14"
-criteria = "safe-to-run"
-
-[[exemptions.fallible-iterator]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.fallible-streaming-iterator]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.fastrand]]
-version = "2.4.1"
-criteria = "safe-to-run"
-
-[[exemptions.find-msvc-tools]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
+notes = "Benchmark harness (dev-dependency); DEV-ONLY (benchmarks), safe-to-run. Published via crates.io trusted publishing from github:criterion-rs/criterion.rs, which no imported audit set trusts or audits."
 
 [[exemptions.fixedbitset]]
 version = "0.5.7"
 criteria = "safe-to-deploy"
-
-[[exemptions.foldhash]]
-version = "0.1.5"
-criteria = "safe-to-run"
-
-[[exemptions.foldhash]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
-version = "0.4.2"
-criteria = "safe-to-run"
+notes = "Visited-node bitset in HNSW search, used directly (shipped). Publisher james7132; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.half]]
 version = "2.7.1"
 criteria = "safe-to-run"
-
-[[exemptions.hashbrown]]
-version = "0.15.5"
-criteria = "safe-to-run"
-
-[[exemptions.hashbrown]]
-version = "0.16.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.hashbrown]]
-version = "0.17.0"
-criteria = "safe-to-run"
-
-[[exemptions.hashlink]]
-version = "0.11.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.heck]]
-version = "0.5.0"
-criteria = "safe-to-run"
-
-[[exemptions.id-arena]]
-version = "2.3.0"
-criteria = "safe-to-run"
-
-[[exemptions.indexmap]]
-version = "2.14.0"
-criteria = "safe-to-run"
-
-[[exemptions.itertools]]
-version = "0.13.0"
-criteria = "safe-to-run"
-
-[[exemptions.itoa]]
-version = "1.0.18"
-criteria = "safe-to-deploy"
+notes = "f16/bf16 types via criterion -> ciborium; DEV-ONLY (benchmarks), safe-to-run. Publisher VoidStarKat; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.js-sys]]
 version = "0.3.95"
 criteria = "safe-to-deploy"
-
-[[exemptions.leb128fmt]]
-version = "0.1.0"
-criteria = "safe-to-run"
-
-[[exemptions.libc]]
-version = "0.2.185"
-criteria = "safe-to-run"
+notes = "JS bindings via rusqlite -> sqlite-wasm-rs (wasm32 targets only; not built for native targets). This version was published by guybedford; only alexcrichton-published versions are trusted."
 
 [[exemptions.libsqlite3-sys]]
 version = "0.36.0@git:18ce4dbced5f56faf4e3b5368f285253e795232c"
 criteria = "safe-to-deploy"
-
-[[exemptions.linux-raw-sys]]
-version = "0.12.1"
-criteria = "safe-to-run"
-
-[[exemptions.log]]
-version = "0.4.29"
-criteria = "safe-to-run"
-
-[[exemptions.memchr]]
-version = "2.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.num-traits]]
-version = "0.2.19"
-criteria = "safe-to-run"
-
-[[exemptions.once_cell]]
-version = "1.21.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.oorandom]]
-version = "11.1.5"
-criteria = "safe-to-run"
-
-[[exemptions.page_size]]
-version = "0.6.0"
-criteria = "safe-to-run"
+notes = "Raw SQLite FFI + bundled SQLite build from Brian's rusqlite fork (shipped); audit-as-crates-io policy. Git fork, so neither trust entries nor imported audits can apply."
 
 [[exemptions.pkg-config]]
 version = "0.3.33"
 criteria = "safe-to-deploy"
+notes = "Build-time system-library discovery for libsqlite3-sys. Publisher sdroege; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.plotters]]
 version = "0.3.7"
 criteria = "safe-to-run"
+notes = "Chart rendering for criterion reports; DEV-ONLY (benchmarks), safe-to-run. Publisher AaronErhardt; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.plotters-backend]]
 version = "0.3.7"
 criteria = "safe-to-run"
+notes = "Backend trait for plotters (criterion reports); DEV-ONLY (benchmarks), safe-to-run. Publisher AaronErhardt; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.plotters-svg]]
 version = "0.3.7"
 criteria = "safe-to-run"
-
-[[exemptions.prettyplease]]
-version = "0.2.37"
-criteria = "safe-to-deploy"
-
-[[exemptions.proc-macro2]]
-version = "1.0.106"
-criteria = "safe-to-deploy"
-
-[[exemptions.quote]]
-version = "1.0.45"
-criteria = "safe-to-deploy"
+notes = "SVG backend for plotters (criterion reports); DEV-ONLY (benchmarks), safe-to-run. Publisher AaronErhardt; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.r-efi]]
 version = "6.0.0"
 criteria = "safe-to-run"
-
-[[exemptions.rand]]
-version = "0.10.3"
-criteria = "safe-to-run"
-
-[[exemptions.rand_core]]
-version = "0.10.1"
-criteria = "safe-to-run"
-
-[[exemptions.rayon]]
-version = "1.12.0"
-criteria = "safe-to-run"
-
-[[exemptions.rayon-core]]
-version = "1.13.0"
-criteria = "safe-to-run"
-
-[[exemptions.regex]]
-version = "1.12.3"
-criteria = "safe-to-run"
-
-[[exemptions.regex-automata]]
-version = "0.4.14"
-criteria = "safe-to-run"
-
-[[exemptions.regex-syntax]]
-version = "0.8.10"
-criteria = "safe-to-run"
+notes = "UEFI bindings pulled in by getrandom (UEFI targets only). Publisher dvdhrm; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.rsqlite-vfs]]
 version = "0.1.0"
 criteria = "safe-to-deploy"
+notes = "SQLite VFS for the wasm build of rusqlite (via sqlite-wasm-rs; wasm32 targets only). Publisher Spxg; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.rusqlite]]
 version = "0.38.0@git:18ce4dbced5f56faf4e3b5368f285253e795232c"
 criteria = "safe-to-deploy"
-
-[[exemptions.rustix]]
-version = "1.1.4"
-criteria = "safe-to-run"
-
-[[exemptions.rustversion]]
-version = "1.0.22"
-criteria = "safe-to-deploy"
-
-[[exemptions.same-file]]
-version = "1.0.6"
-criteria = "safe-to-run"
-
-[[exemptions.semver]]
-version = "1.0.28"
-criteria = "safe-to-run"
-
-[[exemptions.serde]]
-version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_core]]
-version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_derive]]
-version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_json]]
-version = "1.0.151"
-criteria = "safe-to-deploy"
-
-[[exemptions.shlex]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
+notes = "SQLite bindings from Brian's fork (github.com/brianmacy/rusqlite, custom-vtab-features) used directly (shipped); audit-as-crates-io policy. Git fork, so neither trust entries nor imported audits can apply."
 
 [[exemptions.simsimd]]
 version = "6.5.16"
 criteria = "safe-to-deploy"
-
-[[exemptions.smallvec]]
-version = "1.15.1"
-criteria = "safe-to-deploy"
+notes = "SIMD distance kernels (C library + Rust bindings), used directly (shipped). Publisher ashvardanian; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.sqlite-wasm-rs]]
 version = "0.5.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.syn]]
-version = "2.0.117"
-criteria = "safe-to-deploy"
-
-[[exemptions.syn]]
-version = "3.0.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.tempfile]]
-version = "3.27.0"
-criteria = "safe-to-run"
-
-[[exemptions.thiserror]]
-version = "2.0.21"
-criteria = "safe-to-deploy"
-
-[[exemptions.thiserror-impl]]
-version = "2.0.21"
-criteria = "safe-to-deploy"
-
-[[exemptions.tinytemplate]]
-version = "1.2.1"
-criteria = "safe-to-run"
-
-[[exemptions.unicode-ident]]
-version = "1.0.24"
-criteria = "safe-to-deploy"
-
-[[exemptions.unicode-xid]]
-version = "0.2.6"
-criteria = "safe-to-run"
-
-[[exemptions.vcpkg]]
-version = "0.2.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.walkdir]]
-version = "2.5.0"
-criteria = "safe-to-run"
-
-[[exemptions.wasip2]]
-version = "1.0.2+wasi-0.2.9"
-criteria = "safe-to-run"
-
-[[exemptions.wasip3]]
-version = "0.4.0+wasi-0.3.0-rc-2026-01-06"
-criteria = "safe-to-run"
+notes = "SQLite compiled for wasm, optional backend of rusqlite (wasm32 targets only). Publisher Spxg; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.wasm-bindgen]]
 version = "0.2.118"
 criteria = "safe-to-deploy"
+notes = "wasm-bindgen runtime via rusqlite -> sqlite-wasm-rs -> js-sys (wasm32 targets only). This version was published by guybedford; only alexcrichton-published versions are trusted."
 
 [[exemptions.wasm-bindgen-macro]]
 version = "0.2.118"
 criteria = "safe-to-deploy"
+notes = "wasm-bindgen proc macro (wasm32 targets only, via sqlite-wasm-rs). This version was published by guybedford; only alexcrichton-published versions are trusted."
 
 [[exemptions.wasm-bindgen-macro-support]]
 version = "0.2.118"
 criteria = "safe-to-deploy"
+notes = "wasm-bindgen macro implementation (wasm32 targets only, via sqlite-wasm-rs). This version was published by guybedford; only alexcrichton-published versions are trusted."
 
 [[exemptions.wasm-bindgen-shared]]
 version = "0.2.118"
 criteria = "safe-to-deploy"
-
-[[exemptions.wasm-encoder]]
-version = "0.244.0"
-criteria = "safe-to-run"
-
-[[exemptions.wasm-metadata]]
-version = "0.244.0"
-criteria = "safe-to-run"
-
-[[exemptions.wasmparser]]
-version = "0.244.0"
-criteria = "safe-to-run"
+notes = "Shared wasm-bindgen definitions (wasm32 targets only, via sqlite-wasm-rs). This version was published by guybedford; only alexcrichton-published versions are trusted."
 
 [[exemptions.web-sys]]
 version = "0.3.95"
 criteria = "safe-to-run"
-
-[[exemptions.winapi]]
-version = "0.3.9"
-criteria = "safe-to-run"
+notes = "Web API bindings pulled in by plotters (criterion, wasm32 only); DEV-ONLY (benchmarks), safe-to-run. This version was published by guybedford; only alexcrichton-published versions are trusted."
 
 [[exemptions.winapi-i686-pc-windows-gnu]]
 version = "0.4.0"
 criteria = "safe-to-run"
-
-[[exemptions.winapi-util]]
-version = "0.1.11"
-criteria = "safe-to-run"
+notes = "Windows import-library shim via criterion -> page_size -> winapi (Windows-gnu only); DEV-ONLY (benchmarks), safe-to-run. crates.io has no publisher record for this 2018 release, so no trust entry is possible."
 
 [[exemptions.winapi-x86_64-pc-windows-gnu]]
 version = "0.4.0"
 criteria = "safe-to-run"
-
-[[exemptions.windows-link]]
-version = "0.2.1"
-criteria = "safe-to-run"
-
-[[exemptions.windows-sys]]
-version = "0.61.2"
-criteria = "safe-to-run"
-
-[[exemptions.wit-bindgen]]
-version = "0.51.0"
-criteria = "safe-to-run"
-
-[[exemptions.wit-bindgen-core]]
-version = "0.51.0"
-criteria = "safe-to-run"
-
-[[exemptions.wit-bindgen-rust]]
-version = "0.51.0"
-criteria = "safe-to-run"
-
-[[exemptions.wit-bindgen-rust-macro]]
-version = "0.51.0"
-criteria = "safe-to-run"
-
-[[exemptions.wit-component]]
-version = "0.244.0"
-criteria = "safe-to-run"
-
-[[exemptions.wit-parser]]
-version = "0.244.0"
-criteria = "safe-to-run"
+notes = "Windows import-library shim via criterion -> page_size -> winapi (Windows-gnu only); DEV-ONLY (benchmarks), safe-to-run. crates.io has no publisher record for this 2018 release, so no trust entry is possible."
 
 [[exemptions.zerocopy]]
 version = "0.8.48"
 criteria = "safe-to-run"
+notes = "Safe transmute helpers via criterion -> ciborium -> half; DEV-ONLY (benchmarks), safe-to-run. Publisher joshlf; publisher not in any imported [[trusted]] set and no imported audit covers this version."
 
 [[exemptions.zerocopy-derive]]
 version = "0.8.48"
 criteria = "safe-to-run"
-
-[[exemptions.zmij]]
-version = "1.0.21"
-criteria = "safe-to-deploy"
+notes = "Derive macros for zerocopy via criterion -> ciborium -> half; DEV-ONLY (benchmarks), safe-to-run. Publisher joshlf; publisher not in any imported [[trusted]] set and no imported audit covers this version."
