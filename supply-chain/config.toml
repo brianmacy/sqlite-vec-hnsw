@@ -12,7 +12,7 @@ audit-as-crates-io = true
 
 [[exemptions.aho-corasick]]
 version = "1.1.4"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.alloca]]
 version = "0.4.0"
@@ -43,7 +43,7 @@ version = "3.20.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.bytemuck]]
-version = "1.25.0"
+version = "1.25.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.bytemuck_derive]]
@@ -279,7 +279,7 @@ version = "6.0.0"
 criteria = "safe-to-run"
 
 [[exemptions.rand]]
-version = "0.10.1"
+version = "0.10.3"
 criteria = "safe-to-run"
 
 [[exemptions.rand_core]]
@@ -296,15 +296,15 @@ criteria = "safe-to-run"
 
 [[exemptions.regex]]
 version = "1.12.3"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.regex-automata]]
 version = "0.4.14"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.regex-syntax]]
 version = "0.8.10"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.rsqlite-vfs]]
 version = "0.1.0"
@@ -331,19 +331,19 @@ version = "1.0.28"
 criteria = "safe-to-run"
 
 [[exemptions.serde]]
-version = "1.0.228"
+version = "1.0.229"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_core]]
-version = "1.0.228"
+version = "1.0.229"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_derive]]
-version = "1.0.228"
+version = "1.0.229"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_json]]
-version = "1.0.150"
+version = "1.0.151"
 criteria = "safe-to-deploy"
 
 [[exemptions.shlex]]
@@ -366,16 +366,20 @@ criteria = "safe-to-deploy"
 version = "2.0.117"
 criteria = "safe-to-deploy"
 
+[[exemptions.syn]]
+version = "3.0.3"
+criteria = "safe-to-deploy"
+
 [[exemptions.tempfile]]
 version = "3.27.0"
 criteria = "safe-to-run"
 
 [[exemptions.thiserror]]
-version = "2.0.18"
+version = "2.0.21"
 criteria = "safe-to-deploy"
 
 [[exemptions.thiserror-impl]]
-version = "2.0.18"
+version = "2.0.21"
 criteria = "safe-to-deploy"
 
 [[exemptions.tinytemplate]]
