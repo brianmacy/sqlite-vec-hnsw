@@ -329,9 +329,9 @@ impl Vector {
         }
 
         let mut result = Vec::with_capacity(self.dimensions);
-        for chunk in self.data.chunks_exact(4) {
-            let bytes: [u8; 4] = chunk.try_into().unwrap();
-            result.push(f32::from_le_bytes(bytes));
+        let (chunks, _) = self.data.as_chunks::<4>();
+        for bytes in chunks {
+            result.push(f32::from_le_bytes(*bytes));
         }
         Ok(result)
     }
